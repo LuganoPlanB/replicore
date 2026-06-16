@@ -7,7 +7,11 @@ import { createHash, randomBytes } from "node:crypto"
 
 import createTestnet from "hyperdht/testnet.js"
 
-import { generateIdentity, HolepunchSwarmNode } from "../src/index.js"
+import {
+  generateIdentity,
+  HolepunchHttpServer,
+  HolepunchSwarmNode
+} from "../src/index.js"
 
 test("leader operations replicate to followers and rebuild after restart", async () => {
   const testnet = await createTestnet(3)
@@ -173,6 +177,109 @@ test("followers forward writes to the computed leader and the next alive node be
     const result = await nextLeaderNode.put("hash:gamma", { failover: true })
     assert.equal(result.actor, expectedNextLeader)
   } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("authorized HTTP API forwards writes and exposes status routes", async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+  const servers = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("leader"))
+    const follower1Identity = generateIdentity(seed("follower-1"))
+    const follower2Identity = generateIdentity(seed("follower-2"))
+    const authorizedNodes = [leaderIdentity, follower1Identity, follower2Identity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of [leaderIdentity, follower1Identity, follower2Identity]) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "test-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+    }
+
+    await Promise.all(nodes.map((node) => node.start()))
+    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
+
+    for (const node of nodes) {
+      const server = new HolepunchHttpServer({
+        node,
+        auth: {
+          tokens: {
+            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          }
+        }
+      })
+      await server.start()
+      servers.push(server)
+    }
+
+    const followerServer = servers[1]
+    const baseUrl = `http://${followerServer.address.address}:${followerServer.address.port}`
+
+    const putResponse = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ value: { through: "http" } })
+    })
+    assert.equal(putResponse.status, 200)
+    const operation = await putResponse.json()
+    assert.equal(typeof operation.opId, "string")
+
+    const unauthorized = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
+      headers: { authorization: "Bearer missing" }
+    })
+    assert.equal(unauthorized.status, 401)
+
+    const readResponse = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
+      headers: { authorization: "Bearer reader" }
+    })
+    assert.equal(readResponse.status, 200)
+    const current = await readResponse.json()
+    assert.equal(current.value.through, "http")
+
+    const historyResponse = await fetch(`${baseUrl}/kv/hash:http/history?keyspace=default`, {
+      headers: { authorization: "Bearer reader" }
+    })
+    assert.equal(historyResponse.status, 200)
+    const history = await historyResponse.json()
+    assert.equal(history.history.length, 1)
+
+    const replicationResponse = await fetch(`${baseUrl}/status/replication`)
+    assert.equal(replicationResponse.status, 200)
+    const replication = await replicationResponse.json()
+    assert.equal(replication.nodeId, nodes[1].options.identity.publicKeyId)
+
+    const writersResponse = await fetch(`${baseUrl}/status/writers`)
+    assert.equal(writersResponse.status, 200)
+    const writers = await writersResponse.json()
+    assert.equal(writers.authorizedNodes.length, 3)
+
+    const leaderResponse = await fetch(`${baseUrl}/status/leader`)
+    assert.equal(leaderResponse.status, 200)
+    const leader = await leaderResponse.json()
+    assert.equal(typeof leader.currentLeader, "string")
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

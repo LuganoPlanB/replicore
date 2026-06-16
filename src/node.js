@@ -199,6 +199,50 @@ export class HolepunchSwarmNode {
     return this.view.getHistory(options.keyspace ?? "default", key)
   }
 
+  async getReplicationStatus() {
+    const heartbeats = await this.view.getHeartbeats()
+    const feeds = {}
+
+    for (const node of this.options.authorizedNodes) {
+      const core = this.feedCores.get(node.nodeId)
+      feeds[node.nodeId] = {
+        feedKey: node.feedKey,
+        length: core.length,
+        applied: await this.view.getApplied(node.feedKey)
+      }
+    }
+
+    return {
+      nodeId: this.options.identity.publicKeyId,
+      leader: this.currentLeader(),
+      connections: this.connections.size,
+      feeds,
+      heartbeats
+    }
+  }
+
+  getWritersStatus() {
+    return {
+      currentLeader: this.currentLeader(),
+      authorizedNodes: this.options.authorizedNodes.map((node) => ({
+        nodeId: node.nodeId,
+        feedKey: node.feedKey
+      }))
+    }
+  }
+
+  async getLeaderStatus() {
+    const leader = this.currentLeader()
+    const heartbeats = await this.view.getHeartbeats()
+
+    return {
+      nodeId: this.options.identity.publicKeyId,
+      currentLeader: leader,
+      reachable: leader ? this.#isLeaderReachable(leader) : false,
+      heartbeat: leader ? (heartbeats[leader] ?? null) : null
+    }
+  }
+
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)

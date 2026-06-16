@@ -9,6 +9,7 @@ export {
   verifyPayload
 } from "./crypto.js"
 export { MaterializedView } from "./materialized-view.js"
+export { HolepunchHttpServer } from "./http-server.js"
 export {
   createSignedOperation,
   decryptOperationValue,
