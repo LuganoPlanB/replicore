@@ -1,0 +1,15 @@
+{
+  "name": "planb-cleard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "corestore": "^7.10.1",
+    "hyperbee": "^2.27.3",
+    "hyperdht": "^6.32.0",
+    "hyperswarm": "^4.17.0"
+  }
+}
