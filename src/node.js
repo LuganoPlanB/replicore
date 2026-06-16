@@ -246,6 +246,17 @@ export class HolepunchSwarmNode {
     }
   }
 
+  async createSnapshot() {
+    return this.view.exportSnapshot()
+  }
+
+  /**
+   * @param {{ version: number, entries: Array<{ key: string, value: unknown }> }} snapshot
+   */
+  async restoreSnapshot(snapshot) {
+    await this.view.importSnapshot(snapshot)
+  }
+
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)

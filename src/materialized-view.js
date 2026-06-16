@@ -132,4 +132,41 @@ export class MaterializedView {
 
     return heartbeats
   }
+
+  async exportSnapshot() {
+    return {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      entries: await this.#collectEntries()
+    }
+  }
+
+  /**
+   * @param {{ version: number, entries: Array<{ key: string, value: unknown }> }} snapshot
+   */
+  async importSnapshot(snapshot) {
+    if (snapshot.version !== 1) {
+      throw new Error(`Unsupported snapshot version: ${snapshot.version}`)
+    }
+
+    const batch = this.bee.batch()
+    for (const entry of snapshot.entries) {
+      await batch.put(entry.key, entry.value)
+    }
+    await batch.flush()
+  }
+
+  async #collectEntries() {
+    const entries = []
+    const stream = this.bee.createReadStream()
+
+    for await (const entry of stream) {
+      entries.push({
+        key: entry.key,
+        value: entry.value
+      })
+    }
+
+    return entries
+  }
 }

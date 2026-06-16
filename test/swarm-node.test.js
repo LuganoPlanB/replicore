@@ -315,6 +315,85 @@ test("operation validation rejects mismatched feed metadata", () => {
   }, /feed mismatch/)
 })
 
+test("a fresh node can restore current state from a snapshot", async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("leader"))
+    const followerIdentity = generateIdentity(seed("follower-1"))
+    const observerIdentity = generateIdentity(seed("follower-2"))
+    const restoreIdentity = generateIdentity(seed("restore"))
+
+    const authorizedNodes = [leaderIdentity, followerIdentity, observerIdentity, restoreIdentity].map(
+      (identity) => ({
+        nodeId: identity.publicKeyId,
+        publicKey: identity.publicKey,
+        feedKey: identity.feedKey
+      })
+    )
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const observer = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: observerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower, observer)
+    await Promise.all(nodes.map((node) => node.start()))
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+
+    await leader.put("hash:snapshot", { state: "present" })
+    await waitFor(async () => (await follower.get("hash:snapshot"))?.value?.state === "present")
+
+    const snapshot = await follower.createSnapshot()
+
+    const restored = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: restoreIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: []
+    })
+    nodes.push(restored)
+    await restored.start()
+    await restored.restoreSnapshot(snapshot)
+
+    const restoredValue = await restored.get("hash:snapshot")
+    assert.equal(restoredValue.value.state, "present")
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
