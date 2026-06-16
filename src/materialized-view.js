@@ -14,6 +14,11 @@ export class MaterializedView {
    * @param {string} feedKey
    */
   async apply(operation, feedKey) {
+    if (operation.kind === "heartbeat") {
+      await this.#applyHeartbeat(operation, feedKey)
+      return
+    }
+
     const batch = this.bee.batch()
     const keyspace = /** @type {string} */ (operation.keyspace)
     const key = /** @type {string} */ (operation.key)
@@ -42,6 +47,25 @@ export class MaterializedView {
 
     await batch.put(historyKey, summary)
     await batch.put(progressKey, { applied: operation.seq + 1, lastOpId: operation.opId })
+    await batch.flush()
+  }
+
+  /**
+   * @param {Record<string, unknown>} operation
+   * @param {string} feedKey
+   */
+  async #applyHeartbeat(operation, feedKey) {
+    const batch = this.bee.batch()
+    await batch.put(`system/heartbeats/${operation.actor}`, {
+      actor: operation.actor,
+      feed: feedKey,
+      ts: operation.ts,
+      seq: operation.seq,
+      observedLeader: operation.heartbeat?.observedLeader ?? null,
+      reachableLeader: operation.heartbeat?.reachableLeader ?? false,
+      appliedFeeds: operation.heartbeat?.appliedFeeds ?? {}
+    })
+    await batch.put(`feeds/${feedKey}/progress`, { applied: operation.seq + 1, lastOpId: operation.opId })
     await batch.flush()
   }
 
@@ -90,5 +114,22 @@ export class MaterializedView {
     }
 
     return entries
+  }
+
+  /**
+   * @returns {Promise<Record<string, { actor: string, feed: string, ts: string, seq: number, observedLeader: string | null, reachableLeader: boolean, appliedFeeds: Record<string, number> }>>}
+   */
+  async getHeartbeats() {
+    const heartbeats = {}
+    const range = this.bee.createReadStream({
+      gte: "system/heartbeats/",
+      lt: "system/heartbeats/~"
+    })
+
+    for await (const entry of range) {
+      heartbeats[entry.value.actor] = entry.value
+    }
+
+    return heartbeats
   }
 }

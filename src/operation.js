@@ -10,32 +10,41 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
  *   type: "put" | "delete",
  *   key: string,
  *   keyspace?: string,
- *   value?: unknown,
- *   seq: number,
- *   feed: string,
- *   actor: string,
- *   privateKeyPem: string,
- *   encryptionKey: Buffer,
- *   ttlMs?: number
+  *   value?: unknown,
+  *   seq: number,
+  *   feed: string,
+  *   actor: string,
+ *   secretKey: Buffer,
+  *   encryptionKey: Buffer,
+ *   ttlMs?: number,
+ *   kind?: "kv" | "heartbeat",
+ *   heartbeat?: null | {
+ *     observedLeader: string | null,
+ *     reachableLeader: boolean,
+ *     appliedFeeds: Record<string, number>
+ *   }
  * }} input
  * @returns {Record<string, unknown>}
  */
 export function createSignedOperation(input) {
   const ts = new Date().toISOString()
   const expiresAt = new Date(Date.now() + (input.ttlMs ?? 1000 * 60 * 60 * 24 * 30 * 6)).toISOString()
+  const kind = input.kind ?? "kv"
   const value =
-    input.type === "put"
+    kind === "kv" && input.type === "put"
       ? encryptString(JSON.stringify(input.value), input.encryptionKey)
       : null
 
   const unsigned = {
     v: 1,
+    kind,
     feed: input.feed,
     seq: input.seq,
     type: input.type,
     key: input.key,
     keyspace: input.keyspace ?? "default",
     value,
+    heartbeat: input.heartbeat ?? null,
     ts,
     expiresAt,
     actor: input.actor
@@ -43,7 +52,7 @@ export function createSignedOperation(input) {
 
   const unsignedBytes = Buffer.from(canonicalize(unsigned))
   const opId = createHash("sha256").update(unsignedBytes).digest("hex")
-  const signature = signPayload(input.privateKeyPem, unsignedBytes)
+  const signature = signPayload(input.secretKey, unsignedBytes)
 
   return {
     ...unsigned,
@@ -54,10 +63,10 @@ export function createSignedOperation(input) {
 
 /**
  * @param {Record<string, unknown>} operation
- * @param {string} publicKeyPem
+ * @param {Buffer} publicKey
  * @returns {boolean}
  */
-export function verifySignedOperation(operation, publicKeyPem) {
+export function verifySignedOperation(operation, publicKey) {
   const { signature, opId, ...unsigned } = operation
   if (typeof signature !== "string" || typeof opId !== "string") return false
 
@@ -65,7 +74,7 @@ export function verifySignedOperation(operation, publicKeyPem) {
   const expectedOpId = createHash("sha256").update(unsignedBytes).digest("hex")
   if (expectedOpId !== opId) return false
 
-  return verifyPayload(publicKeyPem, unsignedBytes, signature)
+  return verifyPayload(publicKey, unsignedBytes, signature)
 }
 
 /**

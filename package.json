@@ -9,6 +9,8 @@
   "dependencies": {
     "corestore": "^7.10.1",
     "hyperbee": "^2.27.3",
+    "hypercore": "^11.33.2",
+    "hypercore-crypto": "^3.4.2",
     "hyperdht": "^6.32.0",
     "hyperswarm": "^4.17.0"
   }

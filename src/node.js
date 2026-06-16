@@ -1,16 +1,23 @@
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 
+import b4a from "b4a"
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 import Hyperswarm from "hyperswarm"
 
 import { deriveTopic } from "./config.js"
-import { decryptOperationValue, createSignedOperation, verifySignedOperation } from "./operation.js"
+import {
+  createSignedOperation,
+  decryptOperationValue,
+  verifySignedOperation
+} from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
 
+const RPC_EXTENSION = "planb-cleard-rpc-v1"
+
 /**
- * Minimal single-leader node for milestone 1.
+ * Minimal multi-node swarm with one feed per node and leader-only writes.
  */
 export class HolepunchSwarmNode {
   /**
@@ -18,25 +25,44 @@ export class HolepunchSwarmNode {
    *   dataDir: string,
    *   clusterId: string,
    *   topicSalt: string,
-   *   role: "leader" | "follower",
-   *   identity: { publicKeyId: string, publicKeyPem: string, privateKeyPem: string },
-   *   authorizedWriter: { publicKeyId: string, publicKeyPem: string },
+   *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
+   *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
    *   encryptionKey: Buffer,
-   *   leaderFeedKey?: string,
-   *   bootstrap?: Array<string | { host: string, port: number }>
+   *   bootstrap?: Array<string | { host: string, port: number }>,
+   *   heartbeatIntervalMs?: number,
+   *   heartbeatTtlMs?: number,
+   *   forwarding?: boolean,
+   *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
   constructor(options) {
-    this.options = options
+    this.options = {
+      heartbeatIntervalMs: 500,
+      heartbeatTtlMs: 3000,
+      forwarding: true,
+      durability: {
+        requiredFollowerAcks: 1,
+        timeoutMs: 5000,
+        ...options.durability
+      },
+      ...options
+    }
     this.store = null
     this.swarm = null
-    this.logCore = null
     this.viewBee = null
     this.view = null
     this.discovery = null
-    this.syncing = null
-    this.pendingSync = false
+    this.feedCores = new Map()
+    this.heartbeatTimer = null
+    this.syncPromises = new Map()
+    this.pendingSync = new Set()
+    this.rpcExtensions = new Map()
+    this.requestId = 0
+    this.inflightRequests = new Map()
+    this.ackWaiters = new Map()
+    this.lastHeartbeatByNode = new Map()
     this.connections = new Set()
+    this.closing = false
   }
 
   async start() {
@@ -46,16 +72,32 @@ export class HolepunchSwarmNode {
     this.store = new Corestore(join(this.options.dataDir, "corestore"))
     await this.store.ready()
 
-    this.logCore =
-      this.options.role === "leader"
-        ? this.store.get({ name: "leader-log", valueEncoding: "json" })
-        : this.store.get({ key: Buffer.from(this.options.leaderFeedKey, "hex"), valueEncoding: "json" })
-
     const viewCore = this.store.get({ name: "derived-view" })
     this.viewBee = new Hyperbee(viewCore, { keyEncoding: "utf-8", valueEncoding: "json" })
     this.view = new MaterializedView(this.viewBee)
+    await this.viewBee.ready()
 
-    await Promise.all([this.logCore.ready(), this.viewBee.ready()])
+    for (const node of this.options.authorizedNodes) {
+      const isLocal = node.nodeId === this.options.identity.publicKeyId
+      const core = isLocal
+        ? this.store.get({
+            keyPair: {
+              publicKey: this.options.identity.publicKey,
+              secretKey: this.options.identity.secretKey
+            },
+            valueEncoding: "json"
+          })
+        : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
+
+      await core.ready()
+      core.on("append", () => {
+        void this.syncFeed(node.nodeId).catch((error) => {
+          if (!this.closing && error?.code !== "REQUEST_CANCELLED") throw error
+        })
+      })
+      this.feedCores.set(node.nodeId, core)
+      this.rpcExtensions.set(node.nodeId, this.#registerRpcExtension(core))
+    }
 
     this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
     this.swarm.on("connection", (conn) => {
@@ -64,29 +106,43 @@ export class HolepunchSwarmNode {
       this.store.replicate(conn)
     })
 
-    this.discovery = this.swarm.join(deriveTopic(this.options), {
-      client: true,
-      server: true
-    })
-
+    this.discovery = this.swarm.join(deriveTopic(this.options), { client: true, server: true })
     await this.discovery.flushed()
-    this.logCore.on("append", () => {
-      void this.sync()
-    })
-    await this.sync()
-  }
 
-  get leaderFeedKey() {
-    return Buffer.from(this.logCore.key).toString("hex")
+    for (const node of this.options.authorizedNodes) {
+      await this.syncFeed(node.nodeId)
+    }
+
+    await this.#appendHeartbeat()
+    this.heartbeatTimer = setInterval(() => {
+      void this.#appendHeartbeat()
+    }, this.options.heartbeatIntervalMs)
+    this.heartbeatTimer.unref?.()
   }
 
   get status() {
     return {
-      role: this.options.role,
-      leaderFeedKey: this.leaderFeedKey,
-      logLength: this.logCore.length,
-      connections: this.connections.size
+      nodeId: this.options.identity.publicKeyId,
+      leader: this.currentLeader(),
+      knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
+      connections: this.connections.size,
+      feeds: Object.fromEntries(
+        [...this.feedCores.entries()].map(([nodeId, core]) => [nodeId, core.length])
+      )
     }
+  }
+
+  currentLeader() {
+    const now = Date.now()
+    return this.options.authorizedNodes
+      .filter((node) => {
+        if (node.nodeId === this.options.identity.publicKeyId) return true
+        const heartbeat = this.lastHeartbeatByNode.get(node.nodeId)
+        if (!heartbeat) return false
+        return now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs
+      })
+      .map((node) => node.nodeId)
+      .sort()[0] ?? null
   }
 
   /**
@@ -95,24 +151,11 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async put(key, value, options = {}) {
-    this.#assertLeader()
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      return this.#forwardWrite({ action: "put", key, value, options })
+    }
 
-    const operation = createSignedOperation({
-      type: "put",
-      key,
-      keyspace: options.keyspace,
-      value,
-      seq: this.logCore.length,
-      feed: this.leaderFeedKey,
-      actor: this.options.identity.publicKeyId,
-      privateKeyPem: this.options.identity.privateKeyPem,
-      encryptionKey: this.options.encryptionKey,
-      ttlMs: options.ttlMs
-    })
-
-    await this.logCore.append(operation)
-    await this.sync()
-    return operation
+    return this.#appendKvOperation("put", key, value, options)
   }
 
   /**
@@ -120,23 +163,11 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async delete(key, options = {}) {
-    this.#assertLeader()
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      return this.#forwardWrite({ action: "delete", key, options })
+    }
 
-    const operation = createSignedOperation({
-      type: "delete",
-      key,
-      keyspace: options.keyspace,
-      seq: this.logCore.length,
-      feed: this.leaderFeedKey,
-      actor: this.options.identity.publicKeyId,
-      privateKeyPem: this.options.identity.privateKeyPem,
-      encryptionKey: this.options.encryptionKey,
-      ttlMs: options.ttlMs
-    })
-
-    await this.logCore.append(operation)
-    await this.sync()
-    return operation
+    return this.#appendKvOperation("delete", key, undefined, options)
   }
 
   /**
@@ -146,9 +177,7 @@ export class HolepunchSwarmNode {
   async get(key, options = {}) {
     const current = await this.view.getCurrent(options.keyspace ?? "default", key)
     if (!current) return null
-    if (current.metadata.deleted) {
-      return { ...current.metadata, value: null }
-    }
+    if (current.metadata.deleted) return { ...current.metadata, value: null }
 
     return {
       ...current.metadata,
@@ -170,53 +199,327 @@ export class HolepunchSwarmNode {
     return this.view.getHistory(options.keyspace ?? "default", key)
   }
 
-  async sync() {
-    if (this.syncing) {
-      this.pendingSync = true
-      return this.syncing
-    }
-
-    this.syncing = this.#syncLoop()
-
-    try {
-      await this.syncing
-    } finally {
-      this.syncing = null
-      if (this.pendingSync) {
-        this.pendingSync = false
-        await this.sync()
-      }
-    }
-  }
-
   async close() {
-    for (const conn of this.connections) {
-      conn.destroy()
-    }
-
+    this.closing = true
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    for (const conn of this.connections) conn.destroy()
     if (this.swarm) await this.swarm.destroy()
+    for (const extension of this.rpcExtensions.values()) extension.destroy()
+    for (const core of this.feedCores.values()) await core.close()
     if (this.viewBee) await this.viewBee.close()
-    if (this.logCore) await this.logCore.close()
     if (this.store) await this.store.close()
   }
 
-  async #syncLoop() {
-    const feedKey = this.leaderFeedKey
-    let applied = await this.view.getApplied(feedKey)
+  /**
+   * @param {string} nodeId
+   */
+  async syncFeed(nodeId) {
+    if (this.syncPromises.has(nodeId)) {
+      this.pendingSync.add(nodeId)
+      return this.syncPromises.get(nodeId)
+    }
 
-    while (applied < this.logCore.length) {
-      const operation = await this.logCore.get(applied)
-      if (!verifySignedOperation(operation, this.options.authorizedWriter.publicKeyPem)) {
-        throw new Error(`Invalid operation at sequence ${applied}`)
+    const promise = this.#syncFeedLoop(nodeId)
+    this.syncPromises.set(nodeId, promise)
+
+    try {
+      await promise
+    } catch (error) {
+      if (!this.closing && error?.code !== "REQUEST_CANCELLED") throw error
+    } finally {
+      this.syncPromises.delete(nodeId)
+      if (this.pendingSync.has(nodeId)) {
+        this.pendingSync.delete(nodeId)
+        await this.syncFeed(nodeId)
       }
-      await this.view.apply(operation, feedKey)
+    }
+  }
+
+  /**
+   * @param {string} nodeId
+   */
+  async #syncFeedLoop(nodeId) {
+    const node = this.#getAuthorizedNode(nodeId)
+    const core = this.feedCores.get(nodeId)
+    let applied = await this.view.getApplied(node.feedKey)
+
+    while (applied < core.length) {
+      const operation = await core.get(applied)
+      if (!verifySignedOperation(operation, node.publicKey)) {
+        throw new Error(`Invalid operation at sequence ${applied} for ${nodeId}`)
+      }
+      await this.view.apply(operation, node.feedKey)
+      if (operation.kind === "heartbeat") {
+        this.lastHeartbeatByNode.set(operation.actor, {
+          ts: operation.ts,
+          feed: node.feedKey,
+          seq: operation.seq,
+          appliedFeeds: operation.heartbeat?.appliedFeeds ?? {}
+        })
+      } else if (operation.kind === "kv" && nodeId !== this.options.identity.publicKeyId) {
+        this.#sendAck(nodeId, operation.seq)
+      }
       applied += 1
     }
   }
 
-  #assertLeader() {
-    if (this.options.role !== "leader") {
-      throw new Error("Only the leader may append K/V operations in milestone 1")
+  async #appendHeartbeat() {
+    const leader = this.currentLeader()
+    const operation = createSignedOperation({
+      kind: "heartbeat",
+      type: "put",
+      key: `heartbeat:${this.options.identity.publicKeyId}`,
+      keyspace: "system",
+      seq: this.#localCore().length,
+      feed: this.options.identity.feedKey,
+      actor: this.options.identity.publicKeyId,
+      secretKey: this.options.identity.secretKey,
+      encryptionKey: this.options.encryptionKey,
+      heartbeat: {
+        observedLeader: leader,
+        reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
+        appliedFeeds: await this.#appliedFeeds()
+      }
+    })
+
+    await this.#localCore().append(operation)
+    await this.syncFeed(this.options.identity.publicKeyId)
+  }
+
+  async #appendKvOperation(type, key, value, options) {
+    const followerRequirement = this.options.durability.requiredFollowerAcks
+    if (this.#aliveFollowers().length < followerRequirement) {
+      throw new Error("Durability requirement not met: no reachable follower available")
     }
+
+    const operation = createSignedOperation({
+      kind: "kv",
+      type,
+      key,
+      keyspace: options.keyspace,
+      value,
+      seq: this.#localCore().length,
+      feed: this.options.identity.feedKey,
+      actor: this.options.identity.publicKeyId,
+      secretKey: this.options.identity.secretKey,
+      encryptionKey: this.options.encryptionKey,
+      ttlMs: options.ttlMs
+    })
+
+    const ackPromise = this.#waitForFollowerAck(operation.seq, followerRequirement)
+    await this.#localCore().append(operation)
+    await this.syncFeed(this.options.identity.publicKeyId)
+    await ackPromise
+    return operation
+  }
+
+  async #forwardWrite(request) {
+    if (!this.options.forwarding) {
+      throw new Error("Write forwarding is disabled on this node")
+    }
+
+    const leader = this.currentLeader()
+    if (!leader) throw new Error("No current leader is available")
+
+    const leaderCore = this.feedCores.get(leader)
+    const extension = this.rpcExtensions.get(leader)
+    const peer = leaderCore.peers[0]
+    if (!peer) {
+      throw new Error(`Current leader ${leader} is not reachable`)
+    }
+
+    const requestId = `${this.options.identity.publicKeyId}-${++this.requestId}`
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.inflightRequests.delete(requestId)
+        reject(new Error(`Timed out forwarding write request ${requestId}`))
+      }, this.options.durability.timeoutMs)
+      this.inflightRequests.set(requestId, {
+        resolve,
+        reject,
+        timer
+      })
+    })
+
+    extension.send(
+      {
+        type: "write-request",
+        requestId,
+        from: this.options.identity.publicKeyId,
+        request
+      },
+      peer
+    )
+
+    return response
+  }
+
+  /**
+   * @param {number} seq
+   * @param {number} required
+   */
+  async #waitForFollowerAck(seq, required) {
+    const key = `${this.options.identity.feedKey}:${seq}`
+    const existing = this.ackWaiters.get(key) ?? {
+      nodes: new Set(),
+      resolve: null,
+      reject: null,
+      timer: null,
+      promise: null
+    }
+
+    if (!existing.promise) {
+      existing.promise = new Promise((resolve, reject) => {
+        existing.resolve = resolve
+        existing.reject = reject
+        existing.timer = setTimeout(() => {
+          this.ackWaiters.delete(key)
+          reject(new Error(`Timed out waiting for follower acknowledgement for sequence ${seq}`))
+        }, this.options.durability.timeoutMs)
+      })
+      this.ackWaiters.set(key, existing)
+    }
+
+    if (existing.nodes.size >= required) {
+      clearTimeout(existing.timer)
+      this.ackWaiters.delete(key)
+      return
+    }
+
+    return existing.promise
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {number} seq
+   */
+  #recordAck(nodeId, seq) {
+    const key = `${this.options.identity.feedKey}:${seq}`
+    const waiter = this.ackWaiters.get(key)
+    if (!waiter) return
+
+    waiter.nodes.add(nodeId)
+    if (waiter.nodes.size >= this.options.durability.requiredFollowerAcks) {
+      clearTimeout(waiter.timer)
+      this.ackWaiters.delete(key)
+      waiter.resolve()
+    }
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {number} seq
+   */
+  #sendAck(nodeId, seq) {
+    const core = this.feedCores.get(nodeId)
+    const extension = this.rpcExtensions.get(nodeId)
+    const peer = core.peers[0]
+    if (!peer) return
+
+    extension.send(
+      {
+        type: "write-ack",
+        from: this.options.identity.publicKeyId,
+        feedKey: nodeId,
+        seq
+      },
+      peer
+    )
+  }
+
+  /**
+   * @param {import("hypercore")} core
+   */
+  #registerRpcExtension(core) {
+    return core.registerExtension(RPC_EXTENSION, {
+      encoding: "json",
+      onmessage: async (message, peer) => {
+        try {
+          if (message.type === "write-request") {
+            if (this.currentLeader() !== this.options.identity.publicKeyId) {
+              throw new Error("This node is not the current leader")
+            }
+            const result =
+              message.request.action === "put"
+                ? await this.#appendKvOperation(
+                    "put",
+                    message.request.key,
+                    message.request.value,
+                    message.request.options ?? {}
+                  )
+                : await this.#appendKvOperation(
+                    "delete",
+                    message.request.key,
+                    undefined,
+                    message.request.options ?? {}
+                  )
+
+            this.rpcExtensions
+              .get(message.from)
+              .send({ type: "write-response", requestId: message.requestId, ok: true, result }, peer)
+            return
+          }
+
+          if (message.type === "write-response") {
+            const pending = this.inflightRequests.get(message.requestId)
+            if (!pending) return
+            clearTimeout(pending.timer)
+            this.inflightRequests.delete(message.requestId)
+            if (message.ok) pending.resolve(message.result)
+            else pending.reject(new Error(message.error))
+            return
+          }
+
+          if (message.type === "write-ack") {
+            this.#recordAck(message.from, message.seq)
+          }
+        } catch (error) {
+          if (message.type === "write-request") {
+            this.rpcExtensions.get(message.from).send(
+              {
+                type: "write-response",
+                requestId: message.requestId,
+                ok: false,
+                error: error instanceof Error ? error.message : String(error)
+              },
+              peer
+            )
+          }
+        }
+      }
+    })
+  }
+
+  #localCore() {
+    return this.feedCores.get(this.options.identity.publicKeyId)
+  }
+
+  #getAuthorizedNode(nodeId) {
+    const node = this.options.authorizedNodes.find((entry) => entry.nodeId === nodeId)
+    if (!node) throw new Error(`Unknown authorized node ${nodeId}`)
+    return node
+  }
+
+  #aliveFollowers() {
+    const leader = this.options.identity.publicKeyId
+    const now = Date.now()
+    return [...this.lastHeartbeatByNode.entries()]
+      .filter(([nodeId]) => nodeId !== leader)
+      .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
+      .map(([nodeId]) => nodeId)
+  }
+
+  #isLeaderReachable(nodeId) {
+    if (nodeId === this.options.identity.publicKeyId) return true
+    const core = this.feedCores.get(nodeId)
+    return !!core?.peers?.length
+  }
+
+  async #appliedFeeds() {
+    const applied = {}
+    for (const node of this.options.authorizedNodes) {
+      applied[node.feedKey] = await this.view.getApplied(node.feedKey)
+    }
+    return applied
   }
 }

@@ -2,64 +2,56 @@ import {
   createCipheriv,
   createDecipheriv,
   createHash,
-  createPrivateKey,
-  createPublicKey,
-  generateKeyPairSync,
-  randomBytes,
-  sign,
-  verify
+  randomBytes
 } from "node:crypto"
+import b4a from "b4a"
+import crypto from "hypercore-crypto"
+import Hypercore from "hypercore"
 
 /**
  * Create a stable node identity for signing operations.
  *
- * @returns {{ publicKeyId: string, publicKeyPem: string, privateKeyPem: string }}
+ * @param {Buffer} [seed]
+ * @returns {{ publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string }}
  */
-export function generateIdentity() {
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519")
-  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString()
-  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString()
+export function generateIdentity(seed) {
+  const keyPair = crypto.keyPair(seed)
 
   return {
-    publicKeyId: keyIdFromPublicKey(publicKeyPem),
-    publicKeyPem,
-    privateKeyPem
+    publicKeyId: keyIdFromPublicKey(keyPair.publicKey),
+    publicKey: keyPair.publicKey,
+    secretKey: keyPair.secretKey,
+    feedKey: b4a.toString(Hypercore.key(keyPair.publicKey), "hex")
   }
 }
 
 /**
- * Convert a PEM public key to the stable node id used in operations.
+ * Convert a public key to the stable node id used in operations.
  *
- * @param {string} publicKeyPem
+ * @param {Buffer} publicKey
  * @returns {string}
  */
-export function keyIdFromPublicKey(publicKeyPem) {
-  const der = createPublicKey(publicKeyPem).export({ type: "spki", format: "der" })
-  return createHash("sha256").update(der).digest("hex")
+export function keyIdFromPublicKey(publicKey) {
+  return createHash("sha256").update(publicKey).digest("hex")
 }
 
 /**
- * @param {string} privateKeyPem
+ * @param {Buffer} secretKey
  * @param {Buffer} payload
  * @returns {string}
  */
-export function signPayload(privateKeyPem, payload) {
-  return sign(null, payload, createPrivateKey(privateKeyPem)).toString("base64url")
+export function signPayload(secretKey, payload) {
+  return b4a.toString(crypto.sign(payload, secretKey), "base64url")
 }
 
 /**
- * @param {string} publicKeyPem
+ * @param {Buffer} publicKey
  * @param {Buffer} payload
  * @param {string} signature
  * @returns {boolean}
  */
-export function verifyPayload(publicKeyPem, payload, signature) {
-  return verify(
-    null,
-    payload,
-    createPublicKey(publicKeyPem),
-    Buffer.from(signature, "base64url")
-  )
+export function verifyPayload(publicKey, payload, signature) {
+  return crypto.verify(payload, Buffer.from(signature, "base64url"), publicKey)
 }
 
 /**
