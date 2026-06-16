@@ -204,13 +204,20 @@ export class HolepunchSwarmNode {
   async getReplicationStatus() {
     const heartbeats = await this.view.getHeartbeats()
     const feeds = {}
+    const now = Date.now()
 
     for (const node of this.options.authorizedNodes) {
       const core = this.feedCores.get(node.nodeId)
+      const applied = await this.view.getApplied(node.feedKey)
+      const heartbeat = heartbeats[node.nodeId] ?? null
       feeds[node.nodeId] = {
         feedKey: node.feedKey,
         length: core.length,
-        applied: await this.view.getApplied(node.feedKey)
+        applied,
+        lag: core.length - applied,
+        connectedPeers: core.peers.length,
+        alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
+        heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null
       }
     }
 
@@ -219,6 +226,7 @@ export class HolepunchSwarmNode {
       leader: this.currentLeader(),
       connections: this.connections.size,
       lastDurableSequence: this.lastDurableSequence,
+      knownPeerNodeIds: [...this.connections].map((conn) => b4a.toString(conn.remotePublicKey, "hex")),
       feeds,
       heartbeats
     }
@@ -399,6 +407,7 @@ export class HolepunchSwarmNode {
         timer
       })
     })
+    response.catch(() => {})
 
     extension.send(
       {

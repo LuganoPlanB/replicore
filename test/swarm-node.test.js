@@ -155,7 +155,7 @@ test("followers forward writes to the computed leader and the next alive node be
       .map((identity) => identity.publicKeyId)
       .sort()[0]
     await waitFor(async () => follower1.currentLeader() === leaderId)
-    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
 
     const op = await follower1.put("hash:beta", { forwarded: true })
     assert.equal(op.actor, leaderId)
@@ -172,7 +172,9 @@ test("followers forward writes to the computed leader and the next alive node be
       .sort()[0]
 
     await waitFor(async () => survivingObserver.currentLeader() === expectedNextLeader)
-    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 2))
+    await waitFor(
+      async () => Object.keys((await survivingObserver.getReplicationStatus()).heartbeats).length >= 2
+    )
 
     const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
     const result = await nextLeaderNode.put("hash:gamma", { failover: true })
@@ -270,6 +272,9 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
     const replication = await replicationResponse.json()
     assert.equal(replication.nodeId, nodes[1].options.identity.publicKeyId)
     assert.equal(typeof replication.lastDurableSequence, "number")
+    assert.equal(typeof replication.knownPeerNodeIds.length, "number")
+    assert.equal(typeof replication.feeds[nodes[1].options.identity.publicKeyId].lag, "number")
+    assert.equal(typeof replication.feeds[nodes[1].options.identity.publicKeyId].alive, "boolean")
 
     const writersResponse = await fetch(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)
