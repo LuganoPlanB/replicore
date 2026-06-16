@@ -78,6 +78,64 @@ export function verifySignedOperation(operation, publicKey) {
 }
 
 /**
+ * Validate the operation shape and its feed/actor invariants.
+ *
+ * @param {Record<string, unknown>} operation
+ * @param {{ nodeId: string, feedKey: string }} expected
+ */
+export function validateOperation(operation, expected) {
+  if (operation.v !== 1) {
+    throw new Error(`Unsupported operation version: ${operation.v}`)
+  }
+
+  if (operation.actor !== expected.nodeId) {
+    throw new Error(`Operation actor mismatch: expected ${expected.nodeId}`)
+  }
+
+  if (operation.feed !== expected.feedKey) {
+    throw new Error(`Operation feed mismatch: expected ${expected.feedKey}`)
+  }
+
+  if (typeof operation.seq !== "number" || operation.seq < 0 || !Number.isInteger(operation.seq)) {
+    throw new Error("Operation sequence must be a non-negative integer")
+  }
+
+  if (typeof operation.opId !== "string" || typeof operation.signature !== "string") {
+    throw new Error("Operation must include opId and signature")
+  }
+
+  if (operation.kind === "heartbeat") {
+    if (operation.type !== "put") {
+      throw new Error("Heartbeat operations must use type=put")
+    }
+    if (typeof operation.heartbeat !== "object" || operation.heartbeat === null) {
+      throw new Error("Heartbeat operation must include heartbeat metadata")
+    }
+    return
+  }
+
+  if (operation.kind !== "kv") {
+    throw new Error(`Unsupported operation kind: ${operation.kind}`)
+  }
+
+  if (operation.type !== "put" && operation.type !== "delete") {
+    throw new Error(`Unsupported K/V operation type: ${operation.type}`)
+  }
+
+  if (typeof operation.key !== "string" || typeof operation.keyspace !== "string") {
+    throw new Error("K/V operation must include key and keyspace")
+  }
+
+  if (operation.type === "put" && !operation.value) {
+    throw new Error("Put operation must include an encrypted value")
+  }
+
+  if (operation.type === "delete" && operation.value !== null) {
+    throw new Error("Delete operation must store a null value payload")
+  }
+}
+
+/**
  * @param {Record<string, unknown>} operation
  * @param {Buffer} encryptionKey
  * @returns {unknown}

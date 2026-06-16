@@ -10,6 +10,7 @@ import { deriveTopic } from "./config.js"
 import {
   createSignedOperation,
   decryptOperationValue,
+  validateOperation,
   verifySignedOperation
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
@@ -63,6 +64,7 @@ export class HolepunchSwarmNode {
     this.lastHeartbeatByNode = new Map()
     this.connections = new Set()
     this.closing = false
+    this.lastDurableSequence = -1
   }
 
   async start() {
@@ -216,6 +218,7 @@ export class HolepunchSwarmNode {
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
       connections: this.connections.size,
+      lastDurableSequence: this.lastDurableSequence,
       feeds,
       heartbeats
     }
@@ -289,6 +292,7 @@ export class HolepunchSwarmNode {
 
     while (applied < core.length) {
       const operation = await core.get(applied)
+      validateOperation(operation, node)
       if (!verifySignedOperation(operation, node.publicKey)) {
         throw new Error(`Invalid operation at sequence ${applied} for ${nodeId}`)
       }
@@ -427,6 +431,7 @@ export class HolepunchSwarmNode {
     if (existing.nodes.size >= required) {
       clearTimeout(existing.timer)
       this.ackWaiters.delete(key)
+      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
       return
     }
 
@@ -446,6 +451,7 @@ export class HolepunchSwarmNode {
     if (waiter.nodes.size >= this.options.durability.requiredFollowerAcks) {
       clearTimeout(waiter.timer)
       this.ackWaiters.delete(key)
+      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
       waiter.resolve()
     }
   }

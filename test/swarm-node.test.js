@@ -10,7 +10,8 @@ import createTestnet from "hyperdht/testnet.js"
 import {
   generateIdentity,
   HolepunchHttpServer,
-  HolepunchSwarmNode
+  HolepunchSwarmNode,
+  validateOperation
 } from "../src/index.js"
 
 test("leader operations replicate to followers and rebuild after restart", async () => {
@@ -268,6 +269,7 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
     assert.equal(replicationResponse.status, 200)
     const replication = await replicationResponse.json()
     assert.equal(replication.nodeId, nodes[1].options.identity.publicKeyId)
+    assert.equal(typeof replication.lastDurableSequence, "number")
 
     const writersResponse = await fetch(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)
@@ -284,6 +286,33 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
+})
+
+test("operation validation rejects mismatched feed metadata", () => {
+  const identity = generateIdentity(seed("validation"))
+  const operation = {
+    v: 1,
+    kind: "kv",
+    opId: "x",
+    signature: "y",
+    feed: "wrong-feed",
+    seq: 0,
+    type: "delete",
+    key: "hash:key",
+    keyspace: "default",
+    value: null,
+    heartbeat: null,
+    ts: new Date().toISOString(),
+    expiresAt: new Date().toISOString(),
+    actor: identity.publicKeyId
+  }
+
+  assert.throws(() => {
+    validateOperation(operation, {
+      nodeId: identity.publicKeyId,
+      feedKey: identity.feedKey
+    })
+  }, /feed mismatch/)
 })
 
 /**

@@ -13,6 +13,7 @@ export { HolepunchHttpServer } from "./http-server.js"
 export {
   createSignedOperation,
   decryptOperationValue,
+  validateOperation,
   verifySignedOperation
 } from "./operation.js"
 export { HolepunchSwarmNode } from "./node.js"
