@@ -1,0 +1,34 @@
+{
+  "dataDir": "../../data/node-2",
+  "clusterId": "local-demo",
+  "topicSalt": "local-demo-salt",
+  "identitySeed": "2222222222222222222222222222222222222222222222222222222222222222",
+  "authorizedNodeSeeds": [
+    "1111111111111111111111111111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222222222222222222222222222",
+    "3333333333333333333333333333333333333333333333333333333333333333"
+  ],
+  "encryptionKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bootstrap": [
+    {
+      "host": "127.0.0.1",
+      "port": 49737
+    }
+  ],
+  "http": {
+    "host": "127.0.0.1",
+    "port": 3002
+  },
+  "auth": {
+    "tokens": {
+      "writer": {
+        "readKeyspaces": ["default"],
+        "writeKeyspaces": ["default"]
+      },
+      "reader": {
+        "readKeyspaces": ["default"],
+        "writeKeyspaces": []
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 holepunch-stack
 .gestalt
 node_modules
-
+data
+tmp

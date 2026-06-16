@@ -1,5 +1,6 @@
 export { canonicalize } from "./canonical.js"
 export { deriveTopic } from "./config.js"
+export { loadRuntimeConfig } from "./config-loader.js"
 export {
   decryptString,
   encryptString,
