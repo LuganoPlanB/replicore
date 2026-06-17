@@ -44,3 +44,18 @@ Replicore should keep two read modes:
 Until strong reads exist, the API and status responses must not imply
 linearizable reads. Existing stale-read metadata should remain explicit and be
 extended rather than removed.
+
+## Non-Goals
+
+This production path does not include:
+
+- multi-writer conflict merge
+- accepting durable writes on both sides of a split
+- Byzantine fault tolerance
+- full PKI or external trust infrastructure
+- automatic recovery from shared-secret compromise
+- custom NAT traversal or deployment-specific networking
+- external database coordination
+
+The common cluster secret is for discovery and admission only. It is not a
+defense against a node that already knows the secret and behaves maliciously.
