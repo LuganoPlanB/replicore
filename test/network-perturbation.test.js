@@ -619,6 +619,145 @@ test("offline follower misses writes, then catches up with full history after re
   }
 })
 
+test("offline leader yields failover writes and catches up cleanly after restart", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const originalLeaderId = currentLeaderId(cluster)
+    const originalLeader = cluster.record(originalLeaderId).node
+
+    const beforeFailover = await originalLeader.put("hash:leader-before", { phase: "before" })
+    assert.equal(beforeFailover.actor, originalLeaderId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:leader-before", { phase: "before" }),
+      {
+        description: "baseline write before leader outage",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await cluster.stopNode(originalLeaderId)
+
+    await waitFor(
+      async () => {
+        const current = currentLeaderNode(cluster)
+        return current && current.options.identity.publicKeyId !== originalLeaderId
+      },
+      {
+        description: "leader failover after original leader stops",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const failoverLeader = currentLeaderNode(cluster)
+    const failoverLeaderId = failoverLeader.options.identity.publicKeyId
+    assert.notEqual(failoverLeaderId, originalLeaderId)
+
+    let duringFailover = null
+    await waitFor(
+      async () => {
+        const currentFailoverLeader = cluster.record(failoverLeaderId).node
+        if (currentFailoverLeader.currentLeader() !== failoverLeaderId) return false
+
+        try {
+          duringFailover = await currentFailoverLeader.put("hash:leader-during", { phase: "during" })
+          return true
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "failover leader accepts writes after original leader outage",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+    assert.equal(duringFailover.actor, failoverLeaderId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:leader-during", { phase: "during" }),
+      {
+        description: "surviving nodes replicate failover write",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const restartedLeader = await cluster.restartNode(originalLeaderId)
+
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const before = await restartedLeader.get("hash:leader-before")
+        const during = await restartedLeader.get("hash:leader-during")
+        return before?.value?.phase === "before" && during?.value?.phase === "during"
+      },
+      {
+        description: "restarted leader catches up to failover writes",
+        onTimeout: () => restartedLeader.getReplicationStatus()
+      }
+    )
+
+    const settledLeaderId = currentLeaderId(cluster)
+    let afterRecovery = null
+    await waitFor(
+      async () => {
+        const settledLeader = cluster.record(settledLeaderId).node
+        if (settledLeader.currentLeader() !== settledLeaderId) return false
+
+        try {
+          afterRecovery = {
+            ok: true,
+            key: "hash:leader-after",
+            operation: await settledLeader.put("hash:leader-after", { phase: "after" })
+          }
+          return true
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "agreed leader accepts post-restart write",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:leader-after", { phase: "after" }),
+      {
+        description: "post-restart write converges to all nodes",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const beforeHistory = await restartedLeader.getHistory("hash:leader-before")
+    const duringHistory = await restartedLeader.getHistory("hash:leader-during")
+    const afterHistory = await restartedLeader.getHistory("hash:leader-after")
+
+    assert.equal(beforeHistory.length, 1)
+    assert.equal(beforeHistory[0].opId, beforeFailover.opId)
+    assert.equal(duringHistory.length, 1)
+    assert.equal(duringHistory[0].opId, duringFailover.opId)
+    assert.equal(afterHistory.length, 1)
+    assert.equal(afterHistory[0].opId, afterRecovery.operation.opId)
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("rolling restarts across a four-node cluster preserve availability and convergence", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 4,
