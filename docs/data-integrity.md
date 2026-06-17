@@ -31,3 +31,16 @@ The target protocol is intentionally narrow:
 This replaces heartbeat-only leader choice for production durability. It does
 not require a full external consensus dependency if the local implementation can
 stay small and readable.
+
+## Read Semantics
+
+Replicore should keep two read modes:
+
+- local reads: available from any node, may be stale, and must report that
+  staleness is possible
+- strong reads: available only after leader or quorum confirmation against the
+  committed log
+
+Until strong reads exist, the API and status responses must not imply
+linearizable reads. Existing stale-read metadata should remain explicit and be
+extended rather than removed.
