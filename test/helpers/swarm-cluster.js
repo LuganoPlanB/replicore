@@ -12,6 +12,9 @@ import { generateIdentity, HolepunchSwarmNode } from "../../src/index.js"
  *
  * @param {{
  *   size?: number,
+ *   identities?: Array<{ publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string }>,
+ *   authorizedNodes?: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
+ *   dataDirs?: string[],
  *   clusterId?: string,
  *   topicSalt?: string,
  *   encryptionKey?: Buffer,
@@ -20,28 +23,32 @@ import { generateIdentity, HolepunchSwarmNode } from "../../src/index.js"
  *   forwarding?: boolean,
  *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number },
  *   revokedNodeIds?: string[],
- *   identityLabels?: string[]
+ *   identityLabels?: string[],
+ *   bootstrap?: Array<string | { host: string, port: number }>,
+ *   testnet?: Awaited<ReturnType<typeof createTestnet>>
  * }} [options]
  */
 export async function createSwarmCluster(options = {}) {
-  const size = options.size ?? 3
+  const identities = options.identities ?? createIdentities(options.size ?? 3, options.identityLabels)
+  const size = identities.length
   const dirs = []
-  const testnet = await createTestnet(size)
-  const identities = createIdentities(size, options.identityLabels)
-  const authorizedNodes = identities.map((identity) => ({
-    nodeId: identity.publicKeyId,
-    publicKey: identity.publicKey,
-    feedKey: identity.feedKey
-  }))
+  const testnet = options.testnet ?? (options.bootstrap ? null : await createTestnet(size))
+  const authorizedNodes =
+    options.authorizedNodes ??
+    identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
   const encryptionKey = options.encryptionKey ?? randomBytes(32)
   const records = new Map()
 
   for (const [index, identity] of identities.entries()) {
-    const label = defaultNodeLabel(index)
+    const label = options.identityLabels?.[index] ?? defaultNodeLabel(index)
     records.set(identity.publicKeyId, {
       label,
       identity,
-      dataDir: await tempDir(dirs),
+      dataDir: options.dataDirs?.[index] ?? (await tempDir(dirs)),
       node: null
     })
   }
@@ -115,7 +122,7 @@ export async function createSwarmCluster(options = {}) {
         identity: record.identity,
         authorizedNodes: this.authorizedNodes,
         encryptionKey: this.encryptionKey,
-        bootstrap: this.testnet.bootstrap,
+        bootstrap: options.bootstrap ?? this.testnet?.bootstrap ?? [],
         heartbeatIntervalMs: this.options.heartbeatIntervalMs,
         heartbeatTtlMs: this.options.heartbeatTtlMs,
         forwarding: this.options.forwarding,
@@ -155,9 +162,9 @@ export async function createSwarmCluster(options = {}) {
     },
 
     /**
-     * Close all nodes and remove every temporary directory.
+     * Close every running node and keep the underlying resources.
      */
-    async closeAll() {
+    async closeNodes() {
       await Promise.allSettled(
         [...records.values()].map(async (record) => {
           if (!record.node) return
@@ -165,8 +172,24 @@ export async function createSwarmCluster(options = {}) {
           record.node = null
         })
       )
-      await this.testnet.destroy()
+    },
+
+    /**
+     * Destroy underlying test resources after nodes are closed.
+     */
+    async destroyResources() {
+      if (this.testnet && !options.testnet) {
+        await this.testnet.destroy()
+      }
       await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    },
+
+    /**
+     * Close all nodes and remove every temporary directory.
+     */
+    async closeAll() {
+      await this.closeNodes()
+      await this.destroyResources()
     }
   }
 

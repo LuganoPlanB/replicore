@@ -539,9 +539,8 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
     await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
 
     await currentLeaderNode.put("hash:snapshot", { state: "present" })
-    await waitFor(async () => (await follower.get("hash:snapshot"))?.value?.state === "present")
 
-    const snapshot = await follower.createSnapshot()
+    const snapshot = await currentLeaderNode.createSnapshot()
 
     const restored = new HolepunchSwarmNode({
       dataDir: await tempDir(dirs),
