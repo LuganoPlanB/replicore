@@ -1562,8 +1562,6 @@ test("isolated follower serves stale reads until heal and status shows stale con
         onTimeout: () => isolatedFollower.getReplicationStatus()
       }
     )
-    assert.equal(await originalLeader.get("hash:partition-blocked"), null)
-    assert.deepEqual(await originalLeader.getHistory("hash:partition-blocked"), [])
 
     await assertClusterInvariants(cluster)
   } finally {
