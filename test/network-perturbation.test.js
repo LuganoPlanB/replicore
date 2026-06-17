@@ -1345,7 +1345,12 @@ test(
         .filter((nodeId) => !minorityNodeIds.includes(nodeId))
       const majorityNodes = majorityNodeIds.map((nodeId) => cluster.record(nodeId).node)
 
-      await originalLeader.put("hash:subgroup-before", { phase: "before" })
+      await waitForDurableWriteFrom(
+        originalLeader,
+        "hash:subgroup-before",
+        { phase: "before" },
+        "baseline durable write before subgroup partition"
+      )
       await waitFor(
         async () => hasClusterValue(cluster.nodes, "hash:subgroup-before", { phase: "before" }),
         {
@@ -1435,7 +1440,12 @@ test(
         }
       )
 
-      const afterHeal = await originalLeader.put("hash:subgroup-after", { phase: "after" })
+      const afterHeal = await waitForDurableWriteFrom(
+        originalLeader,
+        "hash:subgroup-after",
+        { phase: "after" },
+        "post-heal durable write from the original leader"
+      )
       assert.equal(afterHeal.actor, originalLeaderId)
 
       await waitFor(
@@ -2445,6 +2455,25 @@ async function waitForDurableClusterWrite(cluster, key, value, description) {
     }
   )
   return result
+}
+
+async function waitForDurableWriteFrom(node, key, value, description) {
+  let operation = null
+  await waitFor(
+    async () => {
+      try {
+        operation = await node.put(key, value)
+        return true
+      } catch {
+        return false
+      }
+    },
+    {
+      description,
+      onTimeout: () => node.getReplicationStatus()
+    }
+  )
+  return operation
 }
 
 async function assertClusterInvariants(cluster) {
