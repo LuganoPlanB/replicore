@@ -57,5 +57,102 @@ This production path does not include:
 - custom NAT traversal or deployment-specific networking
 - external database coordination
 
-The common cluster secret is for discovery and admission only. It is not a
-defense against a node that already knows the secret and behaves maliciously.
+The common cluster secret is for discovery and read-only learner admission only.
+It is not a defense against a node that already knows the secret and behaves
+maliciously.
+
+## Protocol Vocabulary
+
+Use these terms consistently in code, tests, and docs:
+
+- `Argon2id-based domain-separated KDF`: derivation from the operator-facing
+  `clusterSecret`. Do not call this HKDF; HKDF is a different construction.
+- `secret-derived Holepunch topic`: the Hyperswarm topic derived from
+  `clusterSecret`.
+- `Noise identity classification`: identifying a connected transport peer by
+  its Holepunch/Noise public key and matching it to Replicore membership state.
+- `learner`: a same-secret peer that may replicate committed data and serve
+  read-only local queries, but cannot vote, lead, proxy durable writes, or
+  accept durable writes.
+- `promotion credential`: a user-approved signed object that allows a learner
+  to be considered for voter promotion. The learner is not a voter until the
+  membership path accepts the promotion.
+
+Do not add a custom HMAC pre-admission handshake. Discovery is gated by the
+secret-derived topic, transport identity comes from Noise identity
+classification, and voter authority comes only from committed membership.
+
+## Secret Derivation Defaults
+
+Use `hash-wasm` Argon2id for production secret derivation. The defaults are
+chosen for startup/config-time work, not per-request use:
+
+- variant: `argon2id`
+- version: Argon2 v1.3, as exposed by `hash-wasm`
+- memory: `65536` KiB
+- iterations: `3`
+- parallelism: `1`
+- output: binary, with explicit caller-selected length
+- topic output length: `32` bytes
+- Noise seed output length: `32` bytes
+
+The KDF input is the raw `clusterSecret`. The salt is ASCII and includes the
+purpose label and context:
+
+```text
+replicore:kdf:v1:<purpose-label>:<context>
+```
+
+Use these initial purpose labels:
+
+- `replicore:dht-topic:v1`
+- `replicore:noise-node-key:v1`
+
+For the DHT topic, the context is the stable cluster identifier. For the
+machine-specific Noise key, the context is the machine identity input, defaulting
+to `/etc/machine-id` where available, with explicit config overrides for tests
+and non-Linux environments. Persist the derived identity in the node data dir
+and fail closed if it changes unexpectedly.
+
+## Promotion Credential V1
+
+Use a simple canonical JSON payload signed with the existing Replicore node
+signing key. The signature is over `canonicalize(payload)` bytes.
+
+Payload fields:
+
+- `v`: `1`
+- `type`: `replicore.promotion`
+- `clusterId`: cluster identifier
+- `membershipVersion`: expected membership version
+- `learnerNodeId`: Replicore node ID being promoted
+- `learnerNoisePublicKey`: hex Noise public key being promoted
+- `targetRole`: `voter`
+- `issuedAt`: ISO-8601 timestamp
+- `expiresAt`: ISO-8601 timestamp
+- `nonce`: random base64url string
+- `signerNodeId`: signing voter/admin node ID
+
+Wire object:
+
+```json
+{
+  "payload": {
+    "v": 1,
+    "type": "replicore.promotion",
+    "clusterId": "example",
+    "membershipVersion": 1,
+    "learnerNodeId": "hex-node-id",
+    "learnerNoisePublicKey": "hex-noise-public-key",
+    "targetRole": "voter",
+    "issuedAt": "2026-06-17T00:00:00.000Z",
+    "expiresAt": "2026-06-18T00:00:00.000Z",
+    "nonce": "base64url-random",
+    "signerNodeId": "hex-signer-node-id"
+  },
+  "signature": "base64url-signature"
+}
+```
+
+Validation must check the signature, signer authority, expiry, target learner
+identity, expected membership version, and replay by nonce or credential hash.
