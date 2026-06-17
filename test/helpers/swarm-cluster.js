@@ -108,7 +108,7 @@ export async function createSwarmCluster(options = {}) {
       const record = this.record(selector)
       if (record.node) return record.node
 
-      const node = new HolepunchSwarmNode({
+      const nodeOptions = {
         dataDir: record.dataDir,
         clusterId: this.options.clusterId,
         topicSalt: this.options.topicSalt,
@@ -119,9 +119,13 @@ export async function createSwarmCluster(options = {}) {
         heartbeatIntervalMs: this.options.heartbeatIntervalMs,
         heartbeatTtlMs: this.options.heartbeatTtlMs,
         forwarding: this.options.forwarding,
-        durability: this.options.durability,
         revokedNodeIds: this.options.revokedNodeIds
-      })
+      }
+      if (this.options.durability) {
+        nodeOptions.durability = this.options.durability
+      }
+
+      const node = new HolepunchSwarmNode(nodeOptions)
 
       await node.start()
       record.node = node
