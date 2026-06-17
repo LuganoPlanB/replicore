@@ -1252,6 +1252,8 @@ test("isolated leader blocks minority writes while connected followers continue 
       originalLeader.put("hash:partition-blocked", { blocked: true }),
       /(Durability requirement not met|Timed out waiting for follower acknowledgement)/
     )
+    assert.equal(await originalLeader.get("hash:partition-blocked"), null)
+    assert.deepEqual(await originalLeader.getHistory("hash:partition-blocked"), [])
 
     const duringIsolation = await connectedLeader.put("hash:partition-during", { phase: "during" })
     assert.equal(duringIsolation.actor, expectedConnectedLeaderId)
@@ -1560,6 +1562,8 @@ test("isolated follower serves stale reads until heal and status shows stale con
         onTimeout: () => isolatedFollower.getReplicationStatus()
       }
     )
+    assert.equal(await originalLeader.get("hash:partition-blocked"), null)
+    assert.deepEqual(await originalLeader.getHistory("hash:partition-blocked"), [])
 
     await assertClusterInvariants(cluster)
   } finally {

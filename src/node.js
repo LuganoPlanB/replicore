@@ -131,14 +131,14 @@ export class HolepunchSwarmNode {
       if (!isLocal) {
         core.on("peer-add", (peer) => this.network?.trackPeer(true, node.nodeId, peer))
         core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
-      }
-      core.on("append", () => {
-        void this.syncFeed(node.nodeId).catch((error) => {
-          if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
-            throw error
-          }
+        core.on("append", () => {
+          void this.syncFeed(node.nodeId).catch((error) => {
+            if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+              throw error
+            }
+          })
         })
-      })
+      }
       this.feedCores.set(node.nodeId, core)
       this.rpc.register(node.nodeId, core)
     }
@@ -539,8 +539,8 @@ export class HolepunchSwarmNode {
 
     const ackPromise = this.durabilityWaiter.waitFor(operation.seq, followerRequirement)
     await this.#localCore().append(operation)
-    await this.syncFeed(this.options.identity.publicKeyId)
     await ackPromise
+    await this.syncFeed(this.options.identity.publicKeyId)
     return operation
   }
 

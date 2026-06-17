@@ -723,10 +723,10 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
       authorizedNodes,
       encryptionKey,
       bootstrap: testnet.bootstrap,
-      ackDelayMs: 600,
+      ackDelayMs: 2000,
       durability: {
         requiredFollowerAcks: 1,
-        timeoutMs: 1000
+        timeoutMs: 4000
       }
     })
     const follower = new HolepunchSwarmNode({
@@ -737,7 +737,7 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
       authorizedNodes,
       encryptionKey,
       bootstrap: testnet.bootstrap,
-      ackDelayMs: 600
+      ackDelayMs: 2000
     })
 
     nodes.push(leader, follower)
@@ -752,11 +752,15 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
     await waitFor(async () => follower.currentLeader() === currentLeaderId)
 
     const pendingWrite = leaderNode.put("hash:closing-leader", { phase: "pending-close" })
-    await waitFor(async () => (await leaderNode.get("hash:closing-leader"))?.value?.phase === "pending-close")
+    pendingWrite.catch(() => {})
+    await waitFor(async () => (await leaderNode.getReplicationStatus()).feeds[leaderNode.options.identity.publicKeyId].length > 1)
+    assert.equal(await leaderNode.get("hash:closing-leader"), null)
+    assert.deepEqual(await leaderNode.getHistory("hash:closing-leader"), [])
 
     const closePromise = leaderNode.close()
     await assert.rejects(pendingWrite, /Node is closing/)
     await closePromise
+    nodes.splice(nodes.indexOf(leaderNode), 1)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
