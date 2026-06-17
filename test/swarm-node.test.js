@@ -409,7 +409,9 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     })
 
     nodes.push(leader, follower)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 2)
 
     const server = new HolepunchHttpServer({
@@ -479,6 +481,9 @@ test("a fresh node can restore current state from a snapshot", async () => {
         feedKey: identity.feedKey
       })
     )
+    const activeNodeIds = [leaderIdentity, followerIdentity, observerIdentity]
+      .map((identity) => identity.publicKeyId)
+      .sort()
 
     const leader = new HolepunchSwarmNode({
       dataDir: await tempDir(dirs),
@@ -509,10 +514,15 @@ test("a fresh node can restore current state from a snapshot", async () => {
     })
 
     nodes.push(leader, follower, observer)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
+    await waitFor(async () => leader.currentLeader() === activeNodeIds[0])
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
 
-    await leader.put("hash:snapshot", { state: "present" })
+    await nodes.find((node) => node.options.identity.publicKeyId === activeNodeIds[0]).put("hash:snapshot", {
+      state: "present"
+    })
     await waitFor(async () => (await follower.get("hash:snapshot"))?.value?.state === "present")
 
     const snapshot = await follower.createSnapshot()

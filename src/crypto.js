@@ -20,7 +20,7 @@ export function generateIdentity(seed) {
     publicKeyId: keyIdFromPublicKey(keyPair.publicKey),
     publicKey: keyPair.publicKey,
     secretKey: keyPair.secretKey,
-    feedKey: Buffer.from(Hypercore.key(keyPair.publicKey)).toString("hex")
+    feedKey: Hypercore.key(keyPair.publicKey).toString("hex")
   }
 }
 
@@ -40,7 +40,7 @@ export function keyIdFromPublicKey(publicKey) {
  * @returns {string}
  */
 export function signPayload(secretKey, payload) {
-  return Buffer.from(crypto.sign(payload, secretKey)).toString("base64url")
+  return crypto.sign(payload, secretKey).toString("base64url")
 }
 
 /**

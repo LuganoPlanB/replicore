@@ -238,7 +238,7 @@ export class HolepunchSwarmNode {
       connections: this.connections.size,
       lastDurableSequence: this.lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
-      knownPeerNodeIds: [...this.connections].map((conn) => Buffer.from(conn.remotePublicKey).toString("hex")),
+      knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
       feeds,
       heartbeats
     }
