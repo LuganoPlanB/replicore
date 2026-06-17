@@ -160,7 +160,7 @@ test(
       .map((identity) => identity.publicKeyId)
       .sort()[0]
     await waitFor(async () => follower1.currentLeader() === leaderId)
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
 
     const op = await follower1.put("hash:beta", { forwarded: true })
     assert.equal(op.actor, leaderId)
@@ -427,7 +427,7 @@ test(
 
     nodes.push(leader, follower)
     await Promise.all(nodes.map((node) => node.start()))
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 2)
+    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 2))
     const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
     const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
     await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
