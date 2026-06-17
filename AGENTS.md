@@ -55,6 +55,14 @@ For longer local churn checks, run:
 npm run test:reliability
 ```
 
+For bounded stress and timeout reproduction, run:
+
+```powershell
+node test/test-stress.mjs
+```
+
+Use `REPLICORE_TEST_TRACE=1` to stream fixture lifecycle events during a failing run. The default `npm test` entrypoint now uses `test/run-suite.mjs` so each grouped child test process has its own timeout. Do not add external chaos tooling or child-process dependencies unless the built-in runner and trace path prove insufficient.
+
 ## Docs and Plans
 
 - Top-level human docs belong in `README.md`.
