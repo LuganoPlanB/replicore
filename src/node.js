@@ -15,6 +15,7 @@ import {
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
 import { NodeRpcRouter } from "./node-rpc.js"
+import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
 
@@ -189,7 +190,7 @@ export class HolepunchSwarmNode {
   }
 
   get status() {
-    return {
+    return buildNodeStatus({
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
       knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
@@ -198,7 +199,7 @@ export class HolepunchSwarmNode {
       feeds: Object.fromEntries(
         [...this.feedCores.entries()].map(([nodeId, core]) => [nodeId, core.length])
       )
-    }
+    })
   }
 
   currentLeader() {
@@ -290,7 +291,7 @@ export class HolepunchSwarmNode {
       }
     }
 
-    return {
+    return buildReplicationStatus({
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
       connections: this.network?.connectionCount ?? 0,
@@ -302,11 +303,11 @@ export class HolepunchSwarmNode {
       readStatus: this.#readStatus(),
       feeds,
       heartbeats
-    }
+    })
   }
 
   getWritersStatus() {
-    return {
+    return buildWritersStatus({
       currentLeader: this.currentLeader(),
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
@@ -316,19 +317,19 @@ export class HolepunchSwarmNode {
         feedKey: node.feedKey,
         revoked: this.#isRevokedNode(node.nodeId)
       }))
-    }
+    })
   }
 
   async getLeaderStatus() {
     const leader = this.currentLeader()
     const heartbeats = await this.view.getHeartbeats()
 
-    return {
+    return buildLeaderStatus({
       nodeId: this.options.identity.publicKeyId,
       currentLeader: leader,
       reachable: leader ? this.#isLeaderReachable(leader) : false,
       heartbeat: leader ? (heartbeats[leader] ?? null) : null
-    }
+    })
   }
 
   async createSnapshot() {
