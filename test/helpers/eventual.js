@@ -33,6 +33,43 @@ export async function waitFor(condition, options = {}) {
 }
 
 /**
+ * Bound one async operation and attach optional diagnostics to timeout failures.
+ *
+ * @template T
+ * @param {string} description
+ * @param {Promise<T>} operation
+ * @param {{
+ *   timeoutMs?: number,
+ *   onTimeout?: (() => Promise<unknown> | unknown)
+ * }} [options]
+ * @returns {Promise<T>}
+ */
+export async function withTimeout(description, operation, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000
+  let timer = null
+
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(async () => {
+      let details = ""
+      if (options.onTimeout) {
+        const diagnostic = await options.onTimeout()
+        if (diagnostic !== undefined) {
+          details = `\n${typeof diagnostic === "string" ? diagnostic : JSON.stringify(diagnostic, null, 2)}`
+        }
+      }
+
+      reject(new Error(`Timed out during ${description} after ${timeoutMs}ms${details}`))
+    }, timeoutMs)
+  })
+
+  try {
+    return await Promise.race([operation, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
  * Assert that an async value remains unchanged for a stability window.
  *
  * @template T

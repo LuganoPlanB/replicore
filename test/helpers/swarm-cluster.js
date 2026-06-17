@@ -6,7 +6,11 @@ import path from "node:path"
 import createTestnet from "hyperdht/testnet.js"
 
 import { generateIdentity, HolepunchSwarmNode } from "../../src/index.js"
+import { withTimeout } from "./eventual.js"
 import { createTrace } from "./trace.js"
+
+const NODE_LIFECYCLE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_NODE_TIMEOUT_MS ?? "10000")
+const RESOURCE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_RESOURCE_TIMEOUT_MS ?? "15000")
 
 /**
  * Create a deterministic multi-node swarm fixture for integration tests.
@@ -87,6 +91,16 @@ export async function createSwarmCluster(options = {}) {
       }
     },
 
+    async timed(description, operation, options = {}) {
+      return withTimeout(description, operation, {
+        timeoutMs: options.timeoutMs,
+        onTimeout: async () => {
+          trace.record(`${description}.timeout`, options.timeoutDetails ?? {})
+          return this.diagnostics(options.nodes)
+        }
+      })
+    },
+
     /**
      * Return all current node records.
      */
@@ -164,7 +178,14 @@ export async function createSwarmCluster(options = {}) {
 
       const node = new HolepunchSwarmNode(nodeOptions)
 
-      await node.start()
+      await this.timed(`cluster.startNode:${record.label}`, node.start(), {
+        timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
+        timeoutDetails: {
+          selector,
+          label: record.label,
+          nodeId: record.identity.publicKeyId
+        }
+      })
       record.node = node
       trace.record("cluster.startNode.end", {
         selector,
@@ -187,7 +208,14 @@ export async function createSwarmCluster(options = {}) {
         label: record.label,
         nodeId: record.identity.publicKeyId
       })
-      await record.node.close()
+      await this.timed(`cluster.stopNode:${record.label}`, record.node.close(), {
+        timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
+        timeoutDetails: {
+          selector,
+          label: record.label,
+          nodeId: record.identity.publicKeyId
+        }
+      })
       record.node = null
       trace.record("cluster.stopNode.end", {
         selector,
@@ -222,7 +250,14 @@ export async function createSwarmCluster(options = {}) {
         label: record.label,
         nodeId: record.identity.publicKeyId
       })
-      await record.node.suspendNetworking()
+      await this.timed(`cluster.isolateNode:${record.label}`, record.node.suspendNetworking(), {
+        timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
+        timeoutDetails: {
+          selector,
+          label: record.label,
+          nodeId: record.identity.publicKeyId
+        }
+      })
       trace.record("cluster.isolateNode.end", {
         selector,
         label: record.label,
@@ -244,7 +279,14 @@ export async function createSwarmCluster(options = {}) {
         label: record.label,
         nodeId: record.identity.publicKeyId
       })
-      await record.node.resumeNetworking()
+      await this.timed(`cluster.healNode:${record.label}`, record.node.resumeNetworking(), {
+        timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
+        timeoutDetails: {
+          selector,
+          label: record.label,
+          nodeId: record.identity.publicKeyId
+        }
+      })
       trace.record("cluster.healNode.end", {
         selector,
         label: record.label,
@@ -260,12 +302,18 @@ export async function createSwarmCluster(options = {}) {
       trace.record("cluster.closeNodes.begin", {
         runningNodeIds: this.nodes.map((node) => node.options.identity.publicKeyId)
       })
-      await Promise.allSettled(
-        [...records.values()].map(async (record) => {
-          if (!record.node) return
-          await record.node.close()
-          record.node = null
-        })
+      await this.timed(
+        "cluster.closeNodes",
+        Promise.allSettled(
+          [...records.values()].map(async (record) => {
+            if (!record.node) return
+            await record.node.close()
+            record.node = null
+          })
+        ),
+        {
+          timeoutMs: RESOURCE_TIMEOUT_MS
+        }
       )
       trace.record("cluster.closeNodes.end", { runningNodeIds: [] })
     },
@@ -279,9 +327,17 @@ export async function createSwarmCluster(options = {}) {
         dirCount: dirs.length
       })
       if (this.testnet && !options.testnet) {
-        await this.testnet.destroy()
+        await this.timed("cluster.destroyResources.testnet", this.testnet.destroy(), {
+          timeoutMs: RESOURCE_TIMEOUT_MS
+        })
       }
-      await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+      await this.timed(
+        "cluster.destroyResources.tempDirs",
+        Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true }))),
+        {
+          timeoutMs: RESOURCE_TIMEOUT_MS
+        }
+      )
       trace.record("cluster.destroyResources.end", { dirCount: dirs.length })
     },
 
@@ -290,8 +346,16 @@ export async function createSwarmCluster(options = {}) {
      */
     async closeAll() {
       trace.record("cluster.closeAll.begin")
-      await this.closeNodes()
-      await this.destroyResources()
+      await this.timed(
+        "cluster.closeAll",
+        (async () => {
+          await this.closeNodes()
+          await this.destroyResources()
+        })(),
+        {
+          timeoutMs: RESOURCE_TIMEOUT_MS
+        }
+      )
       trace.record("cluster.closeAll.end")
     }
   }
