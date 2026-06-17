@@ -765,6 +765,69 @@ test("replication status exposes staged entries without exposing committed CRUD 
   }
 })
 
+test("concurrent leader appends keep signed sequence equal to feed slot", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const firstIdentity = generateIdentity(seed("append-lock-first"))
+    const secondIdentity = generateIdentity(seed("append-lock-second"))
+    const authorizedNodes = [firstIdentity, secondIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: firstIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      heartbeatIntervalMs: 10
+    })
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: secondIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      heartbeatIntervalMs: 10
+    })
+    nodes.push(first, second)
+    await first.start()
+    await second.start()
+
+    const leaderId = [firstIdentity, secondIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const leader = first.options.identity.publicKeyId === leaderId ? first : second
+    const follower = leader === first ? second : first
+    await waitFor(async () => first.currentLeader() === leaderId)
+    await waitFor(async () => second.currentLeader() === leaderId)
+
+    const writes = await Promise.all(
+      Array.from({ length: 5 }, (_, index) => leader.put(`hash:append-lock-${index}`, { index }))
+    )
+    await waitFor(async () => (await follower.get("hash:append-lock-4"))?.value?.index === 4)
+
+    const localCore = leader.feedCores.get(leaderId)
+    for (let seq = 0; seq < localCore.length; seq += 1) {
+      const operation = await localCore.get(seq)
+      assert.equal(operation.seq, seq)
+    }
+    assert.equal(new Set(writes.map((operation) => operation.seq)).size, writes.length)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("a follower keeps a replicated write staged until the leader advertises the commit watermark", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []

@@ -97,6 +97,116 @@ test("materialized view persists staged entries without exposing committed data"
   })
 })
 
+test("materialized view commits staged entries in one transition", { concurrency: false }, async () => {
+  const operation = {
+    kind: "kv",
+    type: "put",
+    keyspace: "default",
+    key: "hash:committed",
+    value: { ciphertext: "encrypted" },
+    actor: "node-a",
+    seq: 2,
+    opId: "committed-2",
+    ts: "2026-06-17T00:00:00.000Z",
+    expiresAt: null
+  }
+
+  await withView(async ({ view }) => {
+    await view.setRawProgress("feed-a", { applied: 3, lastOpId: "raw-3" })
+    await view.stageEntry("feed-a", {
+      nodeId: "node-a",
+      source: "remote",
+      validation: "valid",
+      operation
+    })
+
+    await view.applyCommitted(operation, "feed-a")
+
+    assert.equal(await view.getApplied("feed-a"), 3)
+    assert.deepEqual(await view.getStagedEntries("feed-a"), [])
+    assert.deepEqual(await view.getCurrent("default", "hash:committed"), {
+      metadata: {
+        opId: "committed-2",
+        seq: 2,
+        ts: "2026-06-17T00:00:00.000Z",
+        type: "put",
+        keyspace: "default",
+        key: "hash:committed",
+        actor: "node-a",
+        expiresAt: null,
+        deleted: false
+      },
+      encryptedValue: { ciphertext: "encrypted" }
+    })
+  })
+})
+
+test("materialized view skips staged entries in one transition", { concurrency: false }, async () => {
+  const operation = {
+    kind: "kv",
+    type: "put",
+    keyspace: "default",
+    key: "hash:skipped",
+    value: { ciphertext: "encrypted" },
+    actor: "node-a",
+    seq: 5,
+    opId: "skipped-5",
+    ts: "2026-06-17T00:00:01.000Z",
+    expiresAt: null
+  }
+
+  await withView(async ({ view }) => {
+    await view.setRawProgress("feed-a", { applied: 6, lastOpId: "raw-6" })
+    await view.stageEntry("feed-a", {
+      nodeId: "node-a",
+      source: "local",
+      validation: "valid",
+      operation
+    })
+    await view.markSkippedEntry("feed-a", operation.seq)
+
+    await view.skipCommitted(operation, "feed-a")
+
+    assert.equal(await view.getApplied("feed-a"), 6)
+    assert.deepEqual(await view.getStagedEntries("feed-a"), [])
+    assert.equal(await view.getCurrent("default", "hash:skipped"), null)
+    assert.deepEqual(await view.getHistory("default", "hash:skipped"), [])
+
+    const snapshot = await view.exportSnapshot()
+    assert.ok(snapshot.entries.every((entry) => !String(entry.key).includes("/skipped/")))
+  })
+})
+
+test("materialized view does not restage entries behind committed progress", { concurrency: false }, async () => {
+  const operation = {
+    kind: "kv",
+    type: "put",
+    keyspace: "default",
+    key: "hash:already-committed",
+    value: { ciphertext: "encrypted" },
+    actor: "node-a",
+    seq: 3,
+    opId: "already-committed-3",
+    ts: "2026-06-17T00:00:02.000Z",
+    expiresAt: null
+  }
+
+  await withView(async ({ view }) => {
+    await view.setRawProgress("feed-a", { applied: 4, lastOpId: "raw-4" })
+    await view.applyCommitted(operation, "feed-a")
+
+    await view.stageEntry("feed-a", {
+      nodeId: "node-a",
+      source: "remote",
+      validation: "valid",
+      operation
+    })
+
+    assert.deepEqual(await view.getStagedEntries("feed-a"), [])
+    assert.equal(await view.getApplied("feed-a"), 4)
+  })
+})
+
 test("materialized view staged entries survive restart", { concurrency: false }, async () => {
   const dirs = []
   const dataDir = await tempDir(dirs)

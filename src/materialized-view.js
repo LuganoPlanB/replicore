@@ -56,6 +56,29 @@ export class MaterializedView {
       committedApplied: operation.seq + 1,
       committedLastOpId: operation.opId
     }))
+    await batch.del(this.#stagedEntryKey(feedKey, operation.seq))
+    await batch.flush()
+  }
+
+  /**
+   * Commit a rejected feed slot without applying its staged K/V mutation.
+   *
+   * @param {Record<string, unknown>} operation
+   * @param {string} feedKey
+   */
+  async skipCommitted(operation, feedKey) {
+    const current = await this.getFeedProgress(feedKey)
+    const batch = this.bee.batch()
+    await batch.put(this.#progressKey(feedKey), this.#nextProgressRecord({
+      feedKey,
+      rawApplied: current.rawApplied,
+      rawLastOpId: current.rawLastOpId,
+      committedApplied: operation.seq + 1,
+      committedLastOpId: operation.opId
+    }))
+    if (operation.kind === "kv") {
+      await batch.del(this.#stagedEntryKey(feedKey, operation.seq))
+    }
     await batch.flush()
   }
 
@@ -72,6 +95,7 @@ export class MaterializedView {
       observedLeader: operation.heartbeat?.observedLeader ?? null,
       reachableLeader: operation.heartbeat?.reachableLeader ?? false,
       appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
+      rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
       membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
     })
   }
@@ -159,9 +183,11 @@ export class MaterializedView {
     if (operation.kind !== "kv") {
       throw new Error("Only K/V operations may be staged")
     }
+    if (await this.getApplied(feedKey) > operation.seq) return
 
+    const stagedKey = this.#stagedEntryKey(feedKey, operation.seq)
     const existing = await this.getStagedEntry(feedKey, operation.seq)
-    await this.bee.put(this.#stagedEntryKey(feedKey, operation.seq), {
+    await this.bee.put(stagedKey, {
       feedKey,
       nodeId: staged.nodeId,
       source: staged.source,
@@ -177,6 +203,9 @@ export class MaterializedView {
       ts: operation.ts,
       expiresAt: operation.expiresAt ?? null
     })
+    if (await this.getApplied(feedKey) > operation.seq) {
+      await this.bee.del(stagedKey)
+    }
   }
 
   /**
@@ -213,6 +242,11 @@ export class MaterializedView {
    * @param {"pending" | "rejected"} resolution
    */
   async setStagedEntryResolution(feedKey, seq, resolution) {
+    if (await this.getApplied(feedKey) > seq) {
+      await this.deleteStagedEntry(feedKey, seq)
+      return
+    }
+
     const existing = await this.getStagedEntry(feedKey, seq)
     if (!existing) return
 
@@ -220,6 +254,46 @@ export class MaterializedView {
       ...existing,
       resolution
     })
+    if (await this.getApplied(feedKey) > seq) {
+      await this.deleteStagedEntry(feedKey, seq)
+    }
+  }
+
+  /**
+   * Persist that a feed sequence must advance committed progress without
+   * materializing its K/V operation.
+   *
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  async markSkippedEntry(feedKey, seq) {
+    await this.bee.put(this.#skippedEntryKey(feedKey, seq), { feedKey, seq })
+  }
+
+  /**
+   * @param {string} feedKey
+   * @returns {Promise<number[]>}
+   */
+  async getSkippedEntries(feedKey) {
+    const skipped = []
+    const range = this.bee.createReadStream({
+      gte: `feeds/${feedKey}/skipped/`,
+      lt: `feeds/${feedKey}/skipped/~`
+    })
+
+    for await (const entry of range) {
+      skipped.push(entry.value.seq)
+    }
+
+    return skipped
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  async isSkippedEntry(feedKey, seq) {
+    return Boolean(await this.bee.get(this.#skippedEntryKey(feedKey, seq)))
   }
 
   /**
@@ -338,6 +412,7 @@ export class MaterializedView {
 
     for await (const entry of stream) {
       if (this.#isStagedEntryKey(entry.key)) continue
+      if (this.#isSkippedEntryKey(entry.key)) continue
       entries.push({
         key: entry.key,
         value: entry.value
@@ -360,6 +435,14 @@ export class MaterializedView {
    */
   #stagedEntryKey(feedKey, seq) {
     return `feeds/${feedKey}/staged/${String(seq).padStart(12, "0")}`
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  #skippedEntryKey(feedKey, seq) {
+    return `feeds/${feedKey}/skipped/${String(seq).padStart(12, "0")}`
   }
 
   /**
@@ -397,5 +480,12 @@ export class MaterializedView {
    */
   #isStagedEntryKey(key) {
     return key.includes("/staged/")
+  }
+
+  /**
+   * @param {string} key
+   */
+  #isSkippedEntryKey(key) {
+    return key.includes("/skipped/")
   }
 }

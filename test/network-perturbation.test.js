@@ -1063,17 +1063,32 @@ test("offline leader yields failover writes and catches up cleanly after restart
     )
 
     const settledLeaderId = currentLeaderId(cluster)
-    let afterRecovery = null
     await waitFor(
       async () => {
         const settledLeader = cluster.record(settledLeaderId).node
         if (settledLeader.currentLeader() !== settledLeaderId) return false
 
+        const status = await settledLeader.getReplicationStatus()
+        return liveFollowerIds(cluster, settledLeaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "agreed leader regains a durable follower before post-restart write",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const settledLeader = cluster.record(settledLeaderId).node
+    let afterRecoveryAttempt = 0
+    let afterRecovery = null
+    await waitFor(
+      async () => {
+        const recoveryKey = `hash:leader-after-${++afterRecoveryAttempt}`
         try {
           afterRecovery = {
-            ok: true,
-            key: "hash:leader-after",
-            operation: await settledLeader.put("hash:leader-after", { phase: "after" })
+            key: recoveryKey,
+            operation: await settledLeader.put(recoveryKey, { phase: "after" })
           }
           return true
         } catch {
@@ -1087,7 +1102,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
     )
 
     await waitFor(
-      async () => hasClusterValue(cluster.nodes, "hash:leader-after", { phase: "after" }),
+      async () => hasClusterValue(cluster.nodes, afterRecovery.key, { phase: "after" }),
       {
         description: "post-restart write converges to all nodes",
         onTimeout: () => collectClusterDiagnostics(cluster)
@@ -1096,7 +1111,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
 
     const beforeHistory = await restartedLeader.getHistory("hash:leader-before")
     const duringHistory = await restartedLeader.getHistory("hash:leader-during")
-    const afterHistory = await restartedLeader.getHistory("hash:leader-after")
+    const afterHistory = await restartedLeader.getHistory(afterRecovery.key)
 
     assert.equal(beforeHistory.length, 1)
     assert.equal(beforeHistory[0].opId, beforeFailover.opId)
