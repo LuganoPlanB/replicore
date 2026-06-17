@@ -267,6 +267,7 @@ export class HolepunchSwarmNode {
       encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
       membership: this.#membershipStatus(heartbeats),
+      readStatus: this.#readStatus(),
       feeds,
       heartbeats
     }
@@ -743,6 +744,31 @@ export class HolepunchSwarmNode {
       peerFingerprints,
       mismatchedNodeIds: mismatchedNodeIds.sort(),
       matchingNodeIds: matchingNodeIds.sort()
+    }
+  }
+
+  #readStatus() {
+    const leader = this.currentLeader()
+    if (leader && leader !== this.options.identity.publicKeyId && !this.#isLeaderReachable(leader)) {
+      return {
+        staleReadsPossible: true,
+        reason: "leader-unreachable",
+        leader
+      }
+    }
+
+    if (this.connections.size === 0 && this.options.authorizedNodes.length > 1) {
+      return {
+        staleReadsPossible: true,
+        reason: "no-live-peer-connections",
+        leader
+      }
+    }
+
+    return {
+      staleReadsPossible: false,
+      reason: null,
+      leader
     }
   }
 
