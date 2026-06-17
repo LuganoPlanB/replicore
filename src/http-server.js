@@ -117,6 +117,15 @@ export class HolepunchHttpServer {
         return this.#json(res, 200, { ok: true })
       }
 
+      if (req.method === "POST" && url.pathname === "/admin/encryption/rotate") {
+        this.#authorizeAdmin(req)
+        const body = await this.#readJson(req)
+        return this.#json(res, 200, {
+          ok: true,
+          ...this.options.node.rotateEncryptionKey(body.keyId)
+        })
+      }
+
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500

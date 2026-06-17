@@ -23,13 +23,15 @@ The current implementation is a prototype. It is useful for local runs and archi
 - HTTP routes for CRUD and status
 - Snapshot export/import for current-state restore
 - Admin snapshot export/import endpoints and CLI
+- Static writer revocation on restart/reload config
+- Keyring-based value encryption with live active-key rotation
 - Config-driven node launcher and local bootstrap helper
 
 ## Not Implemented Yet
 
 - Real production auth such as JWT issuer integration, mTLS, or signed HTTP requests
-- Writer revocation workflow
-- Key rotation workflow
+- Dynamic writer membership changes through the replicated log
+- Node identity rotation
 - Log pruning and feed rotation
 - Backup archive lifecycle
 - Production deployment packaging
@@ -135,6 +137,15 @@ Import a snapshot into a live node:
 npm run snapshot -- import http://127.0.0.1:3001 admin .\tmp\snapshot.json
 ```
 
+Rotate the active encryption key on a live node:
+
+```powershell
+curl -X POST "http://127.0.0.1:3001/admin/encryption/rotate" `
+  -H "authorization: Bearer admin" `
+  -H "content-type: application/json" `
+  -d "{\"keyId\":\"next\"}"
+```
+
 The example configs include an `admin` token for these routes.
 
 ## Config
@@ -148,12 +159,37 @@ The node launcher expects:
 - `topicSalt`
 - `identitySeed`
 - either `authorizedNodeSeeds` or `authorizedNodes`
-- `encryptionKey`
+- either `encryptionKey` or `encryption`
+- optional `revokedNodeIds`
 - `bootstrap`
 - `http`
 - `auth`
 
 `identitySeed` and `authorizedNodeSeeds` are hex-encoded 32-byte seeds. The launcher derives stable node identities and feed keys from them.
+
+Simple encryption config:
+
+```json
+{
+  "encryptionKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+```
+
+Keyring config with rotation support:
+
+```json
+{
+  "encryption": {
+    "currentKeyId": "primary",
+    "keys": {
+      "primary": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "next": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  }
+}
+```
+
+Revoked writers remain part of the explicit cluster membership record, but nodes stop replicating from them and reject new operations signed by them after restart with updated config.
 
 ## Project Layout
 

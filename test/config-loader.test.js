@@ -4,7 +4,12 @@ import path from "node:path"
 import test from "node:test"
 import assert from "node:assert/strict"
 
-import { loadRuntimeConfig, readSnapshotFile, writeSnapshotFile } from "../src/index.js"
+import {
+  generateIdentity,
+  loadRuntimeConfig,
+  readSnapshotFile,
+  writeSnapshotFile
+} from "../src/index.js"
 
 test("loadRuntimeConfig derives identities and resolves paths", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-"))
@@ -27,6 +32,37 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
       config.authorizedNodes.some((node) => node.nodeId === config.identity.publicKeyId),
       true
     )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig supports encryption keyrings and revoked writers", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-rotation-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+    raw.encryption = {
+      currentKeyId: "primary",
+      keys: {
+        primary: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        next: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    }
+    delete raw.encryptionKey
+    const revokedIdentity = generateIdentity(Buffer.from(raw.authorizedNodeSeeds[2], "hex"))
+    raw.revokedNodeIds = [revokedIdentity.publicKeyId]
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    const config = await loadRuntimeConfig(configPath)
+    assert.equal(config.encryption.currentKeyId, "primary")
+    assert.equal(Buffer.isBuffer(config.encryption.keys.primary), true)
+    assert.deepEqual(config.revokedNodeIds, [revokedIdentity.publicKeyId])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

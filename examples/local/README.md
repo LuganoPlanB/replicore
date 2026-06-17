@@ -63,3 +63,12 @@ Import a snapshot:
 ```powershell
 npm run snapshot -- import http://127.0.0.1:3001 admin .\tmp\snapshot.json
 ```
+
+Rotate the active encryption key:
+
+```powershell
+curl -X POST "http://127.0.0.1:3001/admin/encryption/rotate" `
+  -H "authorization: Bearer admin" `
+  -H "content-type: application/json" `
+  -d "{\"keyId\":\"next\"}"
+```

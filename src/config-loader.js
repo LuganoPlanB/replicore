@@ -13,13 +13,17 @@ export async function loadRuntimeConfig(configPath) {
   const raw = JSON.parse(await readFile(absolutePath, "utf8"))
 
   const identitySeed = requireHex(raw.identitySeed, "identitySeed")
-  const encryptionKey = requireHex(raw.encryptionKey, "encryptionKey", 32)
   const identity = generateIdentity(identitySeed)
 
   const authorizedNodes = normalizeAuthorizedNodes(raw)
   if (!authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)) {
     throw new Error("Authorized nodes do not include the local identity")
   }
+  const revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
+  if (revokedNodeIds.includes(identity.publicKeyId)) {
+    throw new Error("Local identity is revoked in config")
+  }
+  const encryption = normalizeEncryption(raw)
 
   return {
     configPath: absolutePath,
@@ -36,7 +40,8 @@ export async function loadRuntimeConfig(configPath) {
     },
     identity,
     authorizedNodes,
-    encryptionKey,
+    revokedNodeIds,
+    encryption,
     http: {
       host: raw.http?.host ?? "127.0.0.1",
       port: raw.http?.port ?? 0
@@ -68,6 +73,54 @@ function normalizeAuthorizedNodes(raw) {
   }
 
   throw new Error("Config must include authorizedNodeSeeds or authorizedNodes")
+}
+
+function normalizeRevokedNodeIds(raw, authorizedNodes) {
+  if (raw.revokedNodeIds === undefined) return []
+  if (!Array.isArray(raw.revokedNodeIds)) {
+    throw new Error("revokedNodeIds must be an array")
+  }
+
+  const knownNodeIds = new Set(authorizedNodes.map((node) => node.nodeId))
+  return raw.revokedNodeIds.map((nodeId, index) => {
+    const normalized = requireString(nodeId, `revokedNodeIds[${index}]`)
+    if (!knownNodeIds.has(normalized)) {
+      throw new Error(`revokedNodeIds[${index}] must reference an authorized node`)
+    }
+    return normalized
+  })
+}
+
+function normalizeEncryption(raw) {
+  if (raw.encryption && typeof raw.encryption === "object") {
+    const currentKeyId = requireString(raw.encryption.currentKeyId, "encryption.currentKeyId")
+    const rawKeys = raw.encryption.keys
+    if (!rawKeys || typeof rawKeys !== "object" || Array.isArray(rawKeys)) {
+      throw new Error("encryption.keys must be an object")
+    }
+
+    const keys = {}
+    for (const [keyId, value] of Object.entries(rawKeys)) {
+      keys[requireString(keyId, `encryption.keys.${keyId}`)] = requireHex(
+        value,
+        `encryption.keys.${keyId}`,
+        32
+      )
+    }
+
+    if (!keys[currentKeyId]) {
+      throw new Error("encryption.currentKeyId must reference a configured key")
+    }
+
+    return { currentKeyId, keys }
+  }
+
+  return {
+    currentKeyId: "default",
+    keys: {
+      default: requireHex(raw.encryptionKey, "encryptionKey", 32)
+    }
+  }
 }
 
 function normalizeBootstrap(raw) {

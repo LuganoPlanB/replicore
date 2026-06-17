@@ -16,6 +16,7 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
   *   actor: string,
  *   secretKey: Buffer,
   *   encryptionKey: Buffer,
+  *   encryptionKeyId?: string,
  *   ttlMs?: number,
  *   kind?: "kv" | "heartbeat",
  *   heartbeat?: null | {
@@ -32,7 +33,10 @@ export function createSignedOperation(input) {
   const kind = input.kind ?? "kv"
   const value =
     kind === "kv" && input.type === "put"
-      ? encryptString(JSON.stringify(input.value), input.encryptionKey)
+      ? {
+          ...encryptString(JSON.stringify(input.value), input.encryptionKey),
+          keyId: input.encryptionKeyId ?? "default"
+        }
       : null
 
   const unsigned = {
@@ -82,14 +86,19 @@ export function verifySignedOperation(operation, publicKey) {
  *
  * @param {Record<string, unknown>} operation
  * @param {{ nodeId: string, feedKey: string }} expected
+ * @param {{ revokedNodeIds?: Set<string> }} [options]
  */
-export function validateOperation(operation, expected) {
+export function validateOperation(operation, expected, options = {}) {
   if (operation.v !== 1) {
     throw new Error(`Unsupported operation version: ${operation.v}`)
   }
 
   if (operation.actor !== expected.nodeId) {
     throw new Error(`Operation actor mismatch: expected ${expected.nodeId}`)
+  }
+
+  if (options.revokedNodeIds?.has(expected.nodeId)) {
+    throw new Error(`Operation signer is revoked: ${expected.nodeId}`)
   }
 
   if (operation.feed !== expected.feedKey) {
@@ -137,13 +146,30 @@ export function validateOperation(operation, expected) {
 
 /**
  * @param {Record<string, unknown>} operation
- * @param {Buffer} encryptionKey
+ * @param {Buffer | Record<string, Buffer>} encryptionKeys
  * @returns {unknown}
  */
-export function decryptOperationValue(operation, encryptionKey) {
+export function decryptOperationValue(operation, encryptionKeys) {
   if (operation.type !== "put") return null
-  const payload = /** @type {{ alg: string, iv: string, ciphertext: string, tag: string }} */ (
+  const payload = /** @type {{ alg: string, iv: string, ciphertext: string, tag: string, keyId?: string }} */ (
     operation.value
   )
-  return JSON.parse(decryptString(payload, encryptionKey))
+  return JSON.parse(decryptString(payload, resolveEncryptionKey(encryptionKeys, payload.keyId)))
+}
+
+/**
+ * @param {Buffer | Record<string, Buffer>} encryptionKeys
+ * @param {string | undefined} keyId
+ */
+function resolveEncryptionKey(encryptionKeys, keyId) {
+  if (Buffer.isBuffer(encryptionKeys)) {
+    return encryptionKeys
+  }
+
+  const resolvedKeyId = keyId ?? "default"
+  const encryptionKey = encryptionKeys[resolvedKeyId]
+  if (!encryptionKey) {
+    throw new Error(`Missing encryption key for keyId ${resolvedKeyId}`)
+  }
+  return encryptionKey
 }

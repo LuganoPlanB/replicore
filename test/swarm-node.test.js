@@ -8,6 +8,7 @@ import { createHash, randomBytes } from "node:crypto"
 import createTestnet from "hyperdht/testnet.js"
 
 import {
+  createSignedOperation,
   generateIdentity,
   HolepunchHttpServer,
   HolepunchSwarmNode,
@@ -331,6 +332,128 @@ test("operation validation rejects mismatched feed metadata", () => {
       feedKey: identity.feedKey
     })
   }, /feed mismatch/)
+})
+
+test("operation validation rejects revoked writers", () => {
+  const identity = generateIdentity(seed("revoked-writer"))
+  const operation = createSignedOperation({
+    kind: "kv",
+    type: "delete",
+    key: "hash:key",
+    keyspace: "default",
+    seq: 0,
+    feed: identity.feedKey,
+    actor: identity.publicKeyId,
+    secretKey: identity.secretKey,
+    encryptionKey: randomBytes(32)
+  })
+
+  assert.throws(() => {
+    validateOperation(
+      operation,
+      {
+        nodeId: identity.publicKeyId,
+        feedKey: identity.feedKey
+      },
+      { revokedNodeIds: new Set([identity.publicKeyId]) }
+    )
+  }, /revoked/)
+})
+
+test("encryption rotation preserves existing reads and exposes revoked writer state", async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+  const servers = []
+
+  try {
+    const leaderIdentity = generateIdentity(seed("leader"))
+    const followerIdentity = generateIdentity(seed("follower-1"))
+    const revokedIdentity = generateIdentity(seed("follower-2"))
+    const authorizedNodes = [leaderIdentity, followerIdentity, revokedIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+    const encryption = {
+      currentKeyId: "primary",
+      keys: {
+        primary: randomBytes(32),
+        next: randomBytes(32)
+      }
+    }
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      revokedNodeIds: [revokedIdentity.publicKeyId],
+      encryption,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      revokedNodeIds: [revokedIdentity.publicKeyId],
+      encryption,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower)
+    await Promise.all(nodes.map((node) => node.start()))
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 2)
+
+    const server = new HolepunchHttpServer({
+      node: leader,
+      auth: {
+        tokens: {
+          admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
+          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+        }
+      }
+    })
+    await server.start()
+    servers.push(server)
+
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const firstOperation = await leader.put("hash:before-rotation", { value: "first" })
+    assert.equal(firstOperation.value.keyId, "primary")
+
+    const rotateResponse = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "next" })
+    })
+    assert.equal(rotateResponse.status, 200)
+    assert.deepEqual(await rotateResponse.json(), { ok: true, keyId: "next" })
+
+    const secondOperation = await leader.put("hash:after-rotation", { value: "second" })
+    assert.equal(secondOperation.value.keyId, "next")
+
+    await waitFor(async () => (await follower.get("hash:before-rotation"))?.value?.value === "first")
+    await waitFor(async () => (await follower.get("hash:after-rotation"))?.value?.value === "second")
+
+    const writers = leader.getWritersStatus()
+    assert.deepEqual(writers.revokedNodeIds, [revokedIdentity.publicKeyId])
+    assert.equal(writers.encryptionKeyId, "next")
+    assert.equal(
+      writers.authorizedNodes.find((node) => node.nodeId === revokedIdentity.publicKeyId)?.revoked,
+      true
+    )
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
 })
 
 test("a fresh node can restore current state from a snapshot", async () => {

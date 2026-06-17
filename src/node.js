@@ -23,16 +23,18 @@ const RPC_EXTENSION = "planb-cleard-rpc-v1"
 export class HolepunchSwarmNode {
   /**
    * @param {{
-   *   dataDir: string,
-   *   clusterId: string,
-   *   topicSalt: string,
-   *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
-   *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
-   *   encryptionKey: Buffer,
-   *   bootstrap?: Array<string | { host: string, port: number }>,
-   *   heartbeatIntervalMs?: number,
-   *   heartbeatTtlMs?: number,
-   *   forwarding?: boolean,
+ *   dataDir: string,
+ *   clusterId: string,
+ *   topicSalt: string,
+ *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
+ *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
+ *   revokedNodeIds?: string[],
+ *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
+ *   encryptionKey?: Buffer,
+ *   bootstrap?: Array<string | { host: string, port: number }>,
+ *   heartbeatIntervalMs?: number,
+ *   heartbeatTtlMs?: number,
+ *   forwarding?: boolean,
    *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
@@ -47,6 +49,11 @@ export class HolepunchSwarmNode {
         ...options.durability
       },
       ...options
+    }
+    this.revokedNodeIds = new Set(this.options.revokedNodeIds ?? [])
+    this.encryption = this.options.encryption ?? {
+      currentKeyId: "default",
+      keys: { default: this.options.encryptionKey }
     }
     this.store = null
     this.swarm = null
@@ -80,6 +87,7 @@ export class HolepunchSwarmNode {
     await this.viewBee.ready()
 
     for (const node of this.options.authorizedNodes) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       const isLocal = node.nodeId === this.options.identity.publicKeyId
       const core = isLocal
         ? this.store.get({
@@ -112,6 +120,7 @@ export class HolepunchSwarmNode {
     await this.discovery.flushed()
 
     for (const node of this.options.authorizedNodes) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       await this.syncFeed(node.nodeId)
     }
 
@@ -128,6 +137,7 @@ export class HolepunchSwarmNode {
       leader: this.currentLeader(),
       knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
       connections: this.connections.size,
+      encryptionKeyId: this.encryption.currentKeyId,
       feeds: Object.fromEntries(
         [...this.feedCores.entries()].map(([nodeId, core]) => [nodeId, core.length])
       )
@@ -138,6 +148,7 @@ export class HolepunchSwarmNode {
     const now = Date.now()
     return this.options.authorizedNodes
       .filter((node) => {
+        if (this.#isRevokedNode(node.nodeId)) return false
         if (node.nodeId === this.options.identity.publicKeyId) return true
         const heartbeat = this.lastHeartbeatByNode.get(node.nodeId)
         if (!heartbeat) return false
@@ -188,7 +199,7 @@ export class HolepunchSwarmNode {
           type: "put",
           value: current.encryptedValue
         },
-        this.options.encryptionKey
+        this.encryption.keys
       )
     }
   }
@@ -208,6 +219,7 @@ export class HolepunchSwarmNode {
 
     for (const node of this.options.authorizedNodes) {
       const core = this.feedCores.get(node.nodeId)
+      if (!core) continue
       const applied = await this.view.getApplied(node.feedKey)
       const heartbeat = heartbeats[node.nodeId] ?? null
       feeds[node.nodeId] = {
@@ -226,6 +238,7 @@ export class HolepunchSwarmNode {
       leader: this.currentLeader(),
       connections: this.connections.size,
       lastDurableSequence: this.lastDurableSequence,
+      encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: [...this.connections].map((conn) => b4a.toString(conn.remotePublicKey, "hex")),
       feeds,
       heartbeats
@@ -235,9 +248,12 @@ export class HolepunchSwarmNode {
   getWritersStatus() {
     return {
       currentLeader: this.currentLeader(),
+      revokedNodeIds: [...this.revokedNodeIds],
+      encryptionKeyId: this.encryption.currentKeyId,
       authorizedNodes: this.options.authorizedNodes.map((node) => ({
         nodeId: node.nodeId,
-        feedKey: node.feedKey
+        feedKey: node.feedKey,
+        revoked: this.#isRevokedNode(node.nodeId)
       }))
     }
   }
@@ -263,6 +279,19 @@ export class HolepunchSwarmNode {
    */
   async restoreSnapshot(snapshot) {
     await this.view.importSnapshot(snapshot)
+  }
+
+  /**
+   * Rotate future writes to a configured encryption key ID.
+   *
+   * @param {string} keyId
+   */
+  rotateEncryptionKey(keyId) {
+    if (!this.encryption.keys[keyId]) {
+      throw new Error(`Unknown encryption key ID: ${keyId}`)
+    }
+    this.encryption.currentKeyId = keyId
+    return { keyId }
   }
 
   async close() {
@@ -311,7 +340,7 @@ export class HolepunchSwarmNode {
 
     while (applied < core.length) {
       const operation = await core.get(applied)
-      validateOperation(operation, node)
+      validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
       if (!verifySignedOperation(operation, node.publicKey)) {
         throw new Error(`Invalid operation at sequence ${applied} for ${nodeId}`)
       }
@@ -341,7 +370,8 @@ export class HolepunchSwarmNode {
       feed: this.options.identity.feedKey,
       actor: this.options.identity.publicKeyId,
       secretKey: this.options.identity.secretKey,
-      encryptionKey: this.options.encryptionKey,
+      encryptionKey: this.#currentEncryptionKey(),
+      encryptionKeyId: this.encryption.currentKeyId,
       heartbeat: {
         observedLeader: leader,
         reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
@@ -369,7 +399,8 @@ export class HolepunchSwarmNode {
       feed: this.options.identity.feedKey,
       actor: this.options.identity.publicKeyId,
       secretKey: this.options.identity.secretKey,
-      encryptionKey: this.options.encryptionKey,
+      encryptionKey: this.#currentEncryptionKey(),
+      encryptionKeyId: this.encryption.currentKeyId,
       ttlMs: options.ttlMs
     })
 
@@ -567,6 +598,9 @@ export class HolepunchSwarmNode {
   #getAuthorizedNode(nodeId) {
     const node = this.options.authorizedNodes.find((entry) => entry.nodeId === nodeId)
     if (!node) throw new Error(`Unknown authorized node ${nodeId}`)
+    if (this.#isRevokedNode(nodeId)) {
+      throw new Error(`Revoked node ${nodeId} is not allowed to replicate`)
+    }
     return node
   }
 
@@ -575,11 +609,13 @@ export class HolepunchSwarmNode {
     const now = Date.now()
     return [...this.lastHeartbeatByNode.entries()]
       .filter(([nodeId]) => nodeId !== leader)
+      .filter(([nodeId]) => !this.#isRevokedNode(nodeId))
       .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
       .map(([nodeId]) => nodeId)
   }
 
   #isLeaderReachable(nodeId) {
+    if (this.#isRevokedNode(nodeId)) return false
     if (nodeId === this.options.identity.publicKeyId) return true
     const core = this.feedCores.get(nodeId)
     return !!core?.peers?.length
@@ -588,8 +624,20 @@ export class HolepunchSwarmNode {
   async #appliedFeeds() {
     const applied = {}
     for (const node of this.options.authorizedNodes) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       applied[node.feedKey] = await this.view.getApplied(node.feedKey)
     }
     return applied
+  }
+
+  #currentEncryptionKey() {
+    return this.encryption.keys[this.encryption.currentKeyId]
+  }
+
+  /**
+   * @param {string} nodeId
+   */
+  #isRevokedNode(nodeId) {
+    return this.revokedNodeIds.has(nodeId)
   }
 }
