@@ -1,6 +1,6 @@
-# planb-cleard
+# Replicore
 
-Minimal Holepunch / Hypercore K/V swarm prototype.
+Resilient multi-node K/V storage for high availability, based on the Holepunch / Hypercore stack
 
 This repository implements a small multi-node service with these properties:
 
@@ -38,7 +38,7 @@ The current implementation is a prototype. It is useful for local runs and archi
 
 ## Requirements
 
-- Node.js 25 or newer
+- Node.js 24 or newer
 - npm
 
 ## Install
@@ -150,7 +150,7 @@ The example configs include an `admin` token for these routes.
 
 ## Config
 
-Example configs live in [examples/local/README.md](C:/Users/denis/devel/planb-cleard/examples/local/README.md:1) and `examples/local/node-{1,2,3}.json`.
+Example configs live in `examples/local/README.md` and `examples/local/node-{1,2,3}.json`.
 
 The node launcher expects:
 
@@ -193,14 +193,14 @@ Revoked writers remain part of the explicit cluster membership record, but nodes
 
 ## Project Layout
 
-- [bin/run-bootstrap.js](C:/Users/denis/devel/planb-cleard/bin/run-bootstrap.js:1): local HyperDHT bootstrap helper
-- [bin/run-node.js](C:/Users/denis/devel/planb-cleard/bin/run-node.js:1): config-driven node runner
-- [src/node.js](C:/Users/denis/devel/planb-cleard/src/node.js:1): swarm node, replication, forwarding, leadership, durability
-- [src/http-server.js](C:/Users/denis/devel/planb-cleard/src/http-server.js:1): minimal authorized HTTP surface
-- [src/materialized-view.js](C:/Users/denis/devel/planb-cleard/src/materialized-view.js:1): derived Hyperbee state
-- [src/operation.js](C:/Users/denis/devel/planb-cleard/src/operation.js:1): operation creation, signing, validation
-- [src/config-loader.js](C:/Users/denis/devel/planb-cleard/src/config-loader.js:1): JSON config loading
-- [test](C:/Users/denis/devel/planb-cleard/test:1): integration and config tests
+- `bin/run-bootstrap.js`: local HyperDHT bootstrap helper
+- `bin/run-node.js`C:/Users/denis/devel/planb-cleard/bin/run-node.js:1): config-driven node runner
+- `src/node.js`C:/Users/denis/devel/planb-cleard/src/node.js:1): swarm node, replication, forwarding, leadership, durability
+- `src/http-server.js`: minimal authorized HTTP surface
+- `src/materialized-view.js`: derived Hyperbee state
+- `src/operation.js`: operation creation, signing, validation
+- `src/config-loader.js`: JSON config loading
+- `test`: integration and config tests
 
 ## Tests
 
@@ -255,9 +255,3 @@ Not covered:
 - dynamic membership through the replicated log
 - production-grade consensus semantics
 - production auth, backup lifecycle, or deployment packaging
-
-## Notes
-
-- `.gestalt/` is intentionally ignored and should remain out of commits.
-- `holepunch-stack/` is vendored reference material and is also ignored.
-- `data/` is local runtime state and is ignored.
