@@ -456,6 +456,7 @@ export class HolepunchSwarmNode {
           feed: node.feedKey,
           seq: operation.seq,
           appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
+          rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
         const watermark = operation.heartbeat?.appliedFeeds?.[node.feedKey]
@@ -572,6 +573,7 @@ export class HolepunchSwarmNode {
       await this.#runHeartbeat()
       throw error
     }
+    await this.view.setStagedEntryResolution(this.options.identity.feedKey, operation.seq, "pending")
     await this.#advanceCommittedFeed(this.options.identity.publicKeyId, operation.seq + 1)
     await this.#runHeartbeat()
     return operation
@@ -725,12 +727,15 @@ export class HolepunchSwarmNode {
         ? await this.view.getStagedEntry(node.feedKey, operation.seq)
         : null
 
-      if (stagedEntry?.resolution === "rejected") {
+      if (stagedEntry?.resolution === "rejected" && (await this.#isRejectedSequenceStillLive(nodeId, node.feedKey, operation.seq))) {
         await this.view.setCommittedProgress(node.feedKey, {
           applied: operation.seq + 1,
           lastOpId: operation.opId
         })
       } else {
+        if (stagedEntry?.resolution === "rejected") {
+          await this.view.setStagedEntryResolution(node.feedKey, operation.seq, "pending")
+        }
         await this.view.applyCommitted(operation, node.feedKey)
       }
 
@@ -739,6 +744,22 @@ export class HolepunchSwarmNode {
       }
       committedApplied += 1
     }
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  async #isRejectedSequenceStillLive(nodeId, feedKey, seq) {
+    if (nodeId === this.options.identity.publicKeyId) {
+      const entries = await this.view.getStagedEntries(feedKey)
+      return entries.some((entry) => entry.seq === seq && entry.resolution === "rejected")
+    }
+
+    const latestHeartbeat = this.lastHeartbeatByNode.get(nodeId)
+    const rejectedSeqs = latestHeartbeat?.rejectedFeeds?.[feedKey] ?? []
+    return rejectedSeqs.includes(seq)
   }
 
   #membershipFingerprint() {
