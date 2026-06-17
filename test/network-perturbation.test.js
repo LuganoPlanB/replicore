@@ -111,11 +111,11 @@ test("five-node cluster stays durable when two non-leader followers go offline",
     )
 
     const offlineFollowers = liveFollowerIds(cluster, leaderId).slice(0, 2)
-    const survivingFollowerId = liveFollowerIds(cluster, leaderId).at(-1)
+    const leader = cluster.record(leaderId).node
 
     await Promise.all(offlineFollowers.map((nodeId) => cluster.stopNode(nodeId)))
 
-    const operation = await cluster.record(survivingFollowerId).node.put("hash:degraded-five", { degraded: true })
+    const operation = await leader.put("hash:degraded-five", { degraded: true })
     assert.equal(operation.actor, leaderId)
 
     const liveNodes = cluster.nodes
@@ -127,7 +127,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       }
     )
 
-    const leaderStatus = await cluster.record(leaderId).node.getReplicationStatus()
+    const leaderStatus = await leader.getReplicationStatus()
     assert.ok(leaderStatus.lastDurableSequence >= operation.seq)
 
     await Promise.all(offlineFollowers.map((nodeId) => cluster.restartNode(nodeId)))
@@ -431,6 +431,195 @@ test("planned node addition works after full-cluster restart with expanded membe
   }
 })
 
+test("node replacement via revocation and new identity restores service without hot membership changes", { concurrency: false }, async () => {
+  const initialCluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  let replacementCluster = null
+
+  try {
+    await initialCluster.startAll()
+
+    await waitFor(
+      async () => initialCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
+      {
+        description: "initial three-node convergence before replacement",
+        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+      }
+    )
+
+    const leaderId = currentLeaderId(initialCluster)
+    const leader = initialCluster.record(leaderId).node
+    await leader.put("hash:replacement-before", { replacement: "before" })
+
+    await waitFor(
+      async () => hasClusterValue(initialCluster.nodes, "hash:replacement-before", { replacement: "before" }),
+      {
+        description: "baseline replication before replacement",
+        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+      }
+    )
+
+    const retainedIdentities = initialCluster.identities.slice(0, 2)
+    const retiredIdentity = initialCluster.identities[2]
+    const replacementIdentity = createIdentities(1, ["replacement"])[0]
+    const activeIdentities = [...retainedIdentities, replacementIdentity]
+    const authorizedNodes = [...initialCluster.identities, replacementIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    await initialCluster.closeNodes()
+
+    replacementCluster = await createSwarmCluster({
+      identities: activeIdentities,
+      authorizedNodes,
+      dataDirs: initialCluster.records.slice(0, 2).map((record) => record.dataDir),
+      clusterId: initialCluster.options.clusterId,
+      topicSalt: initialCluster.options.topicSalt,
+      encryptionKey: initialCluster.encryptionKey,
+      heartbeatIntervalMs: initialCluster.options.heartbeatIntervalMs,
+      heartbeatTtlMs: initialCluster.options.heartbeatTtlMs,
+      bootstrap: initialCluster.testnet.bootstrap,
+      revokedNodeIds: [retiredIdentity.publicKeyId],
+      identityLabels: ["leader", "follower-1", "replacement"]
+    })
+
+    await replacementCluster.startAll()
+
+    await waitFor(
+      async () => replacementCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
+      {
+        description: "replacement cluster convergence",
+        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+      }
+    )
+
+    await waitFor(
+      async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-before", { replacement: "before" }),
+      {
+        description: "replacement node catches up to prior state",
+        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+      }
+    )
+
+    const replacementLeaderId = currentLeaderId(replacementCluster)
+    const replacementLeader = replacementCluster.record(replacementLeaderId).node
+    await replacementLeader.put("hash:replacement-after", { replacement: "after" })
+
+    await waitFor(
+      async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-after", { replacement: "after" }),
+      {
+        description: "post-replacement write converges",
+        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+      }
+    )
+
+    const writers = replacementLeader.getWritersStatus()
+    assert.deepEqual(writers.revokedNodeIds, [retiredIdentity.publicKeyId])
+    assert.equal(
+      writers.authorizedNodes.find((node) => node.nodeId === retiredIdentity.publicKeyId)?.revoked,
+      true
+    )
+  } finally {
+    if (replacementCluster) {
+      await replacementCluster.closeNodes()
+      await replacementCluster.destroyResources()
+    }
+    await initialCluster.destroyResources()
+  }
+})
+
+test("rolling restarts across a four-node cluster preserve availability and convergence", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 4,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  try {
+    await cluster.startAll()
+
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 4),
+      {
+        description: "initial four-node convergence",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const baselineLeaderId = currentLeaderId(cluster)
+    const baselineLeader = cluster.record(baselineLeaderId).node
+    await baselineLeader.put("hash:rolling-0", { cycle: 0 })
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:rolling-0", { cycle: 0 }),
+      {
+        description: "baseline write before rolling restarts",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const restartOrder = cluster.records.map((record) => record.identity.publicKeyId)
+
+    for (const [index, nodeId] of restartOrder.entries()) {
+      await cluster.restartNode(nodeId)
+
+      await waitFor(
+        async () => {
+          const liveNodes = cluster.nodes
+          if (liveNodes.some((node) => node.currentLeader() === null)) return false
+          const liveLeader = liveNodes.find((node) => node.currentLeader() === node.options.identity.publicKeyId)
+          if (!liveLeader) return false
+          const liveLeaderId = liveLeader.options.identity.publicKeyId
+          const status = await liveLeader.getReplicationStatus()
+          return liveFollowerIds(cluster, liveLeaderId).some(
+            (followerId) => cluster.record(followerId).node && status.feeds[followerId]?.alive === true
+          )
+        },
+        {
+          description: `cluster availability after restart ${index + 1}`,
+          onTimeout: () => collectReplicationStatus(cluster.nodes)
+        }
+      )
+
+      let writeResult = null
+      await waitFor(
+        async () => {
+          const liveLeader = cluster.nodes.find((node) => node.currentLeader() === node.options.identity.publicKeyId)
+          if (!liveLeader) return false
+
+          try {
+            writeResult = await liveLeader.put(`hash:rolling-${index + 1}`, { cycle: index + 1 })
+            return true
+          } catch {
+            return false
+          }
+        },
+        {
+          description: `durable write after restart ${index + 1}`,
+          onTimeout: () => collectReplicationStatus(cluster.nodes)
+        }
+      )
+      assert.ok(writeResult)
+
+      await waitFor(
+        async () => hasClusterValue(cluster.nodes, `hash:rolling-${index + 1}`, { cycle: index + 1 }),
+        {
+          description: `write convergence after restart ${index + 1}`,
+          onTimeout: () => collectReplicationStatus(cluster.nodes)
+        }
+      )
+    }
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("follower write forwarding fails while the old leader is unreachable and recovers after failover", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
@@ -490,6 +679,91 @@ test("follower write forwarding fails while the old leader is unreachable and re
   }
 })
 
+test("concurrent writes across failover do not create duplicate accepted operations", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+
+    const leaderId = currentLeaderId(cluster)
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
+      {
+        description: "initial leader convergence before concurrent failover writes",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const followerId = liveFollowerIds(cluster, leaderId)[0]
+    const follower = cluster.record(followerId).node
+    await cluster.stopNode(leaderId)
+
+    const attempts = [
+      { key: "hash:concurrent-1", delayMs: 0 },
+      { key: "hash:concurrent-2", delayMs: 100 },
+      { key: "hash:concurrent-3", delayMs: 1000 },
+      { key: "hash:concurrent-4", delayMs: 1100 },
+      { key: "hash:concurrent-5", delayMs: 1200 }
+    ]
+
+    const settled = await Promise.allSettled(
+      attempts.map(async ({ key, delayMs }) => {
+        await delay(delayMs)
+        return {
+          key,
+          operation: await follower.put(key, { key })
+        }
+      })
+    )
+
+    await waitFor(
+      async () => follower.currentLeader() !== leaderId && follower.currentLeader() !== null,
+      {
+        description: "failover completes during concurrent write test",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const succeeded = settled.flatMap((result, index) =>
+      result.status === "fulfilled" ? [{ key: attempts[index].key, operation: result.value.operation }] : []
+    )
+    const failedKeys = settled.flatMap((result, index) =>
+      result.status === "rejected" ? [attempts[index].key] : []
+    )
+
+    assert.ok(succeeded.length > 0)
+    assert.ok(failedKeys.length > 0)
+
+    for (const { key, operation } of succeeded) {
+      await waitFor(
+        async () => hasClusterValue(cluster.nodes, key, { key }),
+        {
+          description: `successful failover write converges for ${key}`,
+          onTimeout: () => collectReplicationStatus(cluster.nodes)
+        }
+      )
+
+      const history = await follower.getHistory(key)
+      assert.equal(history.length, 1)
+      assert.equal(history[0].opId, operation.opId)
+    }
+
+    for (const key of failedKeys) {
+      assert.equal(await follower.get(key), null)
+    }
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("HTTP writes fail while durability is unavailable and recover after a follower returns", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
@@ -500,6 +774,14 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
 
   try {
     await cluster.startAll()
+
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
+      {
+        description: "cluster convergence before HTTP durability test",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
 
     const leaderId = currentLeaderId(cluster)
     const leader = cluster.record(leaderId).node
@@ -618,4 +900,8 @@ async function hasClusterValue(nodes, key, expected) {
   } catch {
     return false
   }
+}
+
+async function delay(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
 }
