@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node test/run-all-tests.mjs",
+    "test": "node -e \"require('./test/run-all-tests.cjs')\"",
     "start:bootstrap": "node bin/run-bootstrap.js",
     "start:node": "node bin/run-node.js",
     "snapshot": "node bin/snapshot.js"

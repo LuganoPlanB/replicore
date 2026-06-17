@@ -57,6 +57,19 @@ test("five-node static membership supports forwarding, replication, and deletes"
       }
     )
 
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return liveFollowerIds(cluster, leaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "five-node delete durability precondition",
+        onTimeout: () => leader.getReplicationStatus()
+      }
+    )
+
     await leader.delete("hash:five-node")
 
     await waitFor(
