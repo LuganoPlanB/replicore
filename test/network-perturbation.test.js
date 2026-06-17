@@ -537,13 +537,7 @@ test("node replacement via revocation and new identity restores service without 
 
     await replacementCluster.startAll()
 
-    await waitFor(
-      async () => replacementCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
-      {
-        description: "replacement cluster convergence",
-        onTimeout: () => collectClusterDiagnostics(replacementCluster)
-      }
-    )
+    await waitForClusterConvergence(replacementCluster)
 
     await waitFor(
       async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-before", { replacement: "before" }),
@@ -555,6 +549,20 @@ test("node replacement via revocation and new identity restores service without 
 
     const replacementLeaderId = currentLeaderId(replacementCluster)
     const replacementLeader = replacementCluster.record(replacementLeaderId).node
+
+    await waitFor(
+      async () => {
+        const status = await replacementLeader.getReplicationStatus()
+        return liveFollowerIds(replacementCluster, replacementLeaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "replacement cluster regains durable follower reachability",
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
+      }
+    )
+
     await replacementLeader.put("hash:replacement-after", { replacement: "after" })
 
     await waitFor(
