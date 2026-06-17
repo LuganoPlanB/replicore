@@ -757,8 +757,9 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
     assert.equal(await leaderNode.get("hash:closing-leader"), null)
     assert.deepEqual(await leaderNode.getHistory("hash:closing-leader"), [])
 
+    const pendingWriteRejection = assert.rejects(pendingWrite, /Node is closing/)
     const closePromise = leaderNode.close()
-    await assert.rejects(pendingWrite, /Node is closing/)
+    await pendingWriteRejection
     await closePromise
     nodes.splice(nodes.indexOf(leaderNode), 1)
   } finally {
