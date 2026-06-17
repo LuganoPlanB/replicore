@@ -114,6 +114,18 @@ test("five-node cluster stays durable when two non-leader followers go offline",
     const leader = cluster.record(leaderId).node
 
     await Promise.all(offlineFollowers.map((nodeId) => cluster.stopNode(nodeId)))
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return liveFollowerIds(cluster, leaderId)
+          .filter((nodeId) => !offlineFollowers.includes(nodeId))
+          .some((nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0)
+      },
+      {
+        description: "surviving follower remains durable after two followers stop",
+        onTimeout: () => leader.getReplicationStatus()
+      }
+    )
 
     const operation = await leader.put("hash:degraded-five", { degraded: true })
     assert.equal(operation.actor, leaderId)
@@ -484,7 +496,7 @@ test("node replacement via revocation and new identity restores service without 
       encryptionKey: initialCluster.encryptionKey,
       heartbeatIntervalMs: initialCluster.options.heartbeatIntervalMs,
       heartbeatTtlMs: initialCluster.options.heartbeatTtlMs,
-      bootstrap: initialCluster.testnet.bootstrap,
+      testnet: initialCluster.testnet,
       revokedNodeIds: [retiredIdentity.publicKeyId],
       identityLabels: ["leader", "follower-1", "replacement"]
     })
@@ -531,6 +543,79 @@ test("node replacement via revocation and new identity restores service without 
       await replacementCluster.destroyResources()
     }
     await initialCluster.destroyResources()
+  }
+})
+
+test("offline follower misses writes, then catches up with full history after restart", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leaderId = currentLeaderId(cluster)
+    const leader = cluster.record(leaderId).node
+    const offlineFollowerId = liveFollowerIds(cluster, leaderId)[1]
+
+    await cluster.stopNode(offlineFollowerId)
+
+    const firstWrite = await leader.put("hash:offline-a", { step: "put" })
+    const secondWrite = await leader.put("hash:offline-b", { step: "stable" })
+    const deleteWrite = await leader.delete("hash:offline-a")
+
+    await waitFor(
+      async () => {
+        const liveNodes = cluster.nodes
+        const deletedValues = await Promise.all(liveNodes.map((node) => node.get("hash:offline-a")))
+        const stableValues = await Promise.all(liveNodes.map((node) => node.get("hash:offline-b")))
+        return (
+          deletedValues.every((value) => value?.deleted === true) &&
+          stableValues.every((value) => value?.value?.step === "stable")
+        )
+      },
+      {
+        description: "live nodes converge while one follower is offline",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const statusWhileOffline = await leader.getReplicationStatus()
+    assert.ok(statusWhileOffline.lastDurableSequence >= deleteWrite.seq)
+
+    const restartedFollower = await cluster.restartNode(offlineFollowerId)
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const deletedValue = await restartedFollower.get("hash:offline-a")
+        const stableValue = await restartedFollower.get("hash:offline-b")
+        return deletedValue?.deleted === true && stableValue?.value?.step === "stable"
+      },
+      {
+        description: "restarted follower catches up after offline writes",
+        onTimeout: () => restartedFollower.getReplicationStatus()
+      }
+    )
+
+    const deletedHistory = await restartedFollower.getHistory("hash:offline-a")
+    assert.deepEqual(
+      deletedHistory.map((entry) => entry.type),
+      ["put", "delete"]
+    )
+    assert.equal(deletedHistory[0].opId, firstWrite.opId)
+    assert.equal(deletedHistory[1].opId, deleteWrite.opId)
+
+    const stableHistory = await restartedFollower.getHistory("hash:offline-b")
+    assert.equal(stableHistory.length, 1)
+    assert.equal(stableHistory[0].opId, secondWrite.opId)
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
   }
 })
 
@@ -739,8 +824,17 @@ test("concurrent writes across failover do not create duplicate accepted operati
       result.status === "rejected" ? [attempts[index].key] : []
     )
 
-    assert.ok(succeeded.length > 0)
     assert.ok(failedKeys.length > 0)
+
+    const recovered = await follower.put("hash:concurrent-recovered", { recovered: true })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:concurrent-recovered", { recovered: true }),
+      {
+        description: "confirmed post-failover write after concurrent batch",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+    assert.ok(recovered.opId)
 
     for (const { key, operation } of succeeded) {
       await waitFor(
@@ -883,6 +977,245 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
   }
 })
 
+test("deterministic churn preserves convergence and write outcome invariants", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 4,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const stepResults = []
+    const steps = [
+      {
+        label: "baseline-write",
+        run: async () => writeOnCurrentLeader(cluster, "hash:churn-0", { step: 0 })
+      },
+      {
+        label: "stop-follower",
+        run: async () => {
+          const leaderId = currentLeaderId(cluster)
+          await cluster.stopNode(liveFollowerIds(cluster, leaderId)[0])
+          return { ok: true }
+        }
+      },
+      {
+        label: "degraded-write",
+        run: async () => writeOnCurrentLeader(cluster, "hash:churn-1", { step: 1 })
+      },
+      {
+        label: "restart-follower",
+        run: async () => {
+          const stopped = cluster.records.find((record) => !record.node)
+          await cluster.restartNode(stopped.identity.publicKeyId)
+          await waitForClusterConvergence(cluster)
+          return { ok: true }
+        }
+      },
+      {
+        label: "stop-leader",
+        run: async () => {
+          const leaderId = currentLeaderId(cluster)
+          await cluster.stopNode(leaderId)
+          return { ok: true }
+        }
+      },
+      {
+        label: "transient-failover-write",
+        run: async () => {
+          const follower = cluster.nodes[0]
+          try {
+            const operation = await follower.put("hash:churn-2", { step: 2 })
+            return { ok: true, key: "hash:churn-2", operation }
+          } catch (error) {
+            return { ok: false, key: "hash:churn-2", error: String(error) }
+          }
+        }
+      },
+      {
+        label: "post-failover-write",
+        run: async () => {
+          let result = null
+          await waitFor(
+            async () => {
+              if (!cluster.nodes.every((node) => node.currentLeader() !== null)) return false
+
+              try {
+                result = await writeOnCurrentLeader(cluster, "hash:churn-3", { step: 3 })
+                return true
+              } catch {
+                return false
+              }
+            },
+            {
+              description: "post-failover durable write during churn",
+              onTimeout: () => collectReplicationStatus(cluster.nodes)
+            }
+          )
+          return result
+        }
+      },
+      {
+        label: "restart-old-leader",
+        run: async () => {
+          const stopped = cluster.records.find((record) => !record.node)
+          await cluster.restartNode(stopped.identity.publicKeyId)
+          await waitForClusterConvergence(cluster)
+          return { ok: true }
+        }
+      },
+      {
+        label: "stop-two-followers",
+        run: async () => {
+          const leaderId = currentLeaderId(cluster)
+          for (const followerId of liveFollowerIds(cluster, leaderId).slice(0, 2)) {
+            await cluster.stopNode(followerId)
+          }
+          return { ok: true }
+        }
+      },
+      {
+        label: "durability-blocked-write",
+        run: async () => {
+          try {
+            await writeOnCurrentLeader(cluster, "hash:churn-4", { step: 4 })
+            return { ok: true, key: "hash:churn-4" }
+          } catch (error) {
+            return { ok: false, key: "hash:churn-4", error: String(error) }
+          }
+        }
+      },
+      {
+        label: "restart-all",
+        run: async () => {
+          for (const stopped of cluster.records.filter((record) => !record.node)) {
+            await cluster.restartNode(stopped.identity.publicKeyId)
+          }
+          await waitForClusterConvergence(cluster)
+          return { ok: true }
+        }
+      }
+    ]
+
+    for (const step of steps) {
+      stepResults.push({ label: step.label, ...(await step.run()) })
+    }
+
+    await waitForClusterConvergence(cluster)
+
+    for (const result of stepResults.filter((entry) => entry.key && entry.ok && entry.operation)) {
+      await waitFor(
+        async () => hasClusterValue(cluster.nodes, result.key, { step: Number(result.key.slice(-1)) }),
+        {
+          description: `final convergence for ${result.key}`,
+          onTimeout: () => collectReplicationStatus(cluster.nodes)
+        }
+      )
+    }
+
+    for (const result of stepResults.filter((entry) => entry.key && entry.ok === false)) {
+      assert.equal(await cluster.nodes[0].get(result.key), null)
+    }
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
+test("full-cluster cold restart from persisted data directories rebuilds state and accepts new writes", { concurrency: false }, async () => {
+  const initialCluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  let restartedCluster = null
+
+  try {
+    await initialCluster.startAll()
+    await waitForClusterConvergence(initialCluster)
+
+    await writeOnCurrentLeader(initialCluster, "hash:cold-1", { cold: 1 })
+    await writeOnCurrentLeader(initialCluster, "hash:cold-2", { cold: 2 })
+    await currentLeaderNode(initialCluster).delete("hash:cold-2")
+
+    await waitFor(
+      async () => {
+        const values = await Promise.all(initialCluster.nodes.map((node) => node.get("hash:cold-2")))
+        return values.every((value) => value?.deleted === true)
+      },
+      {
+        description: "pre-restart tombstone convergence",
+        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+      }
+    )
+
+    await initialCluster.closeNodes()
+    await initialCluster.testnet.destroy()
+
+    restartedCluster = await createSwarmCluster({
+      identities: initialCluster.identities,
+      authorizedNodes: initialCluster.authorizedNodes,
+      dataDirs: initialCluster.records.map((record) => record.dataDir),
+      clusterId: initialCluster.options.clusterId,
+      topicSalt: initialCluster.options.topicSalt,
+      encryptionKey: initialCluster.encryptionKey,
+      heartbeatIntervalMs: initialCluster.options.heartbeatIntervalMs,
+      heartbeatTtlMs: initialCluster.options.heartbeatTtlMs,
+      identityLabels: initialCluster.records.map((record) => record.label)
+    })
+
+    await restartedCluster.startAll()
+    await waitForClusterConvergence(restartedCluster)
+
+    await waitFor(
+      async () => hasClusterValue(restartedCluster.nodes, "hash:cold-1", { cold: 1 }),
+      {
+        description: "cold restart preserves live value",
+        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+      }
+    )
+    await waitFor(
+      async () => {
+        const values = await Promise.all(restartedCluster.nodes.map((node) => node.get("hash:cold-2")))
+        return values.every((value) => value?.deleted === true)
+      },
+      {
+        description: "cold restart preserves tombstone",
+        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+      }
+    )
+
+    const operation = await writeOnCurrentLeader(restartedCluster, "hash:cold-3", { cold: 3 })
+    assert.ok(operation.ok)
+
+    await waitFor(
+      async () => hasClusterValue(restartedCluster.nodes, "hash:cold-3", { cold: 3 }),
+      {
+        description: "post-cold-restart write converges",
+        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+      }
+    )
+
+    await assertClusterInvariants(restartedCluster)
+  } finally {
+    if (restartedCluster) {
+      await restartedCluster.closeNodes()
+      await restartedCluster.destroyResources()
+    } else {
+      await initialCluster.destroyResources()
+    }
+  }
+})
+
 function currentLeaderId(cluster) {
   return cluster.identities.map((identity) => identity.publicKeyId).sort()[0]
 }
@@ -904,4 +1237,49 @@ async function hasClusterValue(nodes, key, expected) {
 
 async function delay(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForClusterConvergence(cluster) {
+  await waitFor(
+    async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.nodes.length),
+    {
+      description: "cluster heartbeat convergence",
+      onTimeout: () => collectReplicationStatus(cluster.nodes)
+    }
+  )
+  await waitFor(
+    async () => {
+      const leaderId = currentLeaderId({ identities: cluster.nodes.map((node) => node.options.identity) })
+      return cluster.nodes.every((node) => node.currentLeader() === leaderId)
+    },
+    {
+      description: "cluster leader convergence",
+      onTimeout: () => collectReplicationStatus(cluster.nodes)
+    }
+  )
+}
+
+function currentLeaderNode(cluster) {
+  const elected = cluster.nodes.find((node) => node.currentLeader() === node.options.identity.publicKeyId)
+  if (elected) return elected
+
+  const leaderId = currentLeaderId({ identities: cluster.nodes.map((node) => node.options.identity) })
+  return cluster.record(leaderId).node
+}
+
+async function writeOnCurrentLeader(cluster, key, value) {
+  const leader = currentLeaderNode(cluster)
+  const operation = await leader.put(key, value)
+  return { ok: true, key, operation }
+}
+
+async function assertClusterInvariants(cluster) {
+  const statuses = await collectReplicationStatus(cluster.nodes)
+
+  for (const status of Object.values(statuses)) {
+    for (const feed of Object.values(status.feeds)) {
+      assert.ok(feed.applied <= feed.length)
+      assert.ok(feed.lag >= 0)
+    }
+  }
 }

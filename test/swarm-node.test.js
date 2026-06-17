@@ -154,7 +154,9 @@ test(
     })
 
     nodes.push(leader, follower1, follower2)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
 
     const leaderId = [leaderIdentity, follower1Identity, follower2Identity]
       .map((identity) => identity.publicKeyId)
@@ -232,7 +234,9 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
       nodes.push(node)
     }
 
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
     const expectedLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
       .map((identity) => identity.publicKeyId)
       .sort()[0]
@@ -426,7 +430,9 @@ test(
     })
 
     nodes.push(leader, follower)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
     await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 2))
     const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
     const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
@@ -530,7 +536,9 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
     })
 
     nodes.push(leader, follower, observer)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
     const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
       .map((identity) => identity.publicKeyId)

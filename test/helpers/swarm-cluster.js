@@ -102,7 +102,9 @@ export async function createSwarmCluster(options = {}) {
      * Start every configured node that is not already running.
      */
     async startAll() {
-      await Promise.all([...records.values()].map((record) => this.startNode(record.identity.publicKeyId)))
+      for (const record of records.values()) {
+        await this.startNode(record.identity.publicKeyId)
+      }
       return this.nodes
     },
 
