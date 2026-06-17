@@ -102,7 +102,9 @@ export class HolepunchSwarmNode {
       await core.ready()
       core.on("append", () => {
         void this.syncFeed(node.nodeId).catch((error) => {
-          if (!this.closing && error?.code !== "REQUEST_CANCELLED") throw error
+          if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+            throw error
+          }
         })
       })
       this.feedCores.set(node.nodeId, core)
@@ -320,7 +322,9 @@ export class HolepunchSwarmNode {
     try {
       await promise
     } catch (error) {
-      if (!this.closing && error?.code !== "REQUEST_CANCELLED") throw error
+      if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+        throw error
+      }
     } finally {
       this.syncPromises.delete(nodeId)
       if (this.pendingSync.has(nodeId)) {
@@ -360,6 +364,8 @@ export class HolepunchSwarmNode {
   }
 
   async #appendHeartbeat() {
+    if (this.closing) return
+
     const leader = this.currentLeader()
     const operation = createSignedOperation({
       kind: "heartbeat",
@@ -379,8 +385,14 @@ export class HolepunchSwarmNode {
       }
     })
 
-    await this.#localCore().append(operation)
-    await this.syncFeed(this.options.identity.publicKeyId)
+    if (this.closing) return
+
+    try {
+      await this.#localCore().append(operation)
+      await this.syncFeed(this.options.identity.publicKeyId)
+    } catch (error) {
+      if (!this.closing || error?.code !== "SESSION_CLOSED") throw error
+    }
   }
 
   async #appendKvOperation(type, key, value, options) {
