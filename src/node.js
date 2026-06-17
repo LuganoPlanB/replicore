@@ -36,6 +36,7 @@ export class HolepunchSwarmNode {
  *   heartbeatIntervalMs?: number,
  *   heartbeatTtlMs?: number,
  *   forwarding?: boolean,
+ *   ackDelayMs?: number,
    *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
@@ -399,7 +400,7 @@ export class HolepunchSwarmNode {
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
       } else if (operation.kind === "kv" && nodeId !== this.options.identity.publicKeyId) {
-        this.#sendAck(nodeId, operation.seq)
+        void this.#sendAck(nodeId, operation.seq)
       }
       applied += 1
     }
@@ -609,7 +610,12 @@ export class HolepunchSwarmNode {
    * @param {string} nodeId
    * @param {number} seq
    */
-  #sendAck(nodeId, seq) {
+  async #sendAck(nodeId, seq) {
+    if (this.options.ackDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, this.options.ackDelayMs))
+    }
+    if (this.closing) return
+
     const core = this.feedCores.get(nodeId)
     const extension = this.rpcExtensions.get(nodeId)
     const peer = core.peers[0]
