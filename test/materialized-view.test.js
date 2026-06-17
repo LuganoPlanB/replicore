@@ -25,21 +25,6 @@ test("materialized view keeps raw and committed feed progress separate", { concu
   })
 })
 
-test("materialized view falls back from legacy progress to both cursors", { concurrency: false }, async () => {
-  await withView(async ({ bee, view }) => {
-    await bee.put("feeds/feed-a/progress", { applied: 5, lastOpId: "legacy-5" })
-
-    assert.equal(await view.getRawApplied("feed-a"), 5)
-    assert.equal(await view.getApplied("feed-a"), 5)
-    assert.deepEqual(await view.getFeedProgress("feed-a"), {
-      rawApplied: 5,
-      rawLastOpId: "legacy-5",
-      committedApplied: 5,
-      committedLastOpId: "legacy-5"
-    })
-  })
-})
-
 test("materialized view feed progress survives restart", { concurrency: false }, async () => {
   const dirs = []
   const dataDir = await tempDir(dirs)
@@ -60,6 +45,103 @@ test("materialized view feed progress survives restart", { concurrency: false },
       committedApplied: 4,
       committedLastOpId: "committed-4"
     })
+  } finally {
+    await Promise.allSettled([first?.close(), second?.close()].filter(Boolean))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("materialized view persists staged entries without exposing committed data", { concurrency: false }, async () => {
+  const stagedOperation = {
+    kind: "kv",
+    type: "put",
+    keyspace: "default",
+    key: "hash:staged",
+    actor: "node-a",
+    seq: 8,
+    opId: "staged-8",
+    ts: "2026-06-17T00:00:00.000Z"
+  }
+
+  await withView(async ({ view }) => {
+    await view.stageEntry("feed-a", {
+      nodeId: "node-a",
+      source: "local",
+      validation: "valid",
+      operation: stagedOperation
+    })
+
+    assert.deepEqual(await view.getStagedEntries("feed-a"), [
+      {
+        feedKey: "feed-a",
+        nodeId: "node-a",
+        source: "local",
+        validation: "valid",
+        seq: 8,
+        opId: "staged-8",
+        kind: "kv",
+        type: "put",
+        keyspace: "default",
+        key: "hash:staged",
+        actor: "node-a",
+        ts: "2026-06-17T00:00:00.000Z",
+        expiresAt: null
+      }
+    ])
+    assert.equal(await view.getCurrent("default", "hash:staged"), null)
+    assert.deepEqual(await view.getHistory("default", "hash:staged"), [])
+
+    const snapshot = await view.exportSnapshot()
+    assert.ok(snapshot.entries.every((entry) => !String(entry.key).includes("/staged/")))
+  })
+})
+
+test("materialized view staged entries survive restart", { concurrency: false }, async () => {
+  const dirs = []
+  const dataDir = await tempDir(dirs)
+  let first = null
+  let second = null
+
+  try {
+    first = await openView(dataDir)
+    await first.view.stageEntry("feed-a", {
+      nodeId: "node-a",
+      source: "remote",
+      validation: "valid",
+      operation: {
+        kind: "kv",
+        type: "delete",
+        keyspace: "default",
+        key: "hash:staged-restart",
+        actor: "node-a",
+        seq: 4,
+        opId: "staged-restart-4",
+        ts: "2026-06-17T00:00:01.000Z"
+      }
+    })
+    await first.close()
+    first = null
+
+    second = await openView(dataDir)
+    assert.deepEqual(await second.view.getStagedEntries("feed-a"), [
+      {
+        feedKey: "feed-a",
+        nodeId: "node-a",
+        source: "remote",
+        validation: "valid",
+        seq: 4,
+        opId: "staged-restart-4",
+        kind: "kv",
+        type: "delete",
+        keyspace: "default",
+        key: "hash:staged-restart",
+        actor: "node-a",
+        ts: "2026-06-17T00:00:01.000Z",
+        expiresAt: null
+      }
+    ])
+    assert.equal(await second.view.getCurrent("default", "hash:staged-restart"), null)
+    assert.deepEqual(await second.view.getHistory("default", "hash:staged-restart"), [])
   } finally {
     await Promise.allSettled([first?.close(), second?.close()].filter(Boolean))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

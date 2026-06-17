@@ -113,7 +113,7 @@ export class MaterializedView {
    */
   async getFeedProgress(feedKey) {
     const progress = await this.bee.get(this.#progressKey(feedKey))
-    return this.#normalizeProgressRecord(progress?.value ?? null)
+    return this.#normalizeProgressRecord(progress?.value)
   }
 
   /**
@@ -150,6 +150,67 @@ export class MaterializedView {
         committedLastOpId: progress.lastOpId ?? null
       })
     )
+  }
+
+  /**
+   * Persist a validated-but-uncommitted K/V entry so restart and heal can
+   * inspect or later apply it without exposing it as committed state.
+   *
+   * @param {string} feedKey
+   * @param {{
+   *   nodeId: string,
+   *   source: "local" | "remote",
+   *   validation: "valid",
+   *   operation: Record<string, unknown>
+   * }} staged
+   */
+  async stageEntry(feedKey, staged) {
+    const operation = staged.operation
+    if (operation.kind !== "kv") {
+      throw new Error("Only K/V operations may be staged")
+    }
+
+    await this.bee.put(this.#stagedEntryKey(feedKey, operation.seq), {
+      feedKey,
+      nodeId: staged.nodeId,
+      source: staged.source,
+      validation: staged.validation,
+      seq: operation.seq,
+      opId: operation.opId,
+      kind: operation.kind,
+      type: operation.type,
+      keyspace: operation.keyspace,
+      key: operation.key,
+      actor: operation.actor,
+      ts: operation.ts,
+      expiresAt: operation.expiresAt ?? null
+    })
+  }
+
+  /**
+   * @param {string} feedKey
+   * @returns {Promise<Record<string, unknown>[]>}
+   */
+  async getStagedEntries(feedKey) {
+    const entries = []
+    const range = this.bee.createReadStream({
+      gte: `feeds/${feedKey}/staged/`,
+      lt: `feeds/${feedKey}/staged/~`
+    })
+
+    for await (const entry of range) {
+      entries.push(entry.value)
+    }
+
+    return entries
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  async deleteStagedEntry(feedKey, seq) {
+    await this.bee.del(this.#stagedEntryKey(feedKey, seq))
   }
 
   /**
@@ -235,6 +296,7 @@ export class MaterializedView {
     const stream = this.bee.createReadStream()
 
     for await (const entry of stream) {
+      if (this.#isStagedEntryKey(entry.key)) continue
       entries.push({
         key: entry.key,
         value: entry.value
@@ -252,23 +314,26 @@ export class MaterializedView {
   }
 
   /**
-   * @param {null | Record<string, unknown>} value
+   * @param {string} feedKey
+   * @param {number} seq
+   */
+  #stagedEntryKey(feedKey, seq) {
+    return `feeds/${feedKey}/staged/${String(seq).padStart(12, "0")}`
+  }
+
+  /**
+   * @param {Record<string, unknown> | undefined} value
    */
   #normalizeProgressRecord(value) {
-    const legacyApplied = value?.applied ?? 0
-    const legacyLastOpId = value?.lastOpId ?? null
     return {
-      rawApplied: value?.rawApplied ?? legacyApplied,
-      rawLastOpId: value?.rawLastOpId ?? legacyLastOpId,
-      committedApplied: value?.committedApplied ?? legacyApplied,
-      committedLastOpId: value?.committedLastOpId ?? legacyLastOpId
+      rawApplied: value?.rawApplied ?? 0,
+      rawLastOpId: value?.rawLastOpId ?? null,
+      committedApplied: value?.committedApplied ?? 0,
+      committedLastOpId: value?.committedLastOpId ?? null
     }
   }
 
   /**
-   * Keep writing the legacy `applied` fields until the rest of the codebase
-   * stops depending on the old shape.
-   *
    * @param {{
    *   feedKey: string,
    *   rawApplied: number,
@@ -279,12 +344,17 @@ export class MaterializedView {
    */
   #nextProgressRecord(next) {
     return {
-      applied: next.committedApplied,
-      lastOpId: next.committedLastOpId,
       rawApplied: next.rawApplied,
       rawLastOpId: next.rawLastOpId,
       committedApplied: next.committedApplied,
       committedLastOpId: next.committedLastOpId
     }
+  }
+
+  /**
+   * @param {string} key
+   */
+  #isStagedEntryKey(key) {
+    return key.includes("/staged/")
   }
 }
