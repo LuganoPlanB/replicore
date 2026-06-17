@@ -14,8 +14,9 @@ import {
   HolepunchSwarmNode,
   validateOperation
 } from "../src/index.js"
+import { waitFor } from "./helpers/eventual.js"
 
-test("leader operations replicate to followers and rebuild after restart", async () => {
+test("leader operations replicate to followers and rebuild after restart", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -105,7 +106,10 @@ test("leader operations replicate to followers and rebuild after restart", async
   }
 })
 
-test("followers forward writes to the computed leader and the next alive node becomes leader", async () => {
+test(
+  "followers forward writes to the computed leader and the next alive node becomes leader",
+  { concurrency: false },
+  async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -185,9 +189,10 @@ test("followers forward writes to the computed leader and the next alive node be
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
-})
+  }
+)
 
-test("authorized HTTP API forwards writes and exposes status routes", async () => {
+test("authorized HTTP API forwards writes and exposes status routes", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -360,7 +365,10 @@ test("operation validation rejects revoked writers", () => {
   }, /revoked/)
 })
 
-test("encryption rotation preserves existing reads and exposes revoked writer state", async () => {
+test(
+  "encryption rotation preserves existing reads and exposes revoked writer state",
+  { concurrency: false },
+  async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -454,9 +462,10 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
-})
+  }
+)
 
-test("a fresh node can restore current state from a snapshot", async () => {
+test("a fresh node can restore current state from a snapshot", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -573,19 +582,4 @@ async function tempDir(dirs) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-swarm-"))
   dirs.push(dir)
   return dir
-}
-
-/**
- * @param {() => Promise<boolean>} condition
- * @param {number} [timeoutMs]
- */
-async function waitFor(condition, timeoutMs = 10000) {
-  const started = Date.now()
-
-  while (Date.now() - started < timeoutMs) {
-    if (await condition()) return
-    await new Promise((resolve) => setTimeout(resolve, 50))
-  }
-
-  throw new Error("Timed out waiting for condition")
 }
