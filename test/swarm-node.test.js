@@ -700,6 +700,70 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
   }
 })
 
+test("closing a leader rejects a delayed durability wait without leaving a live timer behind", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("leader"))
+    const followerIdentity = generateIdentity(seed("follower-1"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 600,
+      durability: {
+        requiredFollowerAcks: 1,
+        timeoutMs: 1000
+      }
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 600
+    })
+
+    nodes.push(leader, follower)
+    await leader.start()
+    await follower.start()
+
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const leaderNode =
+      currentLeaderId === leaderIdentity.publicKeyId ? leader : follower
+
+    await waitFor(async () => leader.currentLeader() === currentLeaderId)
+    await waitFor(async () => follower.currentLeader() === currentLeaderId)
+
+    const pendingWrite = leaderNode.put("hash:closing-leader", { phase: "pending-close" })
+    await waitFor(async () => (await leaderNode.get("hash:closing-leader"))?.value?.phase === "pending-close")
+
+    const closePromise = leaderNode.close()
+    await assert.rejects(pendingWrite, /Node is closing/)
+    await closePromise
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
