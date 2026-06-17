@@ -572,6 +572,134 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
   }
 })
 
+test("a restored node can serve snapshot reads before rejoin and later catch up under degraded topology", { concurrency: false }, async () => {
+  const testnet = await createTestnet(4)
+  const dirs = []
+  const nodes = []
+
+  let restoredOffline = null
+  let restoredOnline = null
+  let restoredDir = null
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("leader"))
+    const followerIdentity = generateIdentity(seed("follower-1"))
+    const observerIdentity = generateIdentity(seed("follower-2"))
+    const restoreIdentity = generateIdentity(seed("restore-degraded"))
+
+    const authorizedNodes = [leaderIdentity, followerIdentity, observerIdentity, restoreIdentity].map(
+      (identity) => ({
+        nodeId: identity.publicKeyId,
+        publicKey: identity.publicKey,
+        feedKey: identity.feedKey
+      })
+    )
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const observer = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: observerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower, observer)
+    for (const node of nodes) {
+      await node.start()
+    }
+
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
+    await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
+
+    await currentLeaderNode.put("hash:degraded-snapshot", { phase: "before-snapshot" })
+    await currentLeaderNode.put("hash:degraded-delete", { phase: "before-delete" })
+    await waitFor(async () => (await follower.get("hash:degraded-snapshot"))?.value?.phase === "before-snapshot")
+    await waitFor(async () => (await observer.get("hash:degraded-delete"))?.value?.phase === "before-delete")
+
+    const snapshot = await currentLeaderNode.createSnapshot()
+
+    await observer.close()
+
+    restoredDir = await tempDir(dirs)
+    restoredOffline = new HolepunchSwarmNode({
+      dataDir: restoredDir,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: restoreIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: []
+    })
+    await restoredOffline.start()
+    await restoredOffline.restoreSnapshot(snapshot)
+
+    const offlineSnapshotValue = await restoredOffline.get("hash:degraded-snapshot")
+    const offlineSnapshotDelete = await restoredOffline.get("hash:degraded-delete")
+    assert.equal(offlineSnapshotValue?.value?.phase, "before-snapshot")
+    assert.equal(offlineSnapshotDelete?.value?.phase, "before-delete")
+
+    const offlineStatus = await restoredOffline.getReplicationStatus()
+    assert.equal(offlineStatus.connections, 0)
+    assert.equal(offlineStatus.readStatus.staleReadsPossible, true)
+
+    const afterSnapshot = await currentLeaderNode.put("hash:degraded-after", { phase: "after-snapshot" })
+    await currentLeaderNode.delete("hash:degraded-delete")
+    await waitFor(async () => (await follower.get("hash:degraded-after"))?.value?.phase === "after-snapshot")
+    await waitFor(async () => (await follower.get("hash:degraded-delete"))?.deleted === true)
+
+    await restoredOffline.close()
+    restoredOffline = null
+
+    restoredOnline = new HolepunchSwarmNode({
+      dataDir: restoredDir,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: restoreIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await restoredOnline.start()
+
+    await waitFor(async () => (await restoredOnline.get("hash:degraded-after"))?.value?.phase === "after-snapshot")
+    await waitFor(async () => (await restoredOnline.get("hash:degraded-delete"))?.deleted === true)
+
+    const restoredHistory = await restoredOnline.getHistory("hash:degraded-after")
+    assert.equal(restoredHistory.length, 1)
+    assert.equal(restoredHistory[0].opId, afterSnapshot.opId)
+  } finally {
+    await Promise.allSettled([restoredOnline?.close(), restoredOffline?.close()].filter(Boolean))
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
