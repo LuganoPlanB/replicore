@@ -214,6 +214,15 @@ Longer local reliability pass:
 npm run test:reliability
 ```
 
+Example bounded reliability profile:
+
+```powershell
+$env:REPLICORE_TEST_ROUNDS=2
+$env:REPLICORE_TEST_TIMEOUT_MS=180000
+$env:REPLICORE_TEST_PATTERN="offline leader|isolated leader|isolated follower|concurrent writes|bootstrap outage|restarted follower stays disconnected|follower write forwarding|deterministic churn"
+npm run test:reliability
+```
+
 The tests currently cover:
 
 - replication and restart recovery
