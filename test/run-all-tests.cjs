@@ -12,7 +12,7 @@ const testRuns = [
   ["--test-name-pattern", "planned node addition", "test/network-perturbation.test.js"],
   [
     "--test-name-pattern",
-    "node replacement|offline follower|offline leader|rolling restarts",
+    "node replacement|offline follower|offline leader|isolated leader|rolling restarts",
     "test/network-perturbation.test.js"
   ],
   [

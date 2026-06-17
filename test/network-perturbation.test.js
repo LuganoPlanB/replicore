@@ -771,6 +771,129 @@ test("offline leader yields failover writes and catches up cleanly after restart
   }
 })
 
+test("isolated leader blocks minority writes while connected followers continue and heal cleanly", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 5,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const originalLeaderId = currentLeaderId(cluster)
+    const originalLeader = cluster.record(originalLeaderId).node
+
+    await waitFor(
+      async () => {
+        const status = await originalLeader.getReplicationStatus()
+        return liveFollowerIds(cluster, originalLeaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "partition baseline durability precondition",
+        onTimeout: () => originalLeader.getReplicationStatus()
+      }
+    )
+
+    await originalLeader.put("hash:partition-before", { phase: "before" })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:partition-before", { phase: "before" }),
+      {
+        description: "baseline convergence before live isolation",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await cluster.isolateNode(originalLeaderId)
+
+    await waitFor(
+      async () => {
+        const status = await originalLeader.getReplicationStatus()
+        return status.connections === 0 && originalLeader.currentLeader() === originalLeaderId
+      },
+      {
+        description: "isolated leader loses all live peers",
+        onTimeout: () => originalLeader.getReplicationStatus()
+      }
+    )
+
+    const connectedFollowers = cluster.nodes.filter(
+      (node) => node.options.identity.publicKeyId !== originalLeaderId
+    )
+    const expectedConnectedLeaderId = connectedFollowers
+      .map((node) => node.options.identity.publicKeyId)
+      .sort()[0]
+
+    await waitFor(
+      async () => connectedFollowers.every((node) => node.currentLeader() === expectedConnectedLeaderId),
+      {
+        description: "connected side elects next live leader during isolation",
+        onTimeout: () => collectReplicationStatus(connectedFollowers)
+      }
+    )
+
+    await assert.rejects(
+      originalLeader.put("hash:partition-blocked", { blocked: true }),
+      /(Durability requirement not met|Timed out waiting for follower acknowledgement)/
+    )
+
+    const connectedLeader = cluster.record(expectedConnectedLeaderId).node
+    const duringIsolation = await connectedLeader.put("hash:partition-during", { phase: "during" })
+    assert.equal(duringIsolation.actor, expectedConnectedLeaderId)
+
+    await waitFor(
+      async () => hasClusterValue(connectedFollowers, "hash:partition-during", { phase: "during" }),
+      {
+        description: "connected side continues durable writes during isolation",
+        onTimeout: () => collectReplicationStatus(connectedFollowers)
+      }
+    )
+
+    await cluster.healNode(originalLeaderId)
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const current = await originalLeader.get("hash:partition-during")
+        return current?.value?.phase === "during"
+      },
+      {
+        description: "healed leader catches up to connected-side write",
+        onTimeout: () => originalLeader.getReplicationStatus()
+      }
+    )
+
+    for (const node of cluster.nodes) {
+      assert.equal(await node.get("hash:partition-blocked"), null)
+    }
+
+    const afterHeal = await writeOnCurrentLeader(cluster, "hash:partition-after", { phase: "after" })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:partition-after", { phase: "after" }),
+      {
+        description: "post-heal write converges to full cluster",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const isolatedHistory = await originalLeader.getHistory("hash:partition-during")
+    assert.equal(isolatedHistory.length, 1)
+    assert.equal(isolatedHistory[0].opId, duringIsolation.opId)
+    assert.ok(afterHeal.operation.opId)
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("rolling restarts across a four-node cluster preserve availability and convergence", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 4,
