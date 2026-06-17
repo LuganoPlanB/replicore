@@ -111,7 +111,9 @@ test("five-node static membership supports forwarding, replication, and deletes"
     }
 
     const history = await leader.getHistory("hash:five-node")
-    assert.equal(history.length, 2)
+    assert.ok(history.some((entry) => entry.opId === operation.opId && entry.type === "put"))
+    assert.ok(history.some((entry) => entry.opId === deleteOperation.opId && entry.type === "delete"))
+    assert.equal(history.at(-1)?.type, "delete")
   } finally {
     await cluster.closeAll()
   }
@@ -509,8 +511,16 @@ test("node replacement via revocation and new identity restores service without 
       }
     )
 
-    const retainedIdentities = initialCluster.identities.slice(0, 2)
-    const retiredIdentity = initialCluster.identities[2]
+    const retainedFollowerIdentity = initialCluster.identities.find((identity) => identity.publicKeyId !== leaderId)
+    assert.ok(retainedFollowerIdentity)
+    const retainedIdentities = [
+      initialCluster.record(leaderId).identity,
+      retainedFollowerIdentity
+    ]
+    const retiredIdentity = initialCluster.identities.find(
+      (identity) => !retainedIdentities.some((retained) => retained.publicKeyId === identity.publicKeyId)
+    )
+    assert.ok(retiredIdentity)
     const replacementIdentity = createIdentities(1, ["replacement"])[0]
     const activeIdentities = [...retainedIdentities, replacementIdentity]
     const authorizedNodes = [...initialCluster.identities, replacementIdentity].map((identity) => ({
@@ -524,7 +534,7 @@ test("node replacement via revocation and new identity restores service without 
     replacementCluster = await createSwarmCluster({
       identities: activeIdentities,
       authorizedNodes,
-      dataDirs: initialCluster.records.slice(0, 2).map((record) => record.dataDir),
+      dataDirs: retainedIdentities.map((identity) => initialCluster.record(identity.publicKeyId).dataDir),
       clusterId: initialCluster.options.clusterId,
       topicSalt: initialCluster.options.topicSalt,
       encryptionKey: initialCluster.encryptionKey,
@@ -563,7 +573,12 @@ test("node replacement via revocation and new identity restores service without 
       }
     )
 
-    await replacementLeader.put("hash:replacement-after", { replacement: "after" })
+    await waitForDurableClusterWrite(
+      replacementCluster,
+      "hash:replacement-after",
+      { replacement: "after" },
+      "post-replacement durable write"
+    )
 
     await waitFor(
       async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-after", { replacement: "after" }),
@@ -603,10 +618,16 @@ test("node replacement catches up a retained stale node after long absence", { c
 
     const leaderId = currentLeaderId(initialCluster)
     const leader = initialCluster.record(leaderId).node
-    const retainedIdentities = initialCluster.identities.slice(0, 2)
-    const retiredIdentity = initialCluster.identities[2]
-    const staleRetainedIdentity =
-      retainedIdentities.find((identity) => identity.publicKeyId !== leaderId) ?? retainedIdentities[0]
+    const staleRetainedIdentity = initialCluster.identities.find((identity) => identity.publicKeyId !== leaderId)
+    assert.ok(staleRetainedIdentity)
+    const retainedIdentities = [
+      initialCluster.record(leaderId).identity,
+      staleRetainedIdentity
+    ]
+    const retiredIdentity = initialCluster.identities.find(
+      (identity) => !retainedIdentities.some((retained) => retained.publicKeyId === identity.publicKeyId)
+    )
+    assert.ok(retiredIdentity)
 
     const baselineHistory = await leader.put("hash:replacement-history", { phase: "before-absence" })
     await leader.put("hash:replacement-delete", { phase: "before-delete" })
