@@ -6,6 +6,7 @@ import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 
 import { canonicalize } from "./canonical.js"
+import { ConsensusStateStore } from "./consensus-state.js"
 import { DurabilityWaiter } from "./durability-waiter.js"
 import {
   createSignedOperation,
@@ -60,6 +61,9 @@ export class HolepunchSwarmNode {
       keys: { default: this.options.encryptionKey }
     }
     this.store = null
+    this.consensusBee = null
+    this.consensusStateStore = null
+    this.consensusState = null
     this.network = null
     this.rpc = null
     this.viewBee = null
@@ -89,6 +93,11 @@ export class HolepunchSwarmNode {
     this.viewBee = new Hyperbee(viewCore, { keyEncoding: "utf-8", valueEncoding: "json" })
     this.view = new MaterializedView(this.viewBee)
     await this.viewBee.ready()
+    const consensusCore = this.store.get({ name: "consensus-state" })
+    this.consensusBee = new Hyperbee(consensusCore, { keyEncoding: "utf-8", valueEncoding: "json" })
+    await this.consensusBee.ready()
+    this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
+    this.consensusState = await this.consensusStateStore.load()
     this.rpc = new NodeRpcRouter({
       localNodeId: this.options.identity.publicKeyId,
       timeoutMs: this.options.durability.timeoutMs,
@@ -332,6 +341,20 @@ export class HolepunchSwarmNode {
     })
   }
 
+  async getConsensusState() {
+    return { ...this.consensusState }
+  }
+
+  /**
+   * Transitional hook for consensus implementation and restart-safety tests.
+   *
+   * @param {Partial<{ currentTerm: number, votedFor: string | null, commitIndex: number, lastApplied: number, membershipVersion: number }>} patch
+   */
+  async setConsensusState(patch) {
+    this.consensusState = await this.consensusStateStore.save(patch)
+    return this.getConsensusState()
+  }
+
   async createSnapshot() {
     return this.view.exportSnapshot()
   }
@@ -367,6 +390,7 @@ export class HolepunchSwarmNode {
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
     this.network?.clear()
+    if (this.consensusBee) await this.consensusBee.close()
     if (this.viewBee) await this.viewBee.close()
     if (this.store) await this.store.close()
   }

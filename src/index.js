@@ -1,4 +1,5 @@
 export { canonicalize } from "./canonical.js"
+export { ConsensusStateStore } from "./consensus-state.js"
 export { deriveTopic } from "./config.js"
 export { loadRuntimeConfig } from "./config-loader.js"
 export {
