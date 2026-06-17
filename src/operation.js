@@ -22,7 +22,8 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
  *   heartbeat?: null | {
  *     observedLeader: string | null,
  *     reachableLeader: boolean,
- *     appliedFeeds: Record<string, number>
+ *     appliedFeeds: Record<string, number>,
+ *     membershipFingerprint?: string
  *   }
  * }} input
  * @returns {Record<string, unknown>}

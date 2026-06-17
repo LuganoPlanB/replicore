@@ -63,7 +63,8 @@ export class MaterializedView {
       seq: operation.seq,
       observedLeader: operation.heartbeat?.observedLeader ?? null,
       reachableLeader: operation.heartbeat?.reachableLeader ?? false,
-      appliedFeeds: operation.heartbeat?.appliedFeeds ?? {}
+      appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
+      membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
     })
     await batch.put(`feeds/${feedKey}/progress`, { applied: operation.seq + 1, lastOpId: operation.opId })
     await batch.flush()
@@ -117,7 +118,7 @@ export class MaterializedView {
   }
 
   /**
-   * @returns {Promise<Record<string, { actor: string, feed: string, ts: string, seq: number, observedLeader: string | null, reachableLeader: boolean, appliedFeeds: Record<string, number> }>>}
+   * @returns {Promise<Record<string, { actor: string, feed: string, ts: string, seq: number, observedLeader: string | null, reachableLeader: boolean, appliedFeeds: Record<string, number>, membershipFingerprint: string | null }>>}
    */
   async getHeartbeats() {
     const heartbeats = {}
