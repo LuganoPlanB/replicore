@@ -321,6 +321,8 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.#rejectPendingWrites(new Error("Node is closing"))
+    this.pendingSync.clear()
     await this.suspendNetworking()
     for (const extension of this.rpcExtensions.values()) extension.destroy()
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
@@ -557,6 +559,25 @@ export class HolepunchSwarmNode {
       this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
       waiter.resolve()
     }
+  }
+
+  /**
+   * Reject outstanding write waits so shutdown does not leave live timers behind.
+   *
+   * @param {Error} error
+   */
+  #rejectPendingWrites(error) {
+    for (const pending of this.inflightRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.inflightRequests.clear()
+
+    for (const waiter of this.ackWaiters.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    this.ackWaiters.clear()
   }
 
   /**
