@@ -55,6 +55,10 @@ For longer local churn checks, run:
 npm run test:reliability
 ```
 
+The reliability runner accepts the same bounded env controls used elsewhere:
+`REPLICORE_TEST_ROUNDS`, `REPLICORE_TEST_TIMEOUT_MS`, `REPLICORE_TEST_PATTERN`,
+`REPLICORE_TEST_FILE`, and `REPLICORE_NODE_TEST_CONCURRENCY`.
+
 For bounded stress and timeout reproduction, run:
 
 ```powershell
