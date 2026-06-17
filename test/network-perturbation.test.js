@@ -2,7 +2,13 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { HolepunchHttpServer } from "../src/index.js"
-import { assertClusterValue, collectClusterDiagnostics, collectReplicationStatus, waitFor } from "./helpers/eventual.js"
+import {
+  assertClusterValue,
+  collectClusterDiagnostics,
+  collectReplicationStatus,
+  waitFor,
+  waitForNoChange
+} from "./helpers/eventual.js"
 import { createIdentities, createSwarmCluster } from "./helpers/swarm-cluster.js"
 
 test("five-node static membership supports forwarding, replication, and deletes", { concurrency: false }, async () => {
@@ -1164,6 +1170,122 @@ test("bootstrap outage after discovery does not break writes for already connect
     await assertClusterInvariants(cluster)
   } finally {
     cluster.testnet = null
+    await cluster.closeAll()
+  }
+})
+
+test("restarted follower stays disconnected while bootstrap remains unavailable", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leaderId = currentLeaderId(cluster)
+    const leader = cluster.record(leaderId).node
+    const followerIds = liveFollowerIds(cluster, leaderId)
+    const restartingFollowerId = followerIds[1]
+    const survivingFollowerId = followerIds[0]
+
+    await leader.put("hash:bootstrap-restart-before", { phase: "before" })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:bootstrap-restart-before", { phase: "before" }),
+      {
+        description: "baseline replication before follower restart during bootstrap outage",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    await cluster.testnet.destroy()
+    cluster.testnet = null
+    await cluster.stopNode(restartingFollowerId)
+
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return (
+          status.feeds[survivingFollowerId]?.alive === true &&
+          status.feeds[survivingFollowerId]?.connectedPeers > 0 &&
+          status.feeds[restartingFollowerId]?.alive === false
+        )
+      },
+      {
+        description: "surviving follower remains durable after bootstrap loss and follower stop",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    await leader.put("hash:bootstrap-restart-during", { phase: "during" })
+    await waitFor(
+      async () =>
+        hasClusterValue(
+          cluster.nodes.filter((node) => node.options.identity.publicKeyId !== restartingFollowerId),
+          "hash:bootstrap-restart-during",
+          { phase: "during" }
+        ),
+      {
+        description: "connected peers continue writing while bootstrap remains unavailable",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const restartedFollower = await cluster.restartNode(restartingFollowerId)
+
+    await waitFor(
+      async () => {
+        const status = await restartedFollower.getReplicationStatus()
+        return (
+          status.connections === 0 &&
+          status.knownPeerNodeIds.length === 0 &&
+          status.feeds[leaderId]?.connectedPeers === 0 &&
+          status.feeds[survivingFollowerId]?.connectedPeers === 0 &&
+          restartedFollower.currentLeader() === restartingFollowerId
+        )
+      },
+      {
+        description: "restarted follower stays disconnected without bootstrap rediscovery",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const staleDuringValue = await waitForNoChange(
+      async () => restartedFollower.get("hash:bootstrap-restart-during"),
+      {
+        stableMs: 500,
+        timeoutMs: 3000,
+        intervalMs: 100
+      }
+    )
+    assert.equal(staleDuringValue, null)
+
+    await leader.put("hash:bootstrap-restart-after", { phase: "after" })
+    await waitFor(
+      async () =>
+        hasClusterValue(
+          cluster.nodes.filter((node) => node.options.identity.publicKeyId !== restartingFollowerId),
+          "hash:bootstrap-restart-after",
+          { phase: "after" }
+        ),
+      {
+        description: "connected peers still converge after follower restart without bootstrap",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const staleAfterValue = await waitForNoChange(
+      async () => restartedFollower.get("hash:bootstrap-restart-after"),
+      {
+        stableMs: 500,
+        timeoutMs: 3000,
+        intervalMs: 100
+      }
+    )
+    assert.equal(staleAfterValue, null)
+  } finally {
     await cluster.closeAll()
   }
 })
