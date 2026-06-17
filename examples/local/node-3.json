@@ -21,6 +21,11 @@
   },
   "auth": {
     "tokens": {
+      "admin": {
+        "admin": true,
+        "readKeyspaces": ["*"],
+        "writeKeyspaces": ["*"]
+      },
       "writer": {
         "readKeyspaces": ["default"],
         "writeKeyspaces": ["default"]

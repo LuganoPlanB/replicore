@@ -51,3 +51,15 @@ curl "http://127.0.0.1:3001/status/replication"
 curl "http://127.0.0.1:3001/status/writers"
 curl "http://127.0.0.1:3001/status/leader"
 ```
+
+Export a snapshot:
+
+```powershell
+npm run snapshot -- export http://127.0.0.1:3001 admin .\tmp\snapshot.json
+```
+
+Import a snapshot:
+
+```powershell
+npm run snapshot -- import http://127.0.0.1:3001 admin .\tmp\snapshot.json
+```

@@ -9,12 +9,13 @@ export class HolepunchHttpServer {
    *   node: import("./node.js").HolepunchSwarmNode,
    *   host?: string,
    *   port?: number,
-   *   auth?: {
-   *     tokens: Record<string, {
-   *       readKeyspaces?: string[],
-   *       writeKeyspaces?: string[]
-   *     }>
-   *   }
+  *   auth?: {
+  *     tokens: Record<string, {
+  *       admin?: boolean,
+  *       readKeyspaces?: string[],
+  *       writeKeyspaces?: string[]
+  *     }>
+  *   }
    * }} options
    */
   constructor(options) {
@@ -104,6 +105,18 @@ export class HolepunchHttpServer {
         return this.#json(res, 200, await this.options.node.getLeaderStatus())
       }
 
+      if (req.method === "GET" && url.pathname === "/admin/snapshot") {
+        this.#authorizeAdmin(req)
+        return this.#json(res, 200, await this.options.node.createSnapshot())
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/snapshot/import") {
+        this.#authorizeAdmin(req)
+        const body = await this.#readJson(req)
+        await this.options.node.restoreSnapshot(body)
+        return this.#json(res, 200, { ok: true })
+      }
+
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
@@ -114,9 +127,7 @@ export class HolepunchHttpServer {
   }
 
   #authorize(req, keyspace, mode) {
-    const header = req.headers.authorization ?? ""
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null
-    const grants = token ? this.options.auth.tokens[token] : null
+    const grants = this.#tokenGrants(req)
     if (!grants) {
       const error = new Error("Unauthorized")
       error.statusCode = 401
@@ -129,6 +140,27 @@ export class HolepunchHttpServer {
       error.statusCode = 403
       throw error
     }
+  }
+
+  #authorizeAdmin(req) {
+    const grants = this.#tokenGrants(req)
+    if (!grants) {
+      const error = new Error("Unauthorized")
+      error.statusCode = 401
+      throw error
+    }
+
+    if (grants.admin !== true) {
+      const error = new Error("Forbidden")
+      error.statusCode = 403
+      throw error
+    }
+  }
+
+  #tokenGrants(req) {
+    const header = req.headers.authorization ?? ""
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null
+    return token ? this.options.auth.tokens[token] ?? null : null
   }
 
   async #readJson(req) {

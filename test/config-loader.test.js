@@ -4,7 +4,7 @@ import path from "node:path"
 import test from "node:test"
 import assert from "node:assert/strict"
 
-import { loadRuntimeConfig } from "../src/index.js"
+import { loadRuntimeConfig, readSnapshotFile, writeSnapshotFile } from "../src/index.js"
 
 test("loadRuntimeConfig derives identities and resolves paths", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-"))
@@ -27,6 +27,25 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
       config.authorizedNodes.some((node) => node.nodeId === config.identity.publicKeyId),
       true
     )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("snapshot file helpers round-trip JSON snapshots", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-snapshot-"))
+
+  try {
+    const filePath = path.join(dir, "snapshot.json")
+    const snapshot = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      entries: [{ key: "kv/current/default/hash:test", value: { deleted: false } }]
+    }
+
+    await writeSnapshotFile(filePath, snapshot)
+    const loaded = await readSnapshotFile(filePath)
+    assert.deepEqual(loaded, snapshot)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

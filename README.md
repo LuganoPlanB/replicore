@@ -22,6 +22,7 @@ The current implementation is a prototype. It is useful for local runs and archi
 - Static bearer-token ACLs by keyspace
 - HTTP routes for CRUD and status
 - Snapshot export/import for current-state restore
+- Admin snapshot export/import endpoints and CLI
 - Config-driven node launcher and local bootstrap helper
 
 ## Not Implemented Yet
@@ -119,6 +120,22 @@ Leader:
 ```powershell
 curl "http://127.0.0.1:3001/status/leader"
 ```
+
+## Snapshots
+
+Export a snapshot from a live node:
+
+```powershell
+npm run snapshot -- export http://127.0.0.1:3001 admin .\tmp\snapshot.json
+```
+
+Import a snapshot into a live node:
+
+```powershell
+npm run snapshot -- import http://127.0.0.1:3001 admin .\tmp\snapshot.json
+```
+
+The example configs include an `admin` token for these routes.
 
 ## Config
 

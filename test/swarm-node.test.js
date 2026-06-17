@@ -224,6 +224,7 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
         node,
         auth: {
           tokens: {
+            admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
             writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
             reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
           }
@@ -285,6 +286,18 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
     assert.equal(leaderResponse.status, 200)
     const leader = await leaderResponse.json()
     assert.equal(typeof leader.currentLeader, "string")
+
+    const snapshotForbidden = await fetch(`${baseUrl}/admin/snapshot`, {
+      headers: { authorization: "Bearer writer" }
+    })
+    assert.equal(snapshotForbidden.status, 403)
+
+    const snapshotResponse = await fetch(`${baseUrl}/admin/snapshot`, {
+      headers: { authorization: "Bearer admin" }
+    })
+    assert.equal(snapshotResponse.status, 200)
+    const snapshot = await snapshotResponse.json()
+    assert.equal(snapshot.version, 1)
   } finally {
     await Promise.allSettled(servers.map((server) => server.close()))
     await Promise.allSettled(nodes.map((node) => node.close()))
