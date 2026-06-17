@@ -47,6 +47,14 @@ npm test
 
 When changing behavior around replication, forwarding, leader election, durability, or snapshots, update or add tests in [test](C:/Users/denis/devel/planb-cleard/test:1).
 
+The default suite is grouped through [test/run-all-tests.cjs](C:/Users/denis/devel/planb-cleard/test/run-all-tests.cjs:1) so perturbation scenarios do not all share one Node test process. The live-isolation helpers are in [test/helpers/swarm-cluster.js](C:/Users/denis/devel/planb-cleard/test/helpers/swarm-cluster.js:1) and rely on the node-level networking hooks in [src/node.js](C:/Users/denis/devel/planb-cleard/src/node.js:1).
+
+For longer local churn checks, run:
+
+```powershell
+npm run test:reliability
+```
+
 ## Docs and Plans
 
 - Top-level human docs belong in `README.md`.
