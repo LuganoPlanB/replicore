@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 
@@ -5,6 +6,7 @@ import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 import Hyperswarm from "hyperswarm"
 
+import { canonicalize } from "./canonical.js"
 import { deriveTopic } from "./config.js"
 import {
   createSignedOperation,
@@ -264,6 +266,7 @@ export class HolepunchSwarmNode {
       lastDurableSequence: this.lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
+      membership: this.#membershipStatus(heartbeats),
       feeds,
       heartbeats
     }
@@ -274,6 +277,7 @@ export class HolepunchSwarmNode {
       currentLeader: this.currentLeader(),
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
+      membershipFingerprint: this.#membershipFingerprint(),
       authorizedNodes: this.options.authorizedNodes.map((node) => ({
         nodeId: node.nodeId,
         feedKey: node.feedKey,
@@ -384,7 +388,8 @@ export class HolepunchSwarmNode {
           ts: operation.ts,
           feed: node.feedKey,
           seq: operation.seq,
-          appliedFeeds: operation.heartbeat?.appliedFeeds ?? {}
+          appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
+          membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
       } else if (operation.kind === "kv" && nodeId !== this.options.identity.publicKeyId) {
         this.#sendAck(nodeId, operation.seq)
@@ -411,7 +416,8 @@ export class HolepunchSwarmNode {
       heartbeat: {
         observedLeader: leader,
         reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
-        appliedFeeds: await this.#appliedFeeds()
+        appliedFeeds: await this.#appliedFeeds(),
+        membershipFingerprint: this.#membershipFingerprint()
       }
     })
 
@@ -705,6 +711,39 @@ export class HolepunchSwarmNode {
       applied[node.feedKey] = await this.view.getApplied(node.feedKey)
     }
     return applied
+  }
+
+  #membershipFingerprint() {
+    const membership = this.options.authorizedNodes.map((node) => ({
+      nodeId: node.nodeId,
+      feedKey: node.feedKey,
+      revoked: this.#isRevokedNode(node.nodeId)
+    }))
+    return createHash("sha256").update(canonicalize(membership)).digest("hex")
+  }
+
+  #membershipStatus(heartbeats) {
+    const localFingerprint = this.#membershipFingerprint()
+    const peerFingerprints = {}
+    const mismatchedNodeIds = []
+    const matchingNodeIds = []
+
+    for (const node of this.options.authorizedNodes) {
+      if (node.nodeId === this.options.identity.publicKeyId) continue
+
+      const fingerprint = heartbeats[node.nodeId]?.membershipFingerprint ?? null
+      peerFingerprints[node.nodeId] = fingerprint
+      if (fingerprint === null) continue
+      if (fingerprint === localFingerprint) matchingNodeIds.push(node.nodeId)
+      else mismatchedNodeIds.push(node.nodeId)
+    }
+
+    return {
+      localFingerprint,
+      peerFingerprints,
+      mismatchedNodeIds: mismatchedNodeIds.sort(),
+      matchingNodeIds: matchingNodeIds.sort()
+    }
   }
 
   #currentEncryptionKey() {

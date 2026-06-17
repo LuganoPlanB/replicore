@@ -236,6 +236,7 @@ The current test suite verifies these non-malicious failure behaviors:
 - isolated followers can serve stale reads until they heal and catch up
 - already-connected peers continue writing after bootstrap disappears
 - if a follower restarts while bootstrap remains unavailable, it starts locally but does not rediscover peers from scratch, stays disconnected, and does not catch up to writes made while it was away
+- membership is static; rolling out divergent `authorizedNodes` views is unsupported, nodes expose membership fingerprint mismatches in replication status, and degraded writes may stay blocked until configs converge again
 - writes may fail transiently during failover windows while leader view and reachability converge
 - snapshot restore and persisted data directories recover current state after severe outage or full restart
 

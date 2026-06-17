@@ -623,6 +623,32 @@ test("mismatched membership config blocks degraded writes conservatively", { con
 
     const staleWriters = staleFollower.getWritersStatus()
     assert.equal(staleWriters.authorizedNodes.length, 2)
+    assert.notEqual(
+      staleWriters.membershipFingerprint,
+      leader.getWritersStatus().membershipFingerprint
+    )
+
+    await waitFor(
+      async () => {
+        const staleStatus = await staleFollower.getReplicationStatus()
+        const fullStatus = await fullyConfiguredFollower.getReplicationStatus()
+        return (
+          staleStatus.membership.mismatchedNodeIds.includes(leaderId) &&
+          fullStatus.membership.mismatchedNodeIds.includes(staleFollowerId)
+        )
+      },
+      {
+        description: "membership mismatch becomes observable before leader loss",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const staleStatusBeforeOutage = await staleFollower.getReplicationStatus()
+    assert.equal(
+      staleStatusBeforeOutage.membership.peerFingerprints[leaderId],
+      leader.getWritersStatus().membershipFingerprint
+    )
+    assert.deepEqual(staleStatusBeforeOutage.membership.mismatchedNodeIds, [leaderId])
 
     await leader.put("hash:mismatch-before", { phase: "before" })
     await waitFor(
@@ -658,6 +684,9 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       }
     )
 
+    const fullStatusDuringOutage = await fullyConfiguredFollower.getReplicationStatus()
+    assert.deepEqual(fullStatusDuringOutage.membership.mismatchedNodeIds, [staleFollowerId])
+
     await assert.rejects(
       fullyConfiguredFollower.put("hash:mismatch-blocked-forwarded", { blocked: true }),
       /(Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
@@ -676,6 +705,24 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     )
 
     assert.equal(staleFollower.getWritersStatus().authorizedNodes.length, 2)
+    assert.deepEqual(
+      (await restartedLeader.getReplicationStatus()).membership.mismatchedNodeIds,
+      [staleFollowerId]
+    )
+
+    await waitFor(
+      async () => {
+        const status = await restartedLeader.getReplicationStatus()
+        return (
+          status.feeds[fullyConfiguredFollowerId]?.alive === true &&
+          status.feeds[fullyConfiguredFollowerId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "fully configured follower becomes reachable after leader restart",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
 
     await restartedLeader.put("hash:mismatch-after", { phase: "after" })
 
