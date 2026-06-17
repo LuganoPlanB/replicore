@@ -608,9 +608,11 @@ export class HolepunchSwarmNode {
                     message.request.options ?? {}
                   )
 
-            this.rpcExtensions
-              .get(message.from)
-              .send({ type: "write-response", requestId: message.requestId, ok: true, result }, peer)
+            const responseExtension = this.rpcExtensions.get(message.from)
+            responseExtension?.send(
+              { type: "write-response", requestId: message.requestId, ok: true, result },
+              peer
+            )
             return
           }
 
@@ -629,7 +631,8 @@ export class HolepunchSwarmNode {
           }
         } catch (error) {
           if (message.type === "write-request") {
-            this.rpcExtensions.get(message.from).send(
+            const responseExtension = this.rpcExtensions.get(message.from)
+            responseExtension?.send(
               {
                 type: "write-response",
                 requestId: message.requestId,
