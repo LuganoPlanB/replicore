@@ -1871,10 +1871,12 @@ test("deterministic churn preserves convergence and write outcome invariants", {
     const steps = [
       {
         label: "baseline-write",
+        checkRecoveryAfter: true,
         run: async () => waitForDurableClusterWrite(cluster, "hash:churn-0", { step: 0 }, "baseline churn write")
       },
       {
         label: "stop-follower",
+        checkRecoveryAfter: true,
         run: async () => {
           const leaderId = currentLeaderId(cluster)
           await cluster.stopNode(liveFollowerIds(cluster, leaderId)[0])
@@ -1883,10 +1885,12 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "degraded-write",
+        checkRecoveryAfter: true,
         run: async () => waitForDurableClusterWrite(cluster, "hash:churn-1", { step: 1 }, "degraded churn write")
       },
       {
         label: "restart-follower",
+        checkRecoveryAfter: true,
         run: async () => {
           const stopped = cluster.records.find((record) => !record.node)
           await cluster.restartNode(stopped.identity.publicKeyId)
@@ -1916,6 +1920,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "post-failover-write",
+        checkRecoveryAfter: true,
         run: async () => {
           let result = null
           result = await waitForDurableClusterWrite(
@@ -1929,6 +1934,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "restart-old-leader",
+        checkRecoveryAfter: true,
         run: async () => {
           const stopped = cluster.records.find((record) => !record.node)
           await cluster.restartNode(stopped.identity.publicKeyId)
@@ -1938,6 +1944,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "stop-two-followers",
+        checkRecoveryAfter: true,
         run: async () => {
           const leaderId = currentLeaderId(cluster)
           for (const followerId of liveFollowerIds(cluster, leaderId).slice(0, 2)) {
@@ -1948,6 +1955,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "durability-blocked-write",
+        checkRecoveryAfter: true,
         run: async () => {
           try {
             await writeOnCurrentLeader(cluster, "hash:churn-4", { step: 4 })
@@ -1959,6 +1967,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "restart-all",
+        checkRecoveryAfter: true,
         run: async () => {
           for (const stopped of cluster.records.filter((record) => !record.node)) {
             await cluster.restartNode(stopped.identity.publicKeyId)
@@ -1970,7 +1979,16 @@ test("deterministic churn preserves convergence and write outcome invariants", {
     ]
 
     for (const step of steps) {
-      stepResults.push({ label: step.label, ...(await step.run()) })
+      const result = { label: step.label, ...(await step.run()) }
+      stepResults.push(result)
+
+      if (step.checkRecoveryAfter) {
+        await assertRecoveryWindowInvariants(cluster, step.label)
+      }
+
+      if (result.key && result.ok === false) {
+        assert.equal(await cluster.nodes[0].get(result.key), null)
+      }
     }
 
     await waitForClusterConvergence(cluster)
@@ -1983,10 +2001,6 @@ test("deterministic churn preserves convergence and write outcome invariants", {
           onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
-    }
-
-    for (const result of stepResults.filter((entry) => entry.key && entry.ok === false)) {
-      assert.equal(await cluster.nodes[0].get(result.key), null)
     }
 
     await assertClusterInvariants(cluster)
@@ -2166,6 +2180,34 @@ async function assertClusterInvariants(cluster) {
     for (const feed of Object.values(status.feeds)) {
       assert.ok(feed.applied <= feed.length)
       assert.ok(feed.lag >= 0)
+    }
+  }
+}
+
+async function assertRecoveryWindowInvariants(cluster, label) {
+  await waitFor(
+    async () => {
+      if (cluster.nodes.length === 0) return false
+      const leaders = cluster.nodes.map((node) => node.currentLeader()).filter(Boolean)
+      return leaders.length === cluster.nodes.length && new Set(leaders).size === 1
+    },
+    {
+      description: `leader agreement after ${label}`,
+      onTimeout: () => collectClusterDiagnostics(cluster)
+    }
+  )
+
+  const statuses = await collectReplicationStatus(cluster.nodes)
+  const agreedLeader = cluster.nodes[0].currentLeader()
+  assert.ok(agreedLeader, `expected a leader after ${label}`)
+
+  for (const status of Object.values(statuses)) {
+    assert.equal(status.leader, agreedLeader, `leader mismatch after ${label}`)
+    assert.deepEqual(status.membership.mismatchedNodeIds, [], `membership mismatch after ${label}`)
+
+    for (const feed of Object.values(status.feeds)) {
+      assert.ok(feed.applied <= feed.length, `applied exceeds length after ${label}`)
+      assert.ok(feed.lag >= 0, `negative lag after ${label}`)
     }
   }
 }
