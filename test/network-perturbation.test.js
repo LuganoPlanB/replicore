@@ -1175,12 +1175,26 @@ test("isolated leader blocks minority writes while connected followers continue 
       }
     )
 
+    const connectedLeader = cluster.record(expectedConnectedLeaderId).node
+    await waitFor(
+      async () => {
+        const status = await connectedLeader.getReplicationStatus()
+        return connectedFollowers
+          .map((node) => node.options.identity.publicKeyId)
+          .filter((nodeId) => nodeId !== expectedConnectedLeaderId)
+          .some((nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0)
+      },
+      {
+        description: "connected side keeps a reachable follower during leader isolation",
+        onTimeout: () => connectedLeader.getReplicationStatus()
+      }
+    )
+
     await assert.rejects(
       originalLeader.put("hash:partition-blocked", { blocked: true }),
       /(Durability requirement not met|Timed out waiting for follower acknowledgement)/
     )
 
-    const connectedLeader = cluster.record(expectedConnectedLeaderId).node
     const duringIsolation = await connectedLeader.put("hash:partition-during", { phase: "during" })
     assert.equal(duringIsolation.actor, expectedConnectedLeaderId)
 
@@ -1194,6 +1208,7 @@ test("isolated leader blocks minority writes while connected followers continue 
 
     await cluster.healNode(originalLeaderId)
     await waitForClusterConvergence(cluster)
+    assert.ok(cluster.nodes.every((node) => node.currentLeader() === originalLeaderId))
 
     await waitFor(
       async () => {
@@ -1210,7 +1225,20 @@ test("isolated leader blocks minority writes while connected followers continue 
       assert.equal(await node.get("hash:partition-blocked"), null)
     }
 
-    const afterHeal = await writeOnCurrentLeader(cluster, "hash:partition-after", { phase: "after" })
+    await waitFor(
+      async () => {
+        const status = await originalLeader.getReplicationStatus()
+        return liveFollowerIds(cluster, originalLeaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "old leader regains durable follower reachability after heal",
+        onTimeout: () => originalLeader.getReplicationStatus()
+      }
+    )
+
+    const afterHeal = await originalLeader.put("hash:partition-after", { phase: "after" })
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:partition-after", { phase: "after" }),
       {
@@ -1222,7 +1250,8 @@ test("isolated leader blocks minority writes while connected followers continue 
     const isolatedHistory = await originalLeader.getHistory("hash:partition-during")
     assert.equal(isolatedHistory.length, 1)
     assert.equal(isolatedHistory[0].opId, duringIsolation.opId)
-    assert.ok(afterHeal.operation.opId)
+    assert.equal(afterHeal.actor, originalLeaderId)
+    assert.ok(afterHeal.opId)
 
     await assertClusterInvariants(cluster)
   } finally {
