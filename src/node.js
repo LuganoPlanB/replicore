@@ -538,6 +538,7 @@ export class HolepunchSwarmNode {
     })
 
     const ackPromise = this.durabilityWaiter.waitFor(operation.seq, followerRequirement)
+    ackPromise.catch(() => {})
     await this.#localCore().append(operation)
     await ackPromise
     await this.syncFeed(this.options.identity.publicKeyId)
