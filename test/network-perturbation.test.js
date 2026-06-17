@@ -1322,6 +1322,9 @@ test("bootstrap outage after discovery does not break writes for already connect
 
     const leaderId = currentLeaderId(cluster)
     const leader = cluster.record(leaderId).node
+    const baselineStatus = await leader.getReplicationStatus()
+    const baselinePeerIds = [...baselineStatus.knownPeerNodeIds].sort()
+    assert.ok(baselinePeerIds.length > 0)
 
     await waitFor(
       async () => {
@@ -1340,6 +1343,21 @@ test("bootstrap outage after discovery does not break writes for already connect
 
     const operation = await leader.put("hash:bootstrap-outage", { outage: true })
     assert.equal(operation.actor, leaderId)
+
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return (
+          status.connections > 0 &&
+          status.readStatus.staleReadsPossible === false &&
+          [...status.knownPeerNodeIds].sort().join(",") === baselinePeerIds.join(",")
+        )
+      },
+      {
+        description: "connected peers remain attached after bootstrap outage",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:bootstrap-outage", { outage: true }),
@@ -1372,6 +1390,8 @@ test("restarted follower stays disconnected while bootstrap remains unavailable"
     const followerIds = liveFollowerIds(cluster, leaderId)
     const restartingFollowerId = followerIds[1]
     const survivingFollowerId = followerIds[0]
+    const baselineLeaderStatus = await leader.getReplicationStatus()
+    assert.ok(baselineLeaderStatus.knownPeerNodeIds.length > 0)
 
     await leader.put("hash:bootstrap-restart-before", { phase: "before" })
     await waitFor(
@@ -1425,6 +1445,8 @@ test("restarted follower stays disconnected while bootstrap remains unavailable"
           status.knownPeerNodeIds.length === 0 &&
           status.feeds[leaderId]?.connectedPeers === 0 &&
           status.feeds[survivingFollowerId]?.connectedPeers === 0 &&
+          status.readStatus.staleReadsPossible === true &&
+          status.readStatus.reason === "no-live-peer-connections" &&
           restartedFollower.currentLeader() === restartingFollowerId
         )
       },
