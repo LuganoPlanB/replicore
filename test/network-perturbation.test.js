@@ -1580,7 +1580,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
   }
 })
 
-test("follower write forwarding fails while the old leader is unreachable and recovers after failover", { concurrency: false }, async () => {
+test("follower write forwarding fails transiently near failover and recovers after leader TTL shifts", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
     heartbeatIntervalMs: 100,
@@ -1622,7 +1622,10 @@ test("follower write forwarding fails while the old leader is unreachable and re
       }
     )
 
-    assert.equal(await follower.get(targetKey), null)
+    for (const node of cluster.nodes) {
+      assert.equal(await node.get(targetKey), null)
+      assert.deepEqual(await node.getHistory(targetKey), [])
+    }
 
     const recovered = await follower.put(targetKey, { recovered: true })
     assert.equal(recovered.actor, follower.currentLeader())
@@ -1634,6 +1637,12 @@ test("follower write forwarding fails while the old leader is unreachable and re
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
+
+    for (const node of cluster.nodes) {
+      const history = await node.getHistory(targetKey)
+      assert.equal(history.length, 1)
+      assert.equal(history[0].opId, recovered.opId)
+    }
   } finally {
     await cluster.closeAll()
   }
