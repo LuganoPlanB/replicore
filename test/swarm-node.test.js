@@ -765,6 +765,161 @@ test("replication status exposes staged entries without exposing committed CRUD 
   }
 })
 
+test("a follower keeps a replicated write staged until the leader advertises the commit watermark", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("watermark-leader"))
+    const followerIdentity = generateIdentity(seed("watermark-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 500,
+      durability: {
+        requiredFollowerAcks: 1,
+        timeoutMs: 4000
+      }
+    })
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 500
+    })
+
+    nodes.push(first, second)
+    await first.start()
+    await second.start()
+
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const leaderNode = currentLeaderId === leaderIdentity.publicKeyId ? first : second
+    const followerNode = leaderNode === first ? second : first
+
+    await waitFor(async () => first.currentLeader() === currentLeaderId)
+    await waitFor(async () => second.currentLeader() === currentLeaderId)
+
+    const pendingWrite = leaderNode.put("hash:watermark-staged", { phase: "pending" })
+    pendingWrite.catch(() => {})
+
+    await waitFor(async () => (await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count === 1)
+    assert.equal(await followerNode.get("hash:watermark-staged"), null)
+    assert.deepEqual(await followerNode.getHistory("hash:watermark-staged"), [])
+
+    await pendingWrite
+    await waitFor(async () => (await followerNode.get("hash:watermark-staged"))?.value?.phase === "pending")
+
+    const status = await followerNode.getReplicationStatus()
+    assert.equal(status.feeds[currentLeaderId].staged.count, 0)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("committed feed progress survives follower restart after watermark-driven apply", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  let restarted = null
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("watermark-restart-leader"))
+    const followerIdentity = generateIdentity(seed("watermark-restart-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const followerDir = await tempDir(dirs)
+    let follower = new HolepunchSwarmNode({
+      dataDir: followerDir,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower)
+    await leader.start()
+    await follower.start()
+
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const leaderNode = currentLeaderId === leaderIdentity.publicKeyId ? leader : follower
+    const followerNode = leaderNode === leader ? follower : leader
+    const followerIdentityForRestart = followerNode.options.identity
+    const followerDirForRestart = followerNode.options.dataDir
+
+    await waitFor(async () => leader.currentLeader() === currentLeaderId)
+    await waitFor(async () => follower.currentLeader() === currentLeaderId)
+
+    await leaderNode.put("hash:watermark-restart", { phase: "committed" })
+    await waitFor(async () => (await followerNode.get("hash:watermark-restart"))?.value?.phase === "committed")
+
+    const leaderFeedKey = authorizedNodes.find((node) => node.nodeId === currentLeaderId).feedKey
+    const beforeRestartProgress = await followerNode.view.getFeedProgress(leaderFeedKey)
+    assert.ok(beforeRestartProgress.committedApplied > 0)
+    assert.equal((await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count, 0)
+
+    await followerNode.close()
+    nodes.splice(nodes.indexOf(followerNode), 1)
+
+    restarted = new HolepunchSwarmNode({
+      dataDir: followerDirForRestart,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentityForRestart,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: []
+    })
+    await restarted.start()
+
+    const restartedValue = await restarted.get("hash:watermark-restart")
+    assert.equal(restartedValue?.value?.phase, "committed")
+
+    const afterRestartProgress = await restarted.view.getFeedProgress(leaderFeedKey)
+    assert.deepEqual(afterRestartProgress, beforeRestartProgress)
+    assert.equal((await restarted.getReplicationStatus()).feeds[currentLeaderId].staged.count, 0)
+  } finally {
+    await Promise.allSettled([restarted?.close(), ...nodes.map((node) => node.close())])
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("closing a leader rejects a delayed durability wait without leaving a live timer behind", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []

@@ -434,18 +434,22 @@ export class HolepunchSwarmNode {
   async #syncFeedLoop(nodeId) {
     const node = this.#getAuthorizedNode(nodeId)
     const core = this.feedCores.get(nodeId)
-    let applied = await this.view.getApplied(node.feedKey)
+    let rawApplied = await this.view.getRawApplied(node.feedKey)
 
-    while (applied < core.length) {
+    while (rawApplied < core.length) {
       if (this.closing) return
 
-      const operation = await core.get(applied)
+      const operation = await core.get(rawApplied)
       validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
       if (!verifySignedOperation(operation, node.publicKey)) {
-        throw new Error(`Invalid operation at sequence ${applied} for ${nodeId}`)
+        throw new Error(`Invalid operation at sequence ${rawApplied} for ${nodeId}`)
       }
-      await this.view.apply(operation, node.feedKey)
       if (operation.kind === "heartbeat") {
+        await this.view.applyHeartbeat(operation, node.feedKey)
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
         this.lastHeartbeatByNode.set(operation.actor, {
           ts: operation.ts,
           feed: node.feedKey,
@@ -453,10 +457,26 @@ export class HolepunchSwarmNode {
           appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
-      } else if (operation.kind === "kv" && nodeId !== this.options.identity.publicKeyId) {
-        void this.#sendAck(nodeId, operation.seq)
+        const watermark = operation.heartbeat?.appliedFeeds?.[node.feedKey]
+        if (Number.isInteger(watermark) && watermark > 0) {
+          await this.#advanceCommittedFeed(nodeId, watermark)
+        }
+      } else if (operation.kind === "kv") {
+        await this.view.stageEntry(node.feedKey, {
+          nodeId,
+          source: nodeId === this.options.identity.publicKeyId ? "local" : "remote",
+          validation: "valid",
+          operation
+        })
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+        if (nodeId !== this.options.identity.publicKeyId) {
+          void this.#sendAck(nodeId, operation.seq)
+        }
       }
-      applied += 1
+      rawApplied += 1
     }
   }
 
@@ -542,8 +562,10 @@ export class HolepunchSwarmNode {
     const ackPromise = this.durabilityWaiter.waitFor(operation.seq, followerRequirement)
     ackPromise.catch(() => {})
     await this.#localCore().append(operation)
-    await ackPromise
     await this.syncFeed(this.options.identity.publicKeyId)
+    await ackPromise
+    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, operation.seq + 1)
+    await this.#runHeartbeat()
     return operation
   }
 
@@ -628,9 +650,44 @@ export class HolepunchSwarmNode {
     const applied = {}
     for (const node of this.options.authorizedNodes) {
       if (this.#isRevokedNode(node.nodeId)) continue
+      if (node.nodeId === this.options.identity.publicKeyId) {
+        const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
+        applied[node.feedKey] = Math.max(await this.view.getApplied(node.feedKey), durableApplied)
+        continue
+      }
+
       applied[node.feedKey] = await this.view.getApplied(node.feedKey)
     }
     return applied
+  }
+
+  /**
+   * Advance the committed prefix for a feed without exposing entries that only
+   * exist in the raw replicated suffix.
+   *
+   * @param {string} nodeId
+   * @param {number} targetApplied
+   */
+  async #advanceCommittedFeed(nodeId, targetApplied) {
+    const node = this.#getAuthorizedNode(nodeId)
+    const core = this.feedCores.get(nodeId)
+    const rawApplied = await this.view.getRawApplied(node.feedKey)
+    let committedApplied = await this.view.getApplied(node.feedKey)
+    const cappedTarget = Math.min(targetApplied, rawApplied, core.length)
+
+    while (committedApplied < cappedTarget) {
+      const operation = await core.get(committedApplied)
+      validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
+      if (!verifySignedOperation(operation, node.publicKey)) {
+        throw new Error(`Invalid committed operation at sequence ${committedApplied} for ${nodeId}`)
+      }
+
+      await this.view.applyCommitted(operation, node.feedKey)
+      if (operation.kind === "kv") {
+        await this.view.deleteStagedEntry(node.feedKey, operation.seq)
+      }
+      committedApplied += 1
+    }
   }
 
   #membershipFingerprint() {

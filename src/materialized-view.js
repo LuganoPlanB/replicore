@@ -13,9 +13,12 @@ export class MaterializedView {
    * @param {Record<string, unknown>} operation
    * @param {string} feedKey
    */
-  async apply(operation, feedKey) {
+  async applyCommitted(operation, feedKey) {
     if (operation.kind === "heartbeat") {
-      await this.#applyHeartbeat(operation, feedKey)
+      await this.setCommittedProgress(feedKey, {
+        applied: operation.seq + 1,
+        lastOpId: operation.opId
+      })
       return
     }
 
@@ -45,16 +48,14 @@ export class MaterializedView {
     }
 
     await batch.put(historyKey, summary)
-    await batch.put(
-      this.#progressKey(feedKey),
-      this.#nextProgressRecord({
-        feedKey,
-        rawApplied: operation.seq + 1,
-        rawLastOpId: operation.opId,
-        committedApplied: operation.seq + 1,
-        committedLastOpId: operation.opId
-      })
-    )
+    const current = await this.getFeedProgress(feedKey)
+    await batch.put(this.#progressKey(feedKey), this.#nextProgressRecord({
+      feedKey,
+      rawApplied: current.rawApplied,
+      rawLastOpId: current.rawLastOpId,
+      committedApplied: operation.seq + 1,
+      committedLastOpId: operation.opId
+    }))
     await batch.flush()
   }
 
@@ -62,9 +63,8 @@ export class MaterializedView {
    * @param {Record<string, unknown>} operation
    * @param {string} feedKey
    */
-  async #applyHeartbeat(operation, feedKey) {
-    const batch = this.bee.batch()
-    await batch.put(`system/heartbeats/${operation.actor}`, {
+  async applyHeartbeat(operation, feedKey) {
+    await this.bee.put(`system/heartbeats/${operation.actor}`, {
       actor: operation.actor,
       feed: feedKey,
       ts: operation.ts,
@@ -74,17 +74,6 @@ export class MaterializedView {
       appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
       membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
     })
-    await batch.put(
-      this.#progressKey(feedKey),
-      this.#nextProgressRecord({
-        feedKey,
-        rawApplied: operation.seq + 1,
-        rawLastOpId: operation.opId,
-        committedApplied: operation.seq + 1,
-        committedLastOpId: operation.opId
-      })
-    )
-    await batch.flush()
   }
 
   /**
@@ -106,8 +95,8 @@ export class MaterializedView {
   }
 
   /**
-   * Read both feed cursors with backward-compatible fallback from the legacy
-   * single `applied` cursor used before committed progress was split out.
+   * Read both feed cursors for one replicated feed.
+   * Raw progress may advance ahead of the committed prefix.
    *
    * @param {string} feedKey
    */
