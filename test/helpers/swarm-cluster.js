@@ -164,6 +164,30 @@ export async function createSwarmCluster(options = {}) {
     },
 
     /**
+     * Temporarily isolate a running node from swarm networking without closing storage.
+     *
+     * @param {string} selector
+     */
+    async isolateNode(selector) {
+      const record = this.record(selector)
+      if (!record.node) throw new Error(`Cannot isolate stopped node ${selector}`)
+      await record.node.suspendNetworking()
+      return record.node
+    },
+
+    /**
+     * Rejoin a previously isolated node to the swarm.
+     *
+     * @param {string} selector
+     */
+    async healNode(selector) {
+      const record = this.record(selector)
+      if (!record.node) throw new Error(`Cannot heal stopped node ${selector}`)
+      await record.node.resumeNetworking()
+      return record.node
+    },
+
+    /**
      * Close every running node and keep the underlying resources.
      */
     async closeNodes() {

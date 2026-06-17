@@ -111,15 +111,7 @@ export class HolepunchSwarmNode {
       this.rpcExtensions.set(node.nodeId, this.#registerRpcExtension(core))
     }
 
-    this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
-    this.swarm.on("connection", (conn) => {
-      this.connections.add(conn)
-      conn.once("close", () => this.connections.delete(conn))
-      this.store.replicate(conn)
-    })
-
-    this.discovery = this.swarm.join(deriveTopic(this.options), { client: true, server: true })
-    await this.discovery.flushed()
+    await this.#startNetworking()
 
     for (const node of this.options.authorizedNodes) {
       if (this.#isRevokedNode(node.nodeId)) continue
@@ -131,6 +123,37 @@ export class HolepunchSwarmNode {
       void this.#appendHeartbeat()
     }, this.options.heartbeatIntervalMs)
     this.heartbeatTimer.unref?.()
+  }
+
+  /**
+   * Temporarily disconnect this node from the swarm without closing storage.
+   * Intended for diagnostics and tests that need live isolation.
+   */
+  async suspendNetworking() {
+    if (!this.swarm) return
+
+    for (const conn of this.connections) {
+      conn.destroy()
+    }
+    this.connections.clear()
+
+    if (this.discovery) {
+      await this.discovery.destroy()
+      this.discovery = null
+    }
+
+    await this.swarm.destroy()
+    this.swarm = null
+  }
+
+  /**
+   * Rejoin the swarm after a temporary networking suspension.
+   */
+  async resumeNetworking() {
+    if (this.closing || this.swarm) return
+
+    await this.#startNetworking()
+    await this.#appendHeartbeat()
   }
 
   get status() {
@@ -299,8 +322,7 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    for (const conn of this.connections) conn.destroy()
-    if (this.swarm) await this.swarm.destroy()
+    await this.suspendNetworking()
     for (const extension of this.rpcExtensions.values()) extension.destroy()
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
@@ -400,6 +422,18 @@ export class HolepunchSwarmNode {
     } catch (error) {
       if (!this.closing || error?.code !== "SESSION_CLOSED") throw error
     }
+  }
+
+  async #startNetworking() {
+    this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
+    this.swarm.on("connection", (conn) => {
+      this.connections.add(conn)
+      conn.once("close", () => this.connections.delete(conn))
+      this.store.replicate(conn)
+    })
+
+    this.discovery = this.swarm.join(deriveTopic(this.options), { client: true, server: true })
+    await this.discovery.flushed()
   }
 
   async #appendKvOperation(type, key, value, options) {
