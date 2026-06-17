@@ -13,10 +13,9 @@ import {
   verifySignedOperation
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
+import { NodeRpcRouter } from "./node-rpc.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
-
-const RPC_EXTENSION = "planb-cleard-rpc-v1"
 
 /**
  * Minimal multi-node swarm with one feed per node and leader-only writes.
@@ -60,6 +59,7 @@ export class HolepunchSwarmNode {
     }
     this.store = null
     this.network = null
+    this.rpc = null
     this.viewBee = null
     this.view = null
     this.feedCores = new Map()
@@ -67,9 +67,6 @@ export class HolepunchSwarmNode {
     this.heartbeatPromise = null
     this.syncPromises = new Map()
     this.pendingSync = new Set()
-    this.rpcExtensions = new Map()
-    this.requestId = 0
-    this.inflightRequests = new Map()
     this.ackWaiters = new Map()
     this.lastHeartbeatByNode = new Map()
     this.closing = false
@@ -87,6 +84,21 @@ export class HolepunchSwarmNode {
     this.viewBee = new Hyperbee(viewCore, { keyEncoding: "utf-8", valueEncoding: "json" })
     this.view = new MaterializedView(this.viewBee)
     await this.viewBee.ready()
+    this.rpc = new NodeRpcRouter({
+      localNodeId: this.options.identity.publicKeyId,
+      timeoutMs: this.options.durability.timeoutMs,
+      ackDelayMs: this.options.ackDelayMs,
+      onWriteRequest: async (message) => {
+        if (this.currentLeader() !== this.options.identity.publicKeyId) {
+          throw new Error("This node is not the current leader")
+        }
+
+        return message.request.action === "put"
+          ? this.#appendKvOperation("put", message.request.key, message.request.value, message.request.options ?? {})
+          : this.#appendKvOperation("delete", message.request.key, undefined, message.request.options ?? {})
+      },
+      onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
+    })
 
     for (const node of this.options.authorizedNodes) {
       if (this.#isRevokedNode(node.nodeId)) continue
@@ -114,7 +126,7 @@ export class HolepunchSwarmNode {
         })
       })
       this.feedCores.set(node.nodeId, core)
-      this.rpcExtensions.set(node.nodeId, this.#registerRpcExtension(core))
+      this.rpc.register(node.nodeId, core)
     }
 
     await this.#startNetworking()
@@ -346,7 +358,7 @@ export class HolepunchSwarmNode {
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
     await this.suspendNetworking()
-    for (const extension of this.rpcExtensions.values()) extension.destroy()
+    this.rpc?.close(new Error("Node is closing"))
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
     this.network?.clear()
@@ -512,37 +524,12 @@ export class HolepunchSwarmNode {
     if (!leader) throw new Error("No current leader is available")
 
     const leaderCore = this.feedCores.get(leader)
-    const extension = this.rpcExtensions.get(leader)
     const peer = leaderCore.peers[0]
     if (!peer) {
       throw new Error(`Current leader ${leader} is not reachable`)
     }
 
-    const requestId = `${this.options.identity.publicKeyId}-${++this.requestId}`
-    const response = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.inflightRequests.delete(requestId)
-        reject(new Error(`Timed out forwarding write request ${requestId}`))
-      }, this.options.durability.timeoutMs)
-      this.inflightRequests.set(requestId, {
-        resolve,
-        reject,
-        timer
-      })
-    })
-    response.catch(() => {})
-
-    extension.send(
-      {
-        type: "write-request",
-        requestId,
-        from: this.options.identity.publicKeyId,
-        request
-      },
-      peer
-    )
-
-    return response
+    return this.rpc.forwardWrite({ targetNodeId: leader, peer, request })
   }
 
   /**
@@ -605,12 +592,6 @@ export class HolepunchSwarmNode {
    * @param {Error} error
    */
   #rejectPendingWrites(error) {
-    for (const pending of this.inflightRequests.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(error)
-    }
-    this.inflightRequests.clear()
-
     for (const waiter of this.ackWaiters.values()) {
       clearTimeout(waiter.timer)
       waiter.reject(error)
@@ -623,91 +604,11 @@ export class HolepunchSwarmNode {
    * @param {number} seq
    */
   async #sendAck(nodeId, seq) {
-    if (this.options.ackDelayMs) {
-      await new Promise((resolve) => setTimeout(resolve, this.options.ackDelayMs))
-    }
-    if (this.closing) return
-
     const core = this.feedCores.get(nodeId)
-    const extension = this.rpcExtensions.get(nodeId)
     const peer = core.peers[0]
     if (!peer) return
 
-    extension.send(
-      {
-        type: "write-ack",
-        from: this.options.identity.publicKeyId,
-        feedKey: nodeId,
-        seq
-      },
-      peer
-    )
-  }
-
-  /**
-   * @param {import("hypercore")} core
-   */
-  #registerRpcExtension(core) {
-    return core.registerExtension(RPC_EXTENSION, {
-      encoding: "json",
-      onmessage: async (message, peer) => {
-        try {
-          if (message.type === "write-request") {
-            if (this.currentLeader() !== this.options.identity.publicKeyId) {
-              throw new Error("This node is not the current leader")
-            }
-            const result =
-              message.request.action === "put"
-                ? await this.#appendKvOperation(
-                    "put",
-                    message.request.key,
-                    message.request.value,
-                    message.request.options ?? {}
-                  )
-                : await this.#appendKvOperation(
-                    "delete",
-                    message.request.key,
-                    undefined,
-                    message.request.options ?? {}
-                  )
-
-            const responseExtension = this.rpcExtensions.get(message.from)
-            responseExtension?.send(
-              { type: "write-response", requestId: message.requestId, ok: true, result },
-              peer
-            )
-            return
-          }
-
-          if (message.type === "write-response") {
-            const pending = this.inflightRequests.get(message.requestId)
-            if (!pending) return
-            clearTimeout(pending.timer)
-            this.inflightRequests.delete(message.requestId)
-            if (message.ok) pending.resolve(message.result)
-            else pending.reject(new Error(message.error))
-            return
-          }
-
-          if (message.type === "write-ack") {
-            this.#recordAck(message.from, message.seq)
-          }
-        } catch (error) {
-          if (message.type === "write-request") {
-            const responseExtension = this.rpcExtensions.get(message.from)
-            responseExtension?.send(
-              {
-                type: "write-response",
-                requestId: message.requestId,
-                ok: false,
-                error: error instanceof Error ? error.message : String(error)
-              },
-              peer
-            )
-          }
-        }
-      }
-    })
+    await this.rpc.sendAck({ targetNodeId: nodeId, peer, seq })
   }
 
   #localCore() {
