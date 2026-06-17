@@ -580,6 +580,132 @@ test("node replacement via revocation and new identity restores service without 
   }
 })
 
+test("node replacement catches up a retained stale node after long absence", { concurrency: false }, async () => {
+  const initialCluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  let replacementCluster = null
+
+  try {
+    await initialCluster.startAll()
+    await waitForClusterConvergence(initialCluster)
+
+    const leaderId = currentLeaderId(initialCluster)
+    const leader = initialCluster.record(leaderId).node
+    const retainedIdentities = initialCluster.identities.slice(0, 2)
+    const retiredIdentity = initialCluster.identities[2]
+    const staleRetainedIdentity =
+      retainedIdentities.find((identity) => identity.publicKeyId !== leaderId) ?? retainedIdentities[0]
+
+    const baselineHistory = await leader.put("hash:replacement-history", { phase: "before-absence" })
+    await leader.put("hash:replacement-delete", { phase: "before-delete" })
+
+    await waitFor(
+      async () =>
+        hasClusterValue(initialCluster.nodes, "hash:replacement-history", { phase: "before-absence" }) &&
+        hasClusterValue(initialCluster.nodes, "hash:replacement-delete", { phase: "before-delete" }),
+      {
+        description: "baseline replication before stale retained follower goes offline",
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
+      }
+    )
+
+    await initialCluster.stopNode(staleRetainedIdentity.publicKeyId)
+
+    const absentHistory = await leader.put("hash:replacement-history", { phase: "during-absence" })
+    const absentDelete = await leader.delete("hash:replacement-delete")
+
+    await waitFor(
+      async () => {
+        const liveNodes = initialCluster.nodes
+        const historyValues = await Promise.all(liveNodes.map((node) => node.get("hash:replacement-history")))
+        const deletedValues = await Promise.all(liveNodes.map((node) => node.get("hash:replacement-delete")))
+        return (
+          historyValues.every((value) => value?.value?.phase === "during-absence") &&
+          deletedValues.every((value) => value?.deleted === true)
+        )
+      },
+      {
+        description: "live nodes converge while retained follower is absent",
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
+      }
+    )
+
+    const replacementIdentity = createIdentities(1, ["replacement-stale"])[0]
+    const activeIdentities = [...retainedIdentities, replacementIdentity]
+    const authorizedNodes = [...initialCluster.identities, replacementIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    await initialCluster.closeNodes()
+
+    replacementCluster = await createSwarmCluster({
+      identities: activeIdentities,
+      authorizedNodes,
+      dataDirs: retainedIdentities.map((identity) => initialCluster.record(identity.publicKeyId).dataDir),
+      clusterId: initialCluster.options.clusterId,
+      topicSalt: initialCluster.options.topicSalt,
+      encryptionKey: initialCluster.encryptionKey,
+      heartbeatIntervalMs: initialCluster.options.heartbeatIntervalMs,
+      heartbeatTtlMs: initialCluster.options.heartbeatTtlMs,
+      testnet: initialCluster.testnet,
+      revokedNodeIds: [retiredIdentity.publicKeyId],
+      identityLabels: ["leader", "follower-1", "replacement"]
+    })
+
+    await replacementCluster.startAll()
+    await waitForClusterConvergence(replacementCluster)
+
+    await waitFor(
+      async () => {
+        const values = await Promise.all(
+          replacementCluster.nodes.map(async (node) => ({
+            history: await node.get("hash:replacement-history"),
+            deleted: await node.get("hash:replacement-delete")
+          }))
+        )
+        return (
+          values.every((value) => value.history?.value?.phase === "during-absence") &&
+          values.every((value) => value.deleted?.deleted === true)
+        )
+      },
+      {
+        description: "replacement cluster converges after stale retained node rejoins",
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
+      }
+    )
+
+    const staleRetainedNode = replacementCluster.record(staleRetainedIdentity.publicKeyId).node
+    const historyEntries = await staleRetainedNode.getHistory("hash:replacement-history")
+    assert.deepEqual(
+      historyEntries.map((entry) => entry.type),
+      ["put", "put"]
+    )
+    assert.equal(historyEntries[0].opId, baselineHistory.opId)
+    assert.equal(historyEntries[1].opId, absentHistory.opId)
+
+    const deletedEntries = await staleRetainedNode.getHistory("hash:replacement-delete")
+    assert.deepEqual(
+      deletedEntries.map((entry) => entry.type),
+      ["put", "delete"]
+    )
+    assert.equal(deletedEntries[1].opId, absentDelete.opId)
+
+    await assertClusterInvariants(replacementCluster)
+  } finally {
+    if (replacementCluster) {
+      await replacementCluster.closeNodes()
+      await replacementCluster.destroyResources()
+    }
+    await initialCluster.destroyResources()
+  }
+})
+
 test("mismatched membership config blocks degraded writes conservatively", { concurrency: false }, async () => {
   const identities = createIdentities(3, ["leader", "follower-1", "follower-2"])
   const authorizedNodes = identities.map((identity) => ({
@@ -1108,7 +1234,12 @@ test("isolated follower serves stale reads until heal and status shows stale con
     await waitFor(
       async () => {
         const status = await isolatedFollower.getReplicationStatus()
-        return status.connections === 0 && status.feeds[leaderId]?.connectedPeers === 0
+        return (
+          status.connections === 0 &&
+          status.feeds[leaderId]?.connectedPeers === 0 &&
+          status.readStatus.staleReadsPossible === true &&
+          status.readStatus.reason === "leader-unreachable"
+        )
       },
       {
         description: "isolated follower loses live connectivity",
@@ -1145,7 +1276,11 @@ test("isolated follower serves stale reads until heal and status shows stale con
     await waitFor(
       async () => {
         const status = await isolatedFollower.getReplicationStatus()
-        return status.feeds[leaderId]?.alive === false
+        return (
+          status.feeds[leaderId]?.alive === false &&
+          status.readStatus.staleReadsPossible === true &&
+          status.readStatus.reason === "no-live-peer-connections"
+        )
       },
       {
         description: "isolated follower marks leader heartbeat stale after TTL",
