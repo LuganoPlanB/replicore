@@ -6,6 +6,7 @@ import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 
 import { canonicalize } from "./canonical.js"
+import { DurabilityWaiter } from "./durability-waiter.js"
 import {
   createSignedOperation,
   decryptOperationValue,
@@ -67,10 +68,13 @@ export class HolepunchSwarmNode {
     this.heartbeatPromise = null
     this.syncPromises = new Map()
     this.pendingSync = new Set()
-    this.ackWaiters = new Map()
+    this.durabilityWaiter = new DurabilityWaiter({
+      feedKey: this.options.identity.feedKey,
+      timeoutMs: this.options.durability.timeoutMs,
+      requiredFollowerAcks: this.options.durability.requiredFollowerAcks
+    })
     this.lastHeartbeatByNode = new Map()
     this.closing = false
-    this.lastDurableSequence = -1
   }
 
   async start() {
@@ -290,7 +294,7 @@ export class HolepunchSwarmNode {
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
       connections: this.network?.connectionCount ?? 0,
-      lastDurableSequence: this.lastDurableSequence,
+      lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: this.network?.knownPeerPublicKeys ?? [],
       membership: this.#membershipStatus(heartbeats),
@@ -508,7 +512,7 @@ export class HolepunchSwarmNode {
       ttlMs: options.ttlMs
     })
 
-    const ackPromise = this.#waitForFollowerAck(operation.seq, followerRequirement)
+    const ackPromise = this.durabilityWaiter.waitFor(operation.seq, followerRequirement)
     await this.#localCore().append(operation)
     await this.syncFeed(this.options.identity.publicKeyId)
     await ackPromise
@@ -533,70 +537,12 @@ export class HolepunchSwarmNode {
   }
 
   /**
-   * @param {number} seq
-   * @param {number} required
-   */
-  async #waitForFollowerAck(seq, required) {
-    const key = `${this.options.identity.feedKey}:${seq}`
-    const existing = this.ackWaiters.get(key) ?? {
-      nodes: new Set(),
-      resolve: null,
-      reject: null,
-      timer: null,
-      promise: null
-    }
-
-    if (!existing.promise) {
-      existing.promise = new Promise((resolve, reject) => {
-        existing.resolve = resolve
-        existing.reject = reject
-        existing.timer = setTimeout(() => {
-          this.ackWaiters.delete(key)
-          reject(new Error(`Timed out waiting for follower acknowledgement for sequence ${seq}`))
-        }, this.options.durability.timeoutMs)
-      })
-      this.ackWaiters.set(key, existing)
-    }
-
-    if (existing.nodes.size >= required) {
-      clearTimeout(existing.timer)
-      this.ackWaiters.delete(key)
-      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
-      return
-    }
-
-    return existing.promise
-  }
-
-  /**
-   * @param {string} nodeId
-   * @param {number} seq
-   */
-  #recordAck(nodeId, seq) {
-    const key = `${this.options.identity.feedKey}:${seq}`
-    const waiter = this.ackWaiters.get(key)
-    if (!waiter) return
-
-    waiter.nodes.add(nodeId)
-    if (waiter.nodes.size >= this.options.durability.requiredFollowerAcks) {
-      clearTimeout(waiter.timer)
-      this.ackWaiters.delete(key)
-      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
-      waiter.resolve()
-    }
-  }
-
-  /**
    * Reject outstanding write waits so shutdown does not leave live timers behind.
    *
    * @param {Error} error
    */
   #rejectPendingWrites(error) {
-    for (const waiter of this.ackWaiters.values()) {
-      clearTimeout(waiter.timer)
-      waiter.reject(error)
-    }
-    this.ackWaiters.clear()
+    this.durabilityWaiter.rejectAll(error)
   }
 
   /**
@@ -609,6 +555,14 @@ export class HolepunchSwarmNode {
     if (!peer) return
 
     await this.rpc.sendAck({ targetNodeId: nodeId, peer, seq })
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {number} seq
+   */
+  #recordAck(nodeId, seq) {
+    this.durabilityWaiter.record(nodeId, seq)
   }
 
   #localCore() {
