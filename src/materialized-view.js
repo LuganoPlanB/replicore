@@ -150,6 +150,7 @@ export class MaterializedView {
    *   nodeId: string,
    *   source: "local" | "remote",
    *   validation: "valid",
+   *   resolution?: "pending" | "rejected",
    *   operation: Record<string, unknown>
    * }} staged
    */
@@ -159,11 +160,13 @@ export class MaterializedView {
       throw new Error("Only K/V operations may be staged")
     }
 
+    const existing = await this.getStagedEntry(feedKey, operation.seq)
     await this.bee.put(this.#stagedEntryKey(feedKey, operation.seq), {
       feedKey,
       nodeId: staged.nodeId,
       source: staged.source,
       validation: staged.validation,
+      resolution: existing?.resolution ?? staged.resolution ?? "pending",
       seq: operation.seq,
       opId: operation.opId,
       kind: operation.kind,
@@ -174,6 +177,16 @@ export class MaterializedView {
       ts: operation.ts,
       expiresAt: operation.expiresAt ?? null
     })
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {number} seq
+   * @returns {Promise<Record<string, unknown> | null>}
+   */
+  async getStagedEntry(feedKey, seq) {
+    const entry = await this.bee.get(this.#stagedEntryKey(feedKey, seq))
+    return entry?.value ?? null
   }
 
   /**
@@ -192,6 +205,21 @@ export class MaterializedView {
     }
 
     return entries
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {number} seq
+   * @param {"pending" | "rejected"} resolution
+   */
+  async setStagedEntryResolution(feedKey, seq, resolution) {
+    const existing = await this.getStagedEntry(feedKey, seq)
+    if (!existing) return
+
+    await this.bee.put(this.#stagedEntryKey(feedKey, seq), {
+      ...existing,
+      resolution
+    })
   }
 
   /**

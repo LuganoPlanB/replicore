@@ -450,6 +450,7 @@ export class HolepunchSwarmNode {
           applied: operation.seq + 1,
           lastOpId: operation.opId
         })
+        await this.#applyRejectedFeedEntries(nodeId, operation.heartbeat?.rejectedFeeds?.[node.feedKey] ?? [])
         this.lastHeartbeatByNode.set(operation.actor, {
           ts: operation.ts,
           feed: node.feedKey,
@@ -499,6 +500,7 @@ export class HolepunchSwarmNode {
         observedLeader: leader,
         reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
         appliedFeeds: await this.#appliedFeeds(),
+        rejectedFeeds: await this.#rejectedFeeds(),
         membershipFingerprint: this.#membershipFingerprint()
       }
     })
@@ -563,7 +565,13 @@ export class HolepunchSwarmNode {
     ackPromise.catch(() => {})
     await this.#localCore().append(operation)
     await this.syncFeed(this.options.identity.publicKeyId)
-    await ackPromise
+    try {
+      await ackPromise
+    } catch (error) {
+      await this.view.setStagedEntryResolution(this.options.identity.feedKey, operation.seq, "rejected")
+      await this.#runHeartbeat()
+      throw error
+    }
     await this.#advanceCommittedFeed(this.options.identity.publicKeyId, operation.seq + 1)
     await this.#runHeartbeat()
     return operation
@@ -661,6 +669,37 @@ export class HolepunchSwarmNode {
     return applied
   }
 
+  async #rejectedFeeds() {
+    const rejected = {}
+
+    for (const node of this.options.authorizedNodes) {
+      if (this.#isRevokedNode(node.nodeId)) continue
+      if (node.nodeId !== this.options.identity.publicKeyId) continue
+
+      const entries = await this.view.getStagedEntries(node.feedKey)
+      const rejectedSeqs = entries
+        .filter((entry) => entry.resolution === "rejected")
+        .map((entry) => entry.seq)
+
+      if (rejectedSeqs.length > 0) {
+        rejected[node.feedKey] = rejectedSeqs
+      }
+    }
+
+    return rejected
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {number[]} rejectedSeqs
+   */
+  async #applyRejectedFeedEntries(nodeId, rejectedSeqs) {
+    const node = this.#getAuthorizedNode(nodeId)
+    for (const seq of rejectedSeqs) {
+      await this.view.setStagedEntryResolution(node.feedKey, seq, "rejected")
+    }
+  }
+
   /**
    * Advance the committed prefix for a feed without exposing entries that only
    * exist in the raw replicated suffix.
@@ -682,8 +721,20 @@ export class HolepunchSwarmNode {
         throw new Error(`Invalid committed operation at sequence ${committedApplied} for ${nodeId}`)
       }
 
-      await this.view.applyCommitted(operation, node.feedKey)
-      if (operation.kind === "kv") {
+      const stagedEntry = operation.kind === "kv"
+        ? await this.view.getStagedEntry(node.feedKey, operation.seq)
+        : null
+
+      if (stagedEntry?.resolution === "rejected") {
+        await this.view.setCommittedProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+      } else {
+        await this.view.applyCommitted(operation, node.feedKey)
+      }
+
+      if (operation.kind === "kv" && stagedEntry?.resolution !== "rejected") {
         await this.view.deleteStagedEntry(node.feedKey, operation.seq)
       }
       committedApplied += 1

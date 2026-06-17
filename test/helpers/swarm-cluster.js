@@ -27,6 +27,7 @@ const RESOURCE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_RESOURCE_TIMEOUT_M
  *   heartbeatIntervalMs?: number,
  *   heartbeatTtlMs?: number,
  *   forwarding?: boolean,
+ *   ackDelayMsByNodeId?: Record<string, number>,
  *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number },
  *   revokedNodeIds?: string[],
  *   identityLabels?: string[],
@@ -74,6 +75,7 @@ export async function createSwarmCluster(options = {}) {
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? 500,
       heartbeatTtlMs: options.heartbeatTtlMs ?? 3000,
       forwarding: options.forwarding ?? true,
+      ackDelayMsByNodeId: options.ackDelayMsByNodeId ?? {},
       durability: options.durability,
       revokedNodeIds: options.revokedNodeIds ?? []
     },
@@ -172,6 +174,7 @@ export async function createSwarmCluster(options = {}) {
         heartbeatIntervalMs: this.options.heartbeatIntervalMs,
         heartbeatTtlMs: this.options.heartbeatTtlMs,
         forwarding: this.options.forwarding,
+        ackDelayMs: this.options.ackDelayMsByNodeId[record.identity.publicKeyId],
         revokedNodeIds: this.options.revokedNodeIds
       }
       if (this.options.durability) {

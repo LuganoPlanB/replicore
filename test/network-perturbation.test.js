@@ -1471,6 +1471,104 @@ test(
   }
 )
 
+test("timed-out local append stays uncommitted across leader restart and later healthy writes", { concurrency: false }, async () => {
+  const identities = createIdentities(3, ["timeout-leader", "timeout-follower-a", "timeout-follower-b"])
+  const leaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
+  const ackDelayMsByNodeId = Object.fromEntries(
+    identities
+      .filter((identity) => identity.publicKeyId !== leaderId)
+      .map((identity) => [identity.publicKeyId, 1000])
+  )
+
+  const cluster = await createSwarmCluster({
+    identities,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    ackDelayMsByNodeId,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 300
+    }
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const originalLeader = cluster.record(leaderId).node
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
+      {
+        description: "leader convergence before timed-out local append test",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    await assert.rejects(
+      originalLeader.put("hash:timed-out-local", { blocked: true }),
+      /Timed out waiting for follower acknowledgement/
+    )
+
+    await waitFor(
+      async () => (await originalLeader.getReplicationStatus()).feeds[leaderId].staged.count === 1,
+      {
+        description: "timed-out local append is retained only as staged state",
+        onTimeout: () => originalLeader.getReplicationStatus()
+      }
+    )
+
+    assert.equal(await originalLeader.get("hash:timed-out-local"), null)
+    assert.deepEqual(await originalLeader.getHistory("hash:timed-out-local"), [])
+    assert.ok((await originalLeader.createSnapshot()).entries.every((entry) => !String(entry.key).includes("/staged/")))
+
+    const restartedLeader = await cluster.restartNode(leaderId)
+    await waitFor(
+      async () => (await restartedLeader.getReplicationStatus()).feeds[leaderId].staged.count === 1,
+      {
+        description: "staged timed-out append survives leader restart",
+        onTimeout: () => restartedLeader.getReplicationStatus()
+      }
+    )
+
+    assert.equal(await restartedLeader.get("hash:timed-out-local"), null)
+    assert.deepEqual(await restartedLeader.getHistory("hash:timed-out-local"), [])
+
+    cluster.options.ackDelayMsByNodeId = {}
+    for (const nodeId of identities.map((identity) => identity.publicKeyId).filter((nodeId) => nodeId !== leaderId)) {
+      await cluster.restartNode(nodeId)
+    }
+
+    await waitForClusterConvergence(cluster)
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
+      {
+        description: "cluster reconverges after removing artificial ack delay",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const recovered = await restartedLeader.put("hash:timed-out-recovered", { recovered: true })
+    assert.equal(recovered.actor, leaderId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:timed-out-recovered", { recovered: true }),
+      {
+        description: "healthy durable write converges after timed-out append scenario",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    for (const node of cluster.nodes) {
+      assert.equal(await node.get("hash:timed-out-local"), null)
+      assert.deepEqual(await node.getHistory("hash:timed-out-local"), [])
+    }
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("isolated follower serves stale reads until heal and status shows stale connectivity", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
