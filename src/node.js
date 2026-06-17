@@ -63,6 +63,7 @@ export class HolepunchSwarmNode {
     this.discovery = null
     this.feedCores = new Map()
     this.heartbeatTimer = null
+    this.heartbeatPromise = null
     this.syncPromises = new Map()
     this.pendingSync = new Set()
     this.rpcExtensions = new Map()
@@ -119,9 +120,13 @@ export class HolepunchSwarmNode {
       await this.syncFeed(node.nodeId)
     }
 
-    await this.#appendHeartbeat()
+    await this.#runHeartbeat()
     this.heartbeatTimer = setInterval(() => {
-      void this.#appendHeartbeat()
+      void this.#runHeartbeat().catch((error) => {
+        if (!this.closing && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
     }, this.options.heartbeatIntervalMs)
     this.heartbeatTimer.unref?.()
   }
@@ -154,7 +159,7 @@ export class HolepunchSwarmNode {
     if (this.closing || this.swarm) return
 
     await this.#startNetworking()
-    await this.#appendHeartbeat()
+    await this.#runHeartbeat()
   }
 
   get status() {
@@ -326,6 +331,7 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
     await this.suspendNetworking()
@@ -430,6 +436,18 @@ export class HolepunchSwarmNode {
     } catch (error) {
       if (!this.closing || error?.code !== "SESSION_CLOSED") throw error
     }
+  }
+
+  async #runHeartbeat() {
+    if (this.heartbeatPromise) return this.heartbeatPromise
+
+    const heartbeatPromise = this.#appendHeartbeat().finally(() => {
+      if (this.heartbeatPromise === heartbeatPromise) {
+        this.heartbeatPromise = null
+      }
+    })
+    this.heartbeatPromise = heartbeatPromise
+    return heartbeatPromise
   }
 
   async #startNetworking() {
