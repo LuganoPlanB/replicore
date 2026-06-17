@@ -437,7 +437,12 @@ test("planned node addition works after full-cluster restart with expanded membe
       identityLabels: ["leader", "follower-1", "follower-2", "added"]
     })
 
-    await expandedCluster.startAll()
+    const expandedLeaderId = currentLeaderId(expandedCluster)
+    await expandedCluster.startNode(expandedLeaderId)
+    for (const identity of expandedCluster.identities) {
+      if (identity.publicKeyId === expandedLeaderId) continue
+      await expandedCluster.startNode(identity.publicKeyId)
+    }
 
     await waitFor(
       async () => expandedCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 4),
@@ -455,7 +460,6 @@ test("planned node addition works after full-cluster restart with expanded membe
       }
     )
 
-    const expandedLeaderId = currentLeaderId(expandedCluster)
     const expandedLeader = expandedCluster.record(expandedLeaderId).node
     await expandedLeader.put("hash:after-add", { phase: "after" })
 
@@ -2119,7 +2123,12 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
       identityLabels: initialCluster.records.map((record) => record.label)
     })
 
-    await restartedCluster.startAll()
+    const restartedLeaderId = currentLeaderId(restartedCluster)
+    await restartedCluster.startNode(restartedLeaderId)
+    for (const identity of restartedCluster.identities) {
+      if (identity.publicKeyId === restartedLeaderId) continue
+      await restartedCluster.startNode(identity.publicKeyId)
+    }
     await waitForClusterConvergence(restartedCluster)
 
     await waitFor(

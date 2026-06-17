@@ -118,7 +118,16 @@ export class HolepunchSwarmNode {
 
     for (const node of this.options.authorizedNodes) {
       if (this.#isRevokedNode(node.nodeId)) continue
-      await this.syncFeed(node.nodeId)
+      if (node.nodeId === this.options.identity.publicKeyId) {
+        await this.syncFeed(node.nodeId)
+        continue
+      }
+
+      void this.syncFeed(node.nodeId).catch((error) => {
+        if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
     }
 
     await this.#runHeartbeat()
