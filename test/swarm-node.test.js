@@ -14,8 +14,9 @@ import {
   HolepunchSwarmNode,
   validateOperation
 } from "../src/index.js"
+import { waitFor } from "./helpers/eventual.js"
 
-test("leader operations replicate to followers and rebuild after restart", async () => {
+test("leader operations replicate to followers and rebuild after restart", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -105,7 +106,10 @@ test("leader operations replicate to followers and rebuild after restart", async
   }
 })
 
-test("followers forward writes to the computed leader and the next alive node becomes leader", async () => {
+test(
+  "followers forward writes to the computed leader and the next alive node becomes leader",
+  { concurrency: false },
+  async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -158,7 +162,7 @@ test("followers forward writes to the computed leader and the next alive node be
       .map((identity) => identity.publicKeyId)
       .sort()[0]
     await waitFor(async () => follower1.currentLeader() === leaderId)
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
 
     const op = await follower1.put("hash:beta", { forwarded: true })
     assert.equal(op.actor, leaderId)
@@ -174,22 +178,33 @@ test("followers forward writes to the computed leader and the next alive node be
       .filter((nodeId) => nodeId !== leaderId)
       .sort()[0]
 
-    await waitFor(async () => survivingObserver.currentLeader() === expectedNextLeader)
+    const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
+    let result = null
     await waitFor(
-      async () => Object.keys((await survivingObserver.getReplicationStatus()).heartbeats).length >= 2
+      async () => {
+        try {
+          result = await nextLeaderNode.put("hash:gamma", { failover: true })
+          return result.actor === expectedNextLeader
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "failover write through the next leader",
+        onTimeout: () => survivingObserver.getReplicationStatus()
+      }
     )
 
-    const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
-    const result = await nextLeaderNode.put("hash:gamma", { failover: true })
     assert.equal(result.actor, expectedNextLeader)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
-})
+  }
+)
 
-test("authorized HTTP API forwards writes and exposes status routes", async () => {
+test("authorized HTTP API forwards writes and exposes status routes", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -222,7 +237,10 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
     for (const node of nodes) {
       await node.start()
     }
-    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
+    const expectedLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === expectedLeaderId))
 
     for (const node of nodes) {
       const server = new HolepunchHttpServer({
@@ -364,7 +382,10 @@ test("operation validation rejects revoked writers", () => {
   }, /revoked/)
 })
 
-test("encryption rotation preserves existing reads and exposes revoked writer state", async () => {
+test(
+  "encryption rotation preserves existing reads and exposes revoked writer state",
+  { concurrency: false },
+  async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -412,10 +433,13 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     for (const node of nodes) {
       await node.start()
     }
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 2)
+    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 2))
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
+    await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
 
     const server = new HolepunchHttpServer({
-      node: leader,
+      node: currentLeaderNode,
       auth: {
         tokens: {
           admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
@@ -427,7 +451,7 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     servers.push(server)
 
     const baseUrl = `http://${server.address.address}:${server.address.port}`
-    const firstOperation = await leader.put("hash:before-rotation", { value: "first" })
+    const firstOperation = await currentLeaderNode.put("hash:before-rotation", { value: "first" })
     assert.equal(firstOperation.value.keyId, "primary")
 
     const rotateResponse = await fetch(`${baseUrl}/admin/encryption/rotate`, {
@@ -441,13 +465,13 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     assert.equal(rotateResponse.status, 200)
     assert.deepEqual(await rotateResponse.json(), { ok: true, keyId: "next" })
 
-    const secondOperation = await leader.put("hash:after-rotation", { value: "second" })
+    const secondOperation = await currentLeaderNode.put("hash:after-rotation", { value: "second" })
     assert.equal(secondOperation.value.keyId, "next")
 
     await waitFor(async () => (await follower.get("hash:before-rotation"))?.value?.value === "first")
     await waitFor(async () => (await follower.get("hash:after-rotation"))?.value?.value === "second")
 
-    const writers = leader.getWritersStatus()
+    const writers = currentLeaderNode.getWritersStatus()
     assert.deepEqual(writers.revokedNodeIds, [revokedIdentity.publicKeyId])
     assert.equal(writers.encryptionKeyId, "next")
     assert.equal(
@@ -460,9 +484,10 @@ test("encryption rotation preserves existing reads and exposes revoked writer st
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
-})
+  }
+)
 
-test("a fresh node can restore current state from a snapshot", async () => {
+test("a fresh node can restore current state from a snapshot", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -481,9 +506,6 @@ test("a fresh node can restore current state from a snapshot", async () => {
         feedKey: identity.feedKey
       })
     )
-    const activeNodeIds = [leaderIdentity, followerIdentity, observerIdentity]
-      .map((identity) => identity.publicKeyId)
-      .sort()
 
     const leader = new HolepunchSwarmNode({
       dataDir: await tempDir(dirs),
@@ -517,15 +539,16 @@ test("a fresh node can restore current state from a snapshot", async () => {
     for (const node of nodes) {
       await node.start()
     }
-    await waitFor(async () => leader.currentLeader() === activeNodeIds[0])
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
+    await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
 
-    await nodes.find((node) => node.options.identity.publicKeyId === activeNodeIds[0]).put("hash:snapshot", {
-      state: "present"
-    })
-    await waitFor(async () => (await follower.get("hash:snapshot"))?.value?.state === "present")
+    await currentLeaderNode.put("hash:snapshot", { state: "present" })
 
-    const snapshot = await follower.createSnapshot()
+    const snapshot = await currentLeaderNode.createSnapshot()
 
     const restored = new HolepunchSwarmNode({
       dataDir: await tempDir(dirs),
@@ -587,19 +610,4 @@ async function tempDir(dirs) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-swarm-"))
   dirs.push(dir)
   return dir
-}
-
-/**
- * @param {() => Promise<boolean>} condition
- * @param {number} [timeoutMs]
- */
-async function waitFor(condition, timeoutMs = 10000) {
-  const started = Date.now()
-
-  while (Date.now() - started < timeoutMs) {
-    if (await condition()) return
-    await new Promise((resolve) => setTimeout(resolve, 50))
-  }
-
-  throw new Error("Timed out waiting for condition")
 }
