@@ -25,7 +25,6 @@ export class MaterializedView {
     const currentKey = `kv/current/${keyspace}/${key}`
     const valueKey = `kv/value/${keyspace}/${key}`
     const historyKey = `kv/history/${keyspace}/${key}/${String(operation.seq).padStart(12, "0")}`
-    const progressKey = `feeds/${feedKey}/progress`
     const summary = {
       opId: operation.opId,
       seq: operation.seq,
@@ -46,7 +45,16 @@ export class MaterializedView {
     }
 
     await batch.put(historyKey, summary)
-    await batch.put(progressKey, { applied: operation.seq + 1, lastOpId: operation.opId })
+    await batch.put(
+      this.#progressKey(feedKey),
+      this.#nextProgressRecord({
+        feedKey,
+        rawApplied: operation.seq + 1,
+        rawLastOpId: operation.opId,
+        committedApplied: operation.seq + 1,
+        committedLastOpId: operation.opId
+      })
+    )
     await batch.flush()
   }
 
@@ -66,7 +74,16 @@ export class MaterializedView {
       appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
       membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
     })
-    await batch.put(`feeds/${feedKey}/progress`, { applied: operation.seq + 1, lastOpId: operation.opId })
+    await batch.put(
+      this.#progressKey(feedKey),
+      this.#nextProgressRecord({
+        feedKey,
+        rawApplied: operation.seq + 1,
+        rawLastOpId: operation.opId,
+        committedApplied: operation.seq + 1,
+        committedLastOpId: operation.opId
+      })
+    )
     await batch.flush()
   }
 
@@ -75,8 +92,64 @@ export class MaterializedView {
    * @returns {Promise<number>}
    */
   async getApplied(feedKey) {
-    const progress = await this.bee.get(`feeds/${feedKey}/progress`)
-    return progress?.value?.applied ?? 0
+    return (await this.getFeedProgress(feedKey)).committedApplied
+  }
+
+  /**
+   * Committed K/V state must read only from committed progress.
+   * Raw progress may move ahead once staging is introduced.
+   *
+   * @param {string} feedKey
+   */
+  async getRawApplied(feedKey) {
+    return (await this.getFeedProgress(feedKey)).rawApplied
+  }
+
+  /**
+   * Read both feed cursors with backward-compatible fallback from the legacy
+   * single `applied` cursor used before committed progress was split out.
+   *
+   * @param {string} feedKey
+   */
+  async getFeedProgress(feedKey) {
+    const progress = await this.bee.get(this.#progressKey(feedKey))
+    return this.#normalizeProgressRecord(progress?.value ?? null)
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {{ applied: number, lastOpId?: string | null }} progress
+   */
+  async setRawProgress(feedKey, progress) {
+    const current = await this.getFeedProgress(feedKey)
+    await this.bee.put(
+      this.#progressKey(feedKey),
+      this.#nextProgressRecord({
+        feedKey,
+        rawApplied: progress.applied,
+        rawLastOpId: progress.lastOpId ?? null,
+        committedApplied: current.committedApplied,
+        committedLastOpId: current.committedLastOpId
+      })
+    )
+  }
+
+  /**
+   * @param {string} feedKey
+   * @param {{ applied: number, lastOpId?: string | null }} progress
+   */
+  async setCommittedProgress(feedKey, progress) {
+    const current = await this.getFeedProgress(feedKey)
+    await this.bee.put(
+      this.#progressKey(feedKey),
+      this.#nextProgressRecord({
+        feedKey,
+        rawApplied: current.rawApplied,
+        rawLastOpId: current.rawLastOpId,
+        committedApplied: progress.applied,
+        committedLastOpId: progress.lastOpId ?? null
+      })
+    )
   }
 
   /**
@@ -169,5 +242,49 @@ export class MaterializedView {
     }
 
     return entries
+  }
+
+  /**
+   * @param {string} feedKey
+   */
+  #progressKey(feedKey) {
+    return `feeds/${feedKey}/progress`
+  }
+
+  /**
+   * @param {null | Record<string, unknown>} value
+   */
+  #normalizeProgressRecord(value) {
+    const legacyApplied = value?.applied ?? 0
+    const legacyLastOpId = value?.lastOpId ?? null
+    return {
+      rawApplied: value?.rawApplied ?? legacyApplied,
+      rawLastOpId: value?.rawLastOpId ?? legacyLastOpId,
+      committedApplied: value?.committedApplied ?? legacyApplied,
+      committedLastOpId: value?.committedLastOpId ?? legacyLastOpId
+    }
+  }
+
+  /**
+   * Keep writing the legacy `applied` fields until the rest of the codebase
+   * stops depending on the old shape.
+   *
+   * @param {{
+   *   feedKey: string,
+   *   rawApplied: number,
+   *   rawLastOpId: string | null,
+   *   committedApplied: number,
+   *   committedLastOpId: string | null
+   * }} next
+   */
+  #nextProgressRecord(next) {
+    return {
+      applied: next.committedApplied,
+      lastOpId: next.committedLastOpId,
+      rawApplied: next.rawApplied,
+      rawLastOpId: next.rawLastOpId,
+      committedApplied: next.committedApplied,
+      committedLastOpId: next.committedLastOpId
+    }
   }
 }
