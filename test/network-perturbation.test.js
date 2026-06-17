@@ -1111,6 +1111,60 @@ test("offline leader yields failover writes and catches up cleanly after restart
   }
 })
 
+test("subgroup partition exposes active policy and blocks cross-group links", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const isolatedNodeId = currentLeaderId(cluster)
+    const connectedNodeIds = liveFollowerIds(cluster, isolatedNodeId)
+
+    await cluster.partitionGroups([[isolatedNodeId], connectedNodeIds])
+
+    await waitFor(
+      async () => {
+        const statuses = await collectReplicationStatus(cluster.nodes)
+        const isolatedStatus = statuses[isolatedNodeId]
+        return (
+          isolatedStatus.connections === 0 &&
+          connectedNodeIds.every(
+            (nodeId) =>
+              isolatedStatus.network.peers[nodeId]?.allowed === false &&
+              isolatedStatus.network.peers[nodeId]?.connected === false
+          ) &&
+          connectedNodeIds.every(
+            (nodeId) =>
+              statuses[nodeId].network.peers[isolatedNodeId]?.allowed === false &&
+              statuses[nodeId].network.peers[isolatedNodeId]?.connected === false
+          )
+        )
+      },
+      {
+        description: "subgroup partition reports policy and blocks the isolated node",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const diagnostics = await collectClusterDiagnostics(cluster)
+    assert.deepEqual(diagnostics.partitionGroups, [
+      [isolatedNodeId],
+      [...connectedNodeIds].sort()
+    ])
+
+    await cluster.healPartition()
+    await waitForClusterConvergence(cluster)
+    assert.ok(cluster.nodes.every((node) => node.currentLeader() === currentLeaderId(cluster)))
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("isolated leader blocks minority writes while connected followers continue and heal cleanly", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 5,
@@ -1262,6 +1316,148 @@ test("isolated leader blocks minority writes while connected followers continue 
     await cluster.closeAll()
   }
 })
+
+test(
+  "subgroup partition blocks minority durability while majority continues and old leader heals cleanly",
+  { concurrency: false },
+  async () => {
+    const cluster = await createSwarmCluster({
+      size: 5,
+      heartbeatIntervalMs: 100,
+      heartbeatTtlMs: 900,
+      durability: {
+        requiredFollowerAcks: 2,
+        timeoutMs: 750
+      }
+    })
+
+    try {
+      await cluster.startAll()
+      await waitForClusterConvergence(cluster)
+
+      const originalLeaderId = currentLeaderId(cluster)
+      const originalLeader = cluster.record(originalLeaderId).node
+      const minorityNodeIds = [originalLeaderId]
+      const majorityNodeIds = cluster.records
+        .map((record) => record.identity.publicKeyId)
+        .filter((nodeId) => !minorityNodeIds.includes(nodeId))
+      const majorityNodes = majorityNodeIds.map((nodeId) => cluster.record(nodeId).node)
+
+      await originalLeader.put("hash:subgroup-before", { phase: "before" })
+      await waitFor(
+        async () => hasClusterValue(cluster.nodes, "hash:subgroup-before", { phase: "before" }),
+        {
+          description: "baseline convergence before subgroup partition",
+          onTimeout: () => collectClusterDiagnostics(cluster)
+        }
+      )
+
+      await cluster.partitionGroups([minorityNodeIds, majorityNodeIds])
+
+      await waitFor(
+        async () =>
+          minorityNodeIds.every((nodeId) => cluster.record(nodeId).node.currentLeader() === originalLeaderId),
+        {
+          description: "minority subgroup keeps the original leader",
+          onTimeout: () =>
+            collectClusterDiagnostics(cluster, minorityNodeIds.map((nodeId) => cluster.record(nodeId).node))
+        }
+      )
+
+      const majorityLeaderId = [...majorityNodeIds].sort()[0]
+      await waitFor(
+        async () => majorityNodes.every((node) => node.currentLeader() === majorityLeaderId),
+        {
+          description: "majority subgroup elects its local leader",
+          onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
+        }
+      )
+
+      const majorityLeader = cluster.record(majorityLeaderId).node
+      await waitFor(
+        async () => {
+          const status = await majorityLeader.getReplicationStatus()
+          return majorityNodeIds
+            .filter((nodeId) => nodeId !== majorityLeaderId)
+            .some((nodeId) => status.network.peers[nodeId]?.connected === true)
+        },
+        {
+          description: "majority subgroup keeps a reachable follower",
+          onTimeout: () => majorityLeader.getReplicationStatus()
+        }
+      )
+
+      await assert.rejects(
+        originalLeader.put("hash:subgroup-blocked", { blocked: true }),
+        /(Durability requirement not met|Timed out waiting for follower acknowledgement)/
+      )
+
+      const duringPartition = await majorityLeader.put("hash:subgroup-during", { phase: "during" })
+      assert.equal(duringPartition.actor, majorityLeaderId)
+
+      await waitFor(
+        async () => hasClusterValue(majorityNodes, "hash:subgroup-during", { phase: "during" }),
+        {
+          description: "majority subgroup continues durable writes during partition",
+          onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
+        }
+      )
+
+      assert.equal(await originalLeader.get("hash:subgroup-during"), null)
+
+      await cluster.healPartition()
+      await waitForClusterConvergence(cluster)
+      assert.ok(cluster.nodes.every((node) => node.currentLeader() === originalLeaderId))
+
+      await waitFor(
+        async () => {
+          const current = await originalLeader.get("hash:subgroup-during")
+          return current?.value?.phase === "during"
+        },
+        {
+          description: "old leader catches up after partition heal",
+          onTimeout: () => originalLeader.getReplicationStatus()
+        }
+      )
+
+      await waitFor(
+        async () => {
+          const status = await originalLeader.getReplicationStatus()
+          return liveFollowerIds(cluster, originalLeaderId).some(
+            (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          )
+        },
+        {
+          description: "old leader regains durable follower reachability",
+          onTimeout: () => originalLeader.getReplicationStatus()
+        }
+      )
+
+      const afterHeal = await originalLeader.put("hash:subgroup-after", { phase: "after" })
+      assert.equal(afterHeal.actor, originalLeaderId)
+
+      await waitFor(
+        async () => hasClusterValue(cluster.nodes, "hash:subgroup-after", { phase: "after" }),
+        {
+          description: "post-heal write converges to the full cluster",
+          onTimeout: () => collectClusterDiagnostics(cluster)
+        }
+      )
+
+      for (const node of cluster.nodes) {
+        assert.equal(await node.get("hash:subgroup-blocked"), null)
+      }
+
+      const history = await originalLeader.getHistory("hash:subgroup-during")
+      assert.equal(history.length, 1)
+      assert.equal(history[0].opId, duringPartition.opId)
+
+      await assertClusterInvariants(cluster)
+    } finally {
+      await cluster.closeAll()
+    }
+  }
+)
 
 test("isolated follower serves stale reads until heal and status shows stale connectivity", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
