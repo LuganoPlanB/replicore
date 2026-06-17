@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node -e \"require('./test/run-all-tests.cjs')\"",
+    "test": "node --test --test-concurrency=1 test/config-loader.test.js && node --test --test-concurrency=1 test/swarm-node.test.js && node --test --test-concurrency=1 --test-name-pattern \"five-node static membership|five-node cluster stays durable|single surviving node\" test/network-perturbation.test.js && node --test --test-concurrency=1 --test-name-pattern \"pre-authorized standby|planned node addition\" test/network-perturbation.test.js && node --test --test-concurrency=1 --test-name-pattern \"node replacement|mismatched membership|offline follower|offline leader|isolated leader|isolated follower|bootstrap outage|rolling restarts\" test/network-perturbation.test.js && node --test --test-concurrency=1 --test-name-pattern \"follower write forwarding|concurrent writes|HTTP writes fail|deterministic churn|full-cluster cold restart\" test/network-perturbation.test.js",
     "test:reliability": "node test/reliability-churn.mjs",
     "start:bootstrap": "node bin/run-bootstrap.js",
     "start:node": "node bin/run-node.js",

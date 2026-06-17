@@ -574,6 +574,119 @@ test("node replacement via revocation and new identity restores service without 
   }
 })
 
+test("mismatched membership config blocks degraded writes conservatively", { concurrency: false }, async () => {
+  const identities = createIdentities(3, ["leader", "follower-1", "follower-2"])
+  const authorizedNodes = identities.map((identity) => ({
+    nodeId: identity.publicKeyId,
+    publicKey: identity.publicKey,
+    feedKey: identity.feedKey
+  }))
+  const sortedNodeIds = identities.map((identity) => identity.publicKeyId).sort()
+  const leaderId = sortedNodeIds[0]
+  const staleFollowerId = sortedNodeIds[1]
+  const fullyConfiguredFollowerId = sortedNodeIds[2]
+
+  const cluster = await createSwarmCluster({
+    identities,
+    authorizedNodes,
+    authorizedNodesByNodeId: {
+      [staleFollowerId]: authorizedNodes.filter((node) => node.nodeId !== fullyConfiguredFollowerId)
+    },
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+
+    const leader = cluster.record(leaderId).node
+    const staleFollower = cluster.record(staleFollowerId).node
+    const fullyConfiguredFollower = cluster.record(fullyConfiguredFollowerId).node
+
+    await waitFor(
+      async () => leader.currentLeader() === leaderId,
+      {
+        description: "baseline leader before mismatched rollout outage",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    const staleWriters = staleFollower.getWritersStatus()
+    assert.equal(staleWriters.authorizedNodes.length, 2)
+
+    await leader.put("hash:mismatch-before", { phase: "before" })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:mismatch-before", { phase: "before" }),
+      {
+        description: "baseline replication before mismatched leader loss",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await cluster.stopNode(leaderId)
+
+    await waitFor(
+      async () => staleFollower.currentLeader() === staleFollowerId,
+      {
+        description: "stale-config follower promotes itself after leader loss",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await assert.rejects(
+      staleFollower.put("hash:mismatch-blocked", { blocked: true }),
+      /(Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
+    )
+
+    assert.equal(await staleFollower.get("hash:mismatch-blocked"), null)
+
+    await waitFor(
+      async () => fullyConfiguredFollower.currentLeader() === staleFollowerId,
+      {
+        description: "fully configured follower still routes to stale-config leader",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await assert.rejects(
+      fullyConfiguredFollower.put("hash:mismatch-blocked-forwarded", { blocked: true }),
+      /(Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
+    )
+    assert.equal(await fullyConfiguredFollower.get("hash:mismatch-blocked-forwarded"), null)
+
+    const restartedLeader = await cluster.restartNode(leaderId)
+    await waitFor(
+      async () =>
+        restartedLeader.currentLeader() === leaderId &&
+        fullyConfiguredFollower.currentLeader() === leaderId,
+      {
+        description: "fully configured nodes recover stable leader after restart",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    assert.equal(staleFollower.getWritersStatus().authorizedNodes.length, 2)
+
+    await restartedLeader.put("hash:mismatch-after", { phase: "after" })
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:mismatch-after", { phase: "after" }),
+      {
+        description: "writes recover after consistent leader returns",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
 test("offline follower misses writes, then catches up with full history after restart", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
@@ -1008,6 +1121,53 @@ test("isolated follower serves stale reads until heal and status shows stale con
   }
 })
 
+test("bootstrap outage after discovery does not break writes for already connected peers", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leaderId = currentLeaderId(cluster)
+    const leader = cluster.record(leaderId).node
+
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return liveFollowerIds(cluster, leaderId).some(
+          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+        )
+      },
+      {
+        description: "bootstrap outage baseline durability precondition",
+        onTimeout: () => leader.getReplicationStatus()
+      }
+    )
+
+    await cluster.testnet.destroy()
+
+    const operation = await leader.put("hash:bootstrap-outage", { outage: true })
+    assert.equal(operation.actor, leaderId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:bootstrap-outage", { outage: true }),
+      {
+        description: "connected peers continue replicating after bootstrap outage",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    cluster.testnet = null
+    await cluster.closeAll()
+  }
+})
+
 test("rolling restarts across a four-node cluster preserve availability and convergence", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 4,
@@ -1385,7 +1545,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
     const steps = [
       {
         label: "baseline-write",
-        run: async () => writeOnCurrentLeader(cluster, "hash:churn-0", { step: 0 })
+        run: async () => waitForDurableClusterWrite(cluster, "hash:churn-0", { step: 0 }, "baseline churn write")
       },
       {
         label: "stop-follower",
@@ -1397,7 +1557,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       },
       {
         label: "degraded-write",
-        run: async () => writeOnCurrentLeader(cluster, "hash:churn-1", { step: 1 })
+        run: async () => waitForDurableClusterWrite(cluster, "hash:churn-1", { step: 1 }, "degraded churn write")
       },
       {
         label: "restart-follower",
@@ -1432,21 +1592,11 @@ test("deterministic churn preserves convergence and write outcome invariants", {
         label: "post-failover-write",
         run: async () => {
           let result = null
-          await waitFor(
-            async () => {
-              if (!cluster.nodes.every((node) => node.currentLeader() !== null)) return false
-
-              try {
-                result = await writeOnCurrentLeader(cluster, "hash:churn-3", { step: 3 })
-                return true
-              } catch {
-                return false
-              }
-            },
-            {
-              description: "post-failover durable write during churn",
-              onTimeout: () => collectReplicationStatus(cluster.nodes)
-            }
+          result = await waitForDurableClusterWrite(
+            cluster,
+            "hash:churn-3",
+            { step: 3 },
+            "post-failover durable write during churn"
           )
           return result
         }
@@ -1660,6 +1810,27 @@ async function writeOnCurrentLeader(cluster, key, value) {
   const leader = currentLeaderNode(cluster)
   const operation = await leader.put(key, value)
   return { ok: true, key, operation }
+}
+
+async function waitForDurableClusterWrite(cluster, key, value, description) {
+  let result = null
+  await waitFor(
+    async () => {
+      if (!cluster.nodes.every((node) => node.currentLeader() !== null)) return false
+
+      try {
+        result = await writeOnCurrentLeader(cluster, key, value)
+        return true
+      } catch {
+        return false
+      }
+    },
+    {
+      description,
+      onTimeout: () => collectReplicationStatus(cluster.nodes)
+    }
+  )
+  return result
 }
 
 async function assertClusterInvariants(cluster) {
