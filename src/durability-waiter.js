@@ -22,7 +22,8 @@ export class DurabilityWaiter {
       resolve: null,
       reject: null,
       timer: null,
-      promise: null
+      promise: null,
+      handledPromise: null
     }
 
     if (!existing.promise) {
@@ -34,6 +35,9 @@ export class DurabilityWaiter {
           reject(new Error(`Timed out waiting for follower acknowledgement for sequence ${seq}`))
         }, this.options.timeoutMs)
       })
+      existing.handledPromise = existing.promise.catch((error) => {
+        throw error
+      })
       this.waiters.set(key, existing)
     }
 
@@ -44,7 +48,7 @@ export class DurabilityWaiter {
       return
     }
 
-    return existing.promise
+    return existing.handledPromise
   }
 
   /**
