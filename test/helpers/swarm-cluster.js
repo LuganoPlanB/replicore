@@ -49,6 +49,7 @@ export async function createSwarmCluster(options = {}) {
   const encryptionKey = options.encryptionKey ?? randomBytes(32)
   const records = new Map()
   const trace = createTrace()
+  let activePartitionGroups = null
 
   for (const [index, identity] of identities.entries()) {
     const label = options.identityLabels?.[index] ?? defaultNodeLabel(index)
@@ -86,6 +87,7 @@ export async function createSwarmCluster(options = {}) {
           running: record.node !== null,
           dataDir: record.dataDir
         })),
+        partitionGroups: activePartitionGroups,
         status: Object.fromEntries(statuses.map((status) => [status.nodeId, status])),
         trace: trace.snapshot()
       }
@@ -193,6 +195,17 @@ export async function createSwarmCluster(options = {}) {
         await Promise.allSettled([node.close()])
         throw error
       }
+
+      if (activePartitionGroups) {
+        const allowedNodeIds = activePartitionGroups.find((group) =>
+          group.includes(record.identity.publicKeyId)
+        )
+        await node.setNetworkPolicy({
+          allowedNodeIds,
+          allowConnection: (_localNodeId, remoteNodeId) => allowedNodeIds.includes(remoteNodeId)
+        })
+      }
+
       trace.record("cluster.startNode.end", {
         selector,
         label: record.label,
@@ -299,6 +312,65 @@ export async function createSwarmCluster(options = {}) {
         nodeId: record.identity.publicKeyId
       })
       return record.node
+    },
+
+    /**
+     * Split the running cluster into internally connected groups and block cross-group links.
+     *
+     * @param {string[][]} groups
+     */
+    async partitionGroups(groups) {
+      const runningRecords = this.records.filter((record) => record.node)
+      const runningNodeIds = this.nodes.map((node) => node.options.identity.publicKeyId).sort()
+      const normalizedGroups = groups.map((group) => group.map((selector) => this.record(selector).identity.publicKeyId))
+      const flattenedNodeIds = normalizedGroups.flat()
+      const uniqueNodeIds = new Set(flattenedNodeIds)
+
+      if (flattenedNodeIds.length !== uniqueNodeIds.size) {
+        throw new Error("Partition groups must not contain duplicate nodes")
+      }
+
+      if (runningNodeIds.length !== uniqueNodeIds.size || runningNodeIds.some((nodeId) => !uniqueNodeIds.has(nodeId))) {
+        throw new Error("Partition groups must include every running node exactly once")
+      }
+
+      activePartitionGroups = normalizedGroups.map((group) => [...group].sort())
+      trace.record("cluster.partitionGroups.begin", { groups: activePartitionGroups })
+
+      await this.timed(
+        "cluster.partitionGroups",
+        Promise.all(
+          runningRecords.map(async (record) => {
+            const allowedNodeIds = activePartitionGroups.find((group) => group.includes(record.identity.publicKeyId))
+            await record.node.setNetworkPolicy({
+              allowedNodeIds,
+              allowConnection: (_localNodeId, remoteNodeId) => allowedNodeIds.includes(remoteNodeId)
+            })
+          })
+        )
+      )
+
+      trace.record("cluster.partitionGroups.end", { groups: activePartitionGroups })
+    },
+
+    /**
+     * Remove any active subgroup partition policy and restore allow-all connectivity.
+     */
+    async healPartition() {
+      const runningRecords = this.records.filter((record) => record.node)
+      trace.record("cluster.healPartition.begin", { groups: activePartitionGroups })
+      activePartitionGroups = null
+
+      await this.timed(
+        "cluster.healPartition",
+        Promise.all(
+          runningRecords.map(async (record) => {
+            await record.node.setNetworkPolicy(null)
+          })
+        )
+      )
+
+      trace.record("cluster.healPartition.end", { groups: activePartitionGroups })
     },
 
     /**
