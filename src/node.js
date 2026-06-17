@@ -4,10 +4,8 @@ import { join } from "node:path"
 
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
-import Hyperswarm from "hyperswarm"
 
 import { canonicalize } from "./canonical.js"
-import { deriveTopic } from "./config.js"
 import {
   createSignedOperation,
   decryptOperationValue,
@@ -15,6 +13,8 @@ import {
   verifySignedOperation
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
+import { SwarmNetwork } from "./swarm-network.js"
+import { deriveTopic } from "./config.js"
 
 const RPC_EXTENSION = "planb-cleard-rpc-v1"
 
@@ -24,20 +24,20 @@ const RPC_EXTENSION = "planb-cleard-rpc-v1"
 export class HolepunchSwarmNode {
   /**
    * @param {{
- *   dataDir: string,
- *   clusterId: string,
- *   topicSalt: string,
- *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
- *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
- *   revokedNodeIds?: string[],
- *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
- *   encryptionKey?: Buffer,
- *   bootstrap?: Array<string | { host: string, port: number }>,
- *   heartbeatIntervalMs?: number,
- *   heartbeatTtlMs?: number,
- *   forwarding?: boolean,
- *   ackDelayMs?: number,
- *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
+   *   dataDir: string,
+   *   clusterId: string,
+   *   topicSalt: string,
+   *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
+   *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
+   *   revokedNodeIds?: string[],
+   *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
+   *   encryptionKey?: Buffer,
+   *   bootstrap?: Array<string | { host: string, port: number }>,
+   *   heartbeatIntervalMs?: number,
+   *   heartbeatTtlMs?: number,
+   *   forwarding?: boolean,
+   *   ackDelayMs?: number,
+   *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
    *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
@@ -59,10 +59,9 @@ export class HolepunchSwarmNode {
       keys: { default: this.options.encryptionKey }
     }
     this.store = null
-    this.swarm = null
+    this.network = null
     this.viewBee = null
     this.view = null
-    this.discovery = null
     this.feedCores = new Map()
     this.heartbeatTimer = null
     this.heartbeatPromise = null
@@ -73,9 +72,6 @@ export class HolepunchSwarmNode {
     this.inflightRequests = new Map()
     this.ackWaiters = new Map()
     this.lastHeartbeatByNode = new Map()
-    this.connections = new Set()
-    this.remoteNodeIdsByConnectionKey = new Map()
-    this.networkPolicy = this.options.networkPolicy ?? null
     this.closing = false
     this.lastDurableSequence = -1
   }
@@ -107,8 +103,8 @@ export class HolepunchSwarmNode {
 
       await core.ready()
       if (!isLocal) {
-        core.on("peer-add", (peer) => this.#onCorePeerUpdate(true, node.nodeId, peer))
-        core.on("peer-remove", (peer) => this.#onCorePeerUpdate(false, node.nodeId, peer))
+        core.on("peer-add", (peer) => this.network?.trackPeer(true, node.nodeId, peer))
+        core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
       }
       core.on("append", () => {
         void this.syncFeed(node.nodeId).catch((error) => {
@@ -153,29 +149,16 @@ export class HolepunchSwarmNode {
    * Intended for diagnostics and tests that need live isolation.
    */
   async suspendNetworking() {
-    if (!this.swarm) return
-
-    for (const conn of this.connections) {
-      conn.destroy()
-    }
-    this.connections.clear()
-
-    if (this.discovery) {
-      await this.discovery.destroy()
-      this.discovery = null
-    }
-
-    await this.swarm.destroy()
-    this.swarm = null
+    await this.network?.suspend()
   }
 
   /**
    * Rejoin the swarm after a temporary networking suspension.
    */
   async resumeNetworking() {
-    if (this.closing || this.swarm) return
+    if (this.closing) return
 
-    await this.#startNetworking()
+    await this.network?.resume()
     await this.#runHeartbeat()
   }
 
@@ -185,8 +168,8 @@ export class HolepunchSwarmNode {
    * @param {{ allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean } | null} networkPolicy
    */
   async setNetworkPolicy(networkPolicy = null) {
-    this.networkPolicy = networkPolicy
-    this.#enforceConnectionPolicy()
+    this.options.networkPolicy = networkPolicy
+    this.network?.setPolicy(networkPolicy)
   }
 
   get status() {
@@ -194,7 +177,7 @@ export class HolepunchSwarmNode {
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
       knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
-      connections: this.connections.size,
+      connections: this.network?.connectionCount ?? 0,
       encryptionKeyId: this.encryption.currentKeyId,
       feeds: Object.fromEntries(
         [...this.feedCores.entries()].map(([nodeId, core]) => [nodeId, core.length])
@@ -294,12 +277,12 @@ export class HolepunchSwarmNode {
     return {
       nodeId: this.options.identity.publicKeyId,
       leader: this.currentLeader(),
-      connections: this.connections.size,
+      connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
-      knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
+      knownPeerNodeIds: this.network?.knownPeerPublicKeys ?? [],
       membership: this.#membershipStatus(heartbeats),
-      network: this.#networkStatus(),
+      network: this.network?.networkStatus() ?? { policyActive: false, allowedNodeIds: [], peers: {} },
       readStatus: this.#readStatus(),
       feeds,
       heartbeats
@@ -366,7 +349,7 @@ export class HolepunchSwarmNode {
     for (const extension of this.rpcExtensions.values()) extension.destroy()
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
-    this.remoteNodeIdsByConnectionKey.clear()
+    this.network?.clear()
     if (this.viewBee) await this.viewBee.close()
     if (this.store) await this.store.close()
   }
@@ -480,18 +463,16 @@ export class HolepunchSwarmNode {
   }
 
   async #startNetworking() {
-    this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
-    this.swarm.on("connection", (conn) => {
-      this.connections.add(conn)
-      conn.once("close", () => {
-        this.connections.delete(conn)
-      })
-      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
-      this.store.replicate(conn)
+    this.network ??= new SwarmNetwork({
+      bootstrap: this.options.bootstrap,
+      topic: deriveTopic(this.options),
+      localNodeId: this.options.identity.publicKeyId,
+      authorizedNodes: this.options.authorizedNodes,
+      isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),
+      replicateConnection: (conn) => this.store.replicate(conn),
+      networkPolicy: this.options.networkPolicy ?? null
     })
-
-    this.discovery = this.swarm.join(deriveTopic(this.options), { client: true, server: true })
-    await this.discovery.flushed()
+    await this.network.start()
   }
 
   async #appendKvOperation(type, key, value, options) {
@@ -742,94 +723,6 @@ export class HolepunchSwarmNode {
     return node
   }
 
-  /**
-   * @param {boolean} added
-   * @param {string} nodeId
-   * @param {{ remotePublicKey?: Buffer, stream?: { remotePublicKey?: Buffer } }} peer
-   */
-  #onCorePeerUpdate(added, nodeId, peer) {
-    const connectionKey = this.#connectionKey(peer.stream?.remotePublicKey ?? peer.remotePublicKey)
-    if (!connectionKey) return
-
-    if (!added) return
-
-    const existing = this.remoteNodeIdsByConnectionKey.get(connectionKey)
-    if (!existing) {
-      this.remoteNodeIdsByConnectionKey.set(connectionKey, nodeId)
-    }
-
-    this.#enforceConnectionPolicyForKey(connectionKey)
-  }
-
-  #networkStatus() {
-    const connectedNodeIds = new Set(
-      [...this.connections]
-        .map((conn) => this.remoteNodeIdsByConnectionKey.get(this.#connectionKey(conn.remotePublicKey)))
-        .filter(Boolean)
-    )
-
-    const peers = {}
-    for (const node of this.options.authorizedNodes) {
-      if (node.nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(node.nodeId)) continue
-      peers[node.nodeId] = {
-        allowed: this.#isConnectionAllowed(node.nodeId),
-        connected: connectedNodeIds.has(node.nodeId)
-      }
-    }
-
-    return {
-      policyActive: Boolean(this.networkPolicy),
-      allowedNodeIds: this.#allowedNodeIds(),
-      peers
-    }
-  }
-
-  #allowedNodeIds() {
-    return this.options.authorizedNodes
-      .map((node) => node.nodeId)
-      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
-      .filter((nodeId) => !this.#isRevokedNode(nodeId))
-      .filter((nodeId) => this.#isConnectionAllowed(nodeId))
-      .sort()
-  }
-
-  /**
-   * @param {string | null} nodeId
-   */
-  #isConnectionAllowed(nodeId) {
-    if (!nodeId) return true
-    if (!this.networkPolicy?.allowConnection) return true
-    return this.networkPolicy.allowConnection(this.options.identity.publicKeyId, nodeId) !== false
-  }
-
-  #enforceConnectionPolicy() {
-    for (const conn of this.connections) {
-      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
-    }
-  }
-
-  /**
-   * @param {string | null} connectionKey
-   */
-  #enforceConnectionPolicyForKey(connectionKey) {
-    if (!connectionKey) return
-    const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
-    if (!remoteNodeId || this.#isConnectionAllowed(remoteNodeId)) return
-
-    for (const conn of this.connections) {
-      if (this.#connectionKey(conn.remotePublicKey) === connectionKey) {
-        conn.destroy()
-      }
-    }
-  }
-
-  /**
-   * @param {Buffer | null | undefined} publicKey
-   */
-  #connectionKey(publicKey) {
-    return publicKey ? publicKey.toString("hex") : null
-  }
-
   #aliveFollowers() {
     const leader = this.options.identity.publicKeyId
     const now = Date.now()
@@ -900,7 +793,7 @@ export class HolepunchSwarmNode {
       }
     }
 
-    if (this.connections.size === 0 && this.options.authorizedNodes.length > 1) {
+    if ((this.network?.connectionCount ?? 0) === 0 && this.options.authorizedNodes.length > 1) {
       return {
         staleReadsPossible: true,
         reason: "no-live-peer-connections",
