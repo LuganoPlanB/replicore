@@ -1,7 +1,6 @@
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 
-import b4a from "b4a"
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 import Hyperswarm from "hyperswarm"
@@ -239,7 +238,7 @@ export class HolepunchSwarmNode {
       connections: this.connections.size,
       lastDurableSequence: this.lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
-      knownPeerNodeIds: [...this.connections].map((conn) => b4a.toString(conn.remotePublicKey, "hex")),
+      knownPeerNodeIds: [...this.connections].map((conn) => Buffer.from(conn.remotePublicKey).toString("hex")),
       feeds,
       heartbeats
     }

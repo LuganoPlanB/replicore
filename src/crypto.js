@@ -4,7 +4,6 @@ import {
   createHash,
   randomBytes
 } from "node:crypto"
-import b4a from "b4a"
 import crypto from "hypercore-crypto"
 import Hypercore from "hypercore"
 
@@ -21,7 +20,7 @@ export function generateIdentity(seed) {
     publicKeyId: keyIdFromPublicKey(keyPair.publicKey),
     publicKey: keyPair.publicKey,
     secretKey: keyPair.secretKey,
-    feedKey: b4a.toString(Hypercore.key(keyPair.publicKey), "hex")
+    feedKey: Buffer.from(Hypercore.key(keyPair.publicKey)).toString("hex")
   }
 }
 
@@ -41,7 +40,7 @@ export function keyIdFromPublicKey(publicKey) {
  * @returns {string}
  */
 export function signPayload(secretKey, payload) {
-  return b4a.toString(crypto.sign(payload, secretKey), "base64url")
+  return Buffer.from(crypto.sign(payload, secretKey)).toString("base64url")
 }
 
 /**

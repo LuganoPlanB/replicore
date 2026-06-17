@@ -150,7 +150,9 @@ test("followers forward writes to the computed leader and the next alive node be
     })
 
     nodes.push(leader, follower1, follower2)
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
 
     const leaderId = [leaderIdentity, follower1Identity, follower2Identity]
       .map((identity) => identity.publicKeyId)
@@ -217,7 +219,9 @@ test("authorized HTTP API forwards writes and exposes status routes", async () =
       nodes.push(node)
     }
 
-    await Promise.all(nodes.map((node) => node.start()))
+    for (const node of nodes) {
+      await node.start()
+    }
     await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
 
     for (const node of nodes) {
