@@ -700,6 +700,71 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
   }
 })
 
+test("replication status exposes staged entries without exposing committed CRUD state", { concurrency: false }, async () => {
+  const testnet = await createTestnet(1)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identity = generateIdentity(seed("staged-status"))
+    const authorizedNodes = [
+      {
+        nodeId: identity.publicKeyId,
+        publicKey: identity.publicKey,
+        feedKey: identity.feedKey
+      }
+    ]
+
+    const node = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    nodes.push(node)
+    await node.start()
+
+    await node.view.stageEntry(identity.feedKey, {
+      nodeId: identity.publicKeyId,
+      source: "local",
+      validation: "valid",
+      operation: {
+        kind: "kv",
+        type: "put",
+        keyspace: "default",
+        key: "hash:staged-status",
+        actor: identity.publicKeyId,
+        seq: 3,
+        opId: "staged-status-3",
+        ts: "2026-06-17T00:00:02.000Z"
+      }
+    })
+
+    const status = await node.getReplicationStatus()
+    assert.deepEqual(status.feeds[identity.publicKeyId].staged, {
+      count: 1,
+      firstSeq: 3,
+      lastSeq: 3,
+      latestOpId: "staged-status-3",
+      latestKey: "hash:staged-status"
+    })
+
+    assert.equal(await node.get("hash:staged-status"), null)
+    assert.deepEqual(await node.getHistory("hash:staged-status"), [])
+
+    const snapshot = await node.createSnapshot()
+    assert.ok(snapshot.entries.every((entry) => !String(entry.key).includes("/staged/")))
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("closing a leader rejects a delayed durability wait without leaving a live timer behind", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []

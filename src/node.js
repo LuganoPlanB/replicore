@@ -288,12 +288,14 @@ export class HolepunchSwarmNode {
       const core = this.feedCores.get(node.nodeId)
       if (!core) continue
       const applied = await this.view.getApplied(node.feedKey)
+      const staged = await this.view.getStagedSummary(node.feedKey)
       const heartbeat = heartbeats[node.nodeId] ?? null
       feeds[node.nodeId] = {
         feedKey: node.feedKey,
         length: core.length,
         applied,
         lag: core.length - applied,
+        staged,
         connectedPeers: core.peers.length,
         alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
         heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null

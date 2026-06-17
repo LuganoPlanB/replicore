@@ -207,6 +207,30 @@ export class MaterializedView {
 
   /**
    * @param {string} feedKey
+   */
+  async getStagedSummary(feedKey) {
+    const entries = await this.getStagedEntries(feedKey)
+    if (entries.length === 0) {
+      return {
+        count: 0,
+        firstSeq: null,
+        lastSeq: null,
+        latestOpId: null,
+        latestKey: null
+      }
+    }
+
+    return {
+      count: entries.length,
+      firstSeq: entries[0].seq,
+      lastSeq: entries.at(-1).seq,
+      latestOpId: entries.at(-1).opId,
+      latestKey: entries.at(-1).key
+    }
+  }
+
+  /**
+   * @param {string} feedKey
    * @param {number} seq
    */
   async deleteStagedEntry(feedKey, seq) {
