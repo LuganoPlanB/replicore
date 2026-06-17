@@ -12,3 +12,22 @@ The implementation must preserve these invariants:
 5. Membership changes are committed operations.
 6. New nodes start as non-voting learners and do not affect quorum until a
    committed promotion.
+
+## Consensus Shape
+
+Replicore should adopt a minimal Raft-like quorum-commit model for metadata and
+K/V operations.
+
+The target protocol is intentionally narrow:
+
+- one leader per term
+- majority quorum for votes and commits
+- append-entries style replication
+- persistent `currentTerm` and `votedFor`
+- persistent `commitIndex` and `lastApplied`
+- log matching before append acceptance
+- membership changes committed through the log
+
+This replaces heartbeat-only leader choice for production durability. It does
+not require a full external consensus dependency if the local implementation can
+stay small and readable.
