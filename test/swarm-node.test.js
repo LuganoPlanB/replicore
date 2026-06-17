@@ -176,13 +176,23 @@ test(
       .filter((nodeId) => nodeId !== leaderId)
       .sort()[0]
 
-    await waitFor(async () => survivingObserver.currentLeader() === expectedNextLeader)
+    const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
+    let result = null
     await waitFor(
-      async () => Object.keys((await survivingObserver.getReplicationStatus()).heartbeats).length >= 2
+      async () => {
+        try {
+          result = await nextLeaderNode.put("hash:gamma", { failover: true })
+          return result.actor === expectedNextLeader
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "failover write through the next leader",
+        onTimeout: () => survivingObserver.getReplicationStatus()
+      }
     )
 
-    const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
-    const result = await nextLeaderNode.put("hash:gamma", { failover: true })
     assert.equal(result.actor, expectedNextLeader)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
@@ -223,7 +233,10 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     }
 
     await Promise.all(nodes.map((node) => node.start()))
-    await waitFor(async () => nodes.every((node) => node.status.knownHeartbeats.length >= 3))
+    const expectedLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === expectedLeaderId))
 
     for (const node of nodes) {
       const server = new HolepunchHttpServer({
@@ -415,9 +428,12 @@ test(
     nodes.push(leader, follower)
     await Promise.all(nodes.map((node) => node.start()))
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 2)
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
+    await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
 
     const server = new HolepunchHttpServer({
-      node: leader,
+      node: currentLeaderNode,
       auth: {
         tokens: {
           admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
@@ -429,7 +445,7 @@ test(
     servers.push(server)
 
     const baseUrl = `http://${server.address.address}:${server.address.port}`
-    const firstOperation = await leader.put("hash:before-rotation", { value: "first" })
+    const firstOperation = await currentLeaderNode.put("hash:before-rotation", { value: "first" })
     assert.equal(firstOperation.value.keyId, "primary")
 
     const rotateResponse = await fetch(`${baseUrl}/admin/encryption/rotate`, {
@@ -443,13 +459,13 @@ test(
     assert.equal(rotateResponse.status, 200)
     assert.deepEqual(await rotateResponse.json(), { ok: true, keyId: "next" })
 
-    const secondOperation = await leader.put("hash:after-rotation", { value: "second" })
+    const secondOperation = await currentLeaderNode.put("hash:after-rotation", { value: "second" })
     assert.equal(secondOperation.value.keyId, "next")
 
     await waitFor(async () => (await follower.get("hash:before-rotation"))?.value?.value === "first")
     await waitFor(async () => (await follower.get("hash:after-rotation"))?.value?.value === "second")
 
-    const writers = leader.getWritersStatus()
+    const writers = currentLeaderNode.getWritersStatus()
     assert.deepEqual(writers.revokedNodeIds, [revokedIdentity.publicKeyId])
     assert.equal(writers.encryptionKeyId, "next")
     assert.equal(
@@ -516,8 +532,13 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
     nodes.push(leader, follower, observer)
     await Promise.all(nodes.map((node) => node.start()))
     await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
+    await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
 
-    await leader.put("hash:snapshot", { state: "present" })
+    await currentLeaderNode.put("hash:snapshot", { state: "present" })
     await waitFor(async () => (await follower.get("hash:snapshot"))?.value?.state === "present")
 
     const snapshot = await follower.createSnapshot()
