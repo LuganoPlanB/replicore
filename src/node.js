@@ -37,6 +37,7 @@ export class HolepunchSwarmNode {
  *   heartbeatTtlMs?: number,
  *   forwarding?: boolean,
  *   ackDelayMs?: number,
+ *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
    *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
@@ -73,6 +74,8 @@ export class HolepunchSwarmNode {
     this.ackWaiters = new Map()
     this.lastHeartbeatByNode = new Map()
     this.connections = new Set()
+    this.remoteNodeIdsByConnectionKey = new Map()
+    this.networkPolicy = this.options.networkPolicy ?? null
     this.closing = false
     this.lastDurableSequence = -1
   }
@@ -103,6 +106,10 @@ export class HolepunchSwarmNode {
         : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
 
       await core.ready()
+      if (!isLocal) {
+        core.on("peer-add", (peer) => this.#onCorePeerUpdate(true, node.nodeId, peer))
+        core.on("peer-remove", (peer) => this.#onCorePeerUpdate(false, node.nodeId, peer))
+      }
       core.on("append", () => {
         void this.syncFeed(node.nodeId).catch((error) => {
           if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
@@ -170,6 +177,16 @@ export class HolepunchSwarmNode {
 
     await this.#startNetworking()
     await this.#runHeartbeat()
+  }
+
+  /**
+   * Test-only connection filter used by adverse-network fixtures.
+   *
+   * @param {{ allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean } | null} networkPolicy
+   */
+  async setNetworkPolicy(networkPolicy = null) {
+    this.networkPolicy = networkPolicy
+    this.#enforceConnectionPolicy()
   }
 
   get status() {
@@ -282,6 +299,7 @@ export class HolepunchSwarmNode {
       encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
       membership: this.#membershipStatus(heartbeats),
+      network: this.#networkStatus(),
       readStatus: this.#readStatus(),
       feeds,
       heartbeats
@@ -348,6 +366,7 @@ export class HolepunchSwarmNode {
     for (const extension of this.rpcExtensions.values()) extension.destroy()
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
+    this.remoteNodeIdsByConnectionKey.clear()
     if (this.viewBee) await this.viewBee.close()
     if (this.store) await this.store.close()
   }
@@ -464,7 +483,10 @@ export class HolepunchSwarmNode {
     this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
     this.swarm.on("connection", (conn) => {
       this.connections.add(conn)
-      conn.once("close", () => this.connections.delete(conn))
+      conn.once("close", () => {
+        this.connections.delete(conn)
+      })
+      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
       this.store.replicate(conn)
     })
 
@@ -718,6 +740,94 @@ export class HolepunchSwarmNode {
       throw new Error(`Revoked node ${nodeId} is not allowed to replicate`)
     }
     return node
+  }
+
+  /**
+   * @param {boolean} added
+   * @param {string} nodeId
+   * @param {{ remotePublicKey?: Buffer, stream?: { remotePublicKey?: Buffer } }} peer
+   */
+  #onCorePeerUpdate(added, nodeId, peer) {
+    const connectionKey = this.#connectionKey(peer.stream?.remotePublicKey ?? peer.remotePublicKey)
+    if (!connectionKey) return
+
+    if (!added) return
+
+    const existing = this.remoteNodeIdsByConnectionKey.get(connectionKey)
+    if (!existing) {
+      this.remoteNodeIdsByConnectionKey.set(connectionKey, nodeId)
+    }
+
+    this.#enforceConnectionPolicyForKey(connectionKey)
+  }
+
+  #networkStatus() {
+    const connectedNodeIds = new Set(
+      [...this.connections]
+        .map((conn) => this.remoteNodeIdsByConnectionKey.get(this.#connectionKey(conn.remotePublicKey)))
+        .filter(Boolean)
+    )
+
+    const peers = {}
+    for (const node of this.options.authorizedNodes) {
+      if (node.nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(node.nodeId)) continue
+      peers[node.nodeId] = {
+        allowed: this.#isConnectionAllowed(node.nodeId),
+        connected: connectedNodeIds.has(node.nodeId)
+      }
+    }
+
+    return {
+      policyActive: Boolean(this.networkPolicy),
+      allowedNodeIds: this.#allowedNodeIds(),
+      peers
+    }
+  }
+
+  #allowedNodeIds() {
+    return this.options.authorizedNodes
+      .map((node) => node.nodeId)
+      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
+      .filter((nodeId) => !this.#isRevokedNode(nodeId))
+      .filter((nodeId) => this.#isConnectionAllowed(nodeId))
+      .sort()
+  }
+
+  /**
+   * @param {string | null} nodeId
+   */
+  #isConnectionAllowed(nodeId) {
+    if (!nodeId) return true
+    if (!this.networkPolicy?.allowConnection) return true
+    return this.networkPolicy.allowConnection(this.options.identity.publicKeyId, nodeId) !== false
+  }
+
+  #enforceConnectionPolicy() {
+    for (const conn of this.connections) {
+      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
+    }
+  }
+
+  /**
+   * @param {string | null} connectionKey
+   */
+  #enforceConnectionPolicyForKey(connectionKey) {
+    if (!connectionKey) return
+    const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
+    if (!remoteNodeId || this.#isConnectionAllowed(remoteNodeId)) return
+
+    for (const conn of this.connections) {
+      if (this.#connectionKey(conn.remotePublicKey) === connectionKey) {
+        conn.destroy()
+      }
+    }
+  }
+
+  /**
+   * @param {Buffer | null | undefined} publicKey
+   */
+  #connectionKey(publicKey) {
+    return publicKey ? publicKey.toString("hex") : null
   }
 
   #aliveFollowers() {
