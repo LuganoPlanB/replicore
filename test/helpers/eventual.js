@@ -83,6 +83,26 @@ export async function collectReplicationStatus(nodes) {
 }
 
 /**
+ * Collect cluster status together with recent fixture lifecycle events.
+ *
+ * @param {{
+ *   diagnostics?: (nodes?: Array<import("../../src/index.js").HolepunchSwarmNode>) => Promise<unknown>,
+ *   trace?: { snapshot?: () => unknown }
+ * }} cluster
+ * @param {Array<import("../../src/index.js").HolepunchSwarmNode>} [nodes]
+ */
+export async function collectClusterDiagnostics(cluster, nodes = cluster.nodes) {
+  if (typeof cluster.diagnostics === "function") {
+    return cluster.diagnostics(nodes)
+  }
+
+  return {
+    status: await collectReplicationStatus(nodes),
+    trace: cluster.trace?.snapshot?.() ?? []
+  }
+}
+
+/**
  * Assert that every node exposes the same current value for a key.
  *
  * @param {Array<import("../../src/index.js").HolepunchSwarmNode>} nodes
