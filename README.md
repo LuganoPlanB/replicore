@@ -235,6 +235,7 @@ The current test suite verifies these non-malicious failure behaviors:
 - a connected subset with a live leader plus at least one follower can continue writing
 - isolated followers can serve stale reads until they heal and catch up
 - already-connected peers continue writing after bootstrap disappears
+- if a follower restarts while bootstrap remains unavailable, it starts locally but does not rediscover peers from scratch, stays disconnected, and does not catch up to writes made while it was away
 - writes may fail transiently during failover windows while leader view and reachability converge
 - snapshot restore and persisted data directories recover current state after severe outage or full restart
 
@@ -242,7 +243,6 @@ Not covered:
 
 - malevolent or Byzantine nodes
 - dynamic membership through the replicated log
-- restart-time rediscovery while bootstrap remains unavailable
 - production-grade consensus semantics
 - production auth, backup lifecycle, or deployment packaging
 
