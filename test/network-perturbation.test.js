@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { HolepunchHttpServer } from "../src/index.js"
-import { assertClusterValue, collectReplicationStatus, waitFor } from "./helpers/eventual.js"
+import { assertClusterValue, collectClusterDiagnostics, collectReplicationStatus, waitFor } from "./helpers/eventual.js"
 import { createIdentities, createSwarmCluster } from "./helpers/swarm-cluster.js"
 
 test("five-node static membership supports forwarding, replication, and deletes", { concurrency: false }, async () => {
@@ -19,7 +19,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.identities.length),
       {
         description: "five-node heartbeat convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -28,7 +28,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
       {
         description: "five-node leader convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -53,7 +53,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       async () => hasClusterValue(cluster.nodes, "hash:five-node", { members: 5 }),
       {
         description: "five-node value convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -94,7 +94,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       },
       {
         description: "five-node delete convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -125,7 +125,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.identities.length),
       {
         description: "initial five-node convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -134,7 +134,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
       {
         description: "initial five-node leader convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -163,7 +163,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       async () => hasClusterValue(liveNodes, "hash:degraded-five", { degraded: true }),
       {
         description: "live-node convergence while two followers are offline",
-        onTimeout: () => collectReplicationStatus(liveNodes)
+        onTimeout: () => collectClusterDiagnostics(cluster, liveNodes)
       }
     )
 
@@ -176,7 +176,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.identities.length),
       {
         description: "five-node reconvergence after follower restart",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -184,7 +184,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       async () => hasClusterValue(cluster.nodes, "hash:degraded-five", { degraded: true }),
       {
         description: "restarted follower catch-up",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -197,7 +197,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       },
       {
         description: "delete convergence after offline followers return",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
   } finally {
@@ -219,7 +219,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.identities.length),
       {
         description: "initial three-node convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -232,7 +232,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
       async () => hasClusterValue(cluster.nodes, "hash:survive-read", { baseline: true }),
       {
         description: "baseline replication before follower outage",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -287,7 +287,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
       },
       {
         description: "restarted follower receives post-recovery write",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
   } finally {
@@ -314,7 +314,7 @@ test("pre-authorized standby node can join later and catch up without config cha
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
       {
         description: "three active nodes converge before standby joins",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -328,7 +328,7 @@ test("pre-authorized standby node can join later and catch up without config cha
       async () => hasClusterValue(cluster.nodes, "hash:standby-before", { standby: "baseline" }),
       {
         description: "baseline replication before standby startup",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -346,7 +346,7 @@ test("pre-authorized standby node can join later and catch up without config cha
       },
       {
         description: "cluster converges after standby startup",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -357,7 +357,7 @@ test("pre-authorized standby node can join later and catch up without config cha
       },
       {
         description: "standby catches up to pre-start writes",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -367,7 +367,7 @@ test("pre-authorized standby node can join later and catch up without config cha
       async () => hasClusterValue(cluster.nodes, "hash:standby-after", { standby: "joined" }),
       {
         description: "all nodes converge after standby joins",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
   } finally {
@@ -391,7 +391,7 @@ test("planned node addition works after full-cluster restart with expanded membe
       async () => initialCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
       {
         description: "initial three-node convergence",
-        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
       }
     )
 
@@ -403,7 +403,7 @@ test("planned node addition works after full-cluster restart with expanded membe
       async () => hasClusterValue(initialCluster.nodes, "hash:before-add", { phase: "before" }),
       {
         description: "baseline replication before node addition",
-        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
       }
     )
 
@@ -435,7 +435,7 @@ test("planned node addition works after full-cluster restart with expanded membe
       async () => expandedCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 4),
       {
         description: "expanded four-node convergence after restart",
-        onTimeout: () => collectReplicationStatus(expandedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(expandedCluster)
       }
     )
 
@@ -443,7 +443,7 @@ test("planned node addition works after full-cluster restart with expanded membe
       async () => hasClusterValue(expandedCluster.nodes, "hash:before-add", { phase: "before" }),
       {
         description: "new node catches up to existing state",
-        onTimeout: () => collectReplicationStatus(expandedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(expandedCluster)
       }
     )
 
@@ -455,7 +455,7 @@ test("planned node addition works after full-cluster restart with expanded membe
       async () => hasClusterValue(expandedCluster.nodes, "hash:after-add", { phase: "after" }),
       {
         description: "post-add write converges to all four nodes",
-        onTimeout: () => collectReplicationStatus(expandedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(expandedCluster)
       }
     )
 
@@ -487,7 +487,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => initialCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
       {
         description: "initial three-node convergence before replacement",
-        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
       }
     )
 
@@ -499,7 +499,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => hasClusterValue(initialCluster.nodes, "hash:replacement-before", { replacement: "before" }),
       {
         description: "baseline replication before replacement",
-        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
       }
     )
 
@@ -535,7 +535,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => replacementCluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
       {
         description: "replacement cluster convergence",
-        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
       }
     )
 
@@ -543,7 +543,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-before", { replacement: "before" }),
       {
         description: "replacement node catches up to prior state",
-        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
       }
     )
 
@@ -555,7 +555,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-after", { replacement: "after" }),
       {
         description: "post-replacement write converges",
-        onTimeout: () => collectReplicationStatus(replacementCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
       }
     )
 
@@ -611,7 +611,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       async () => leader.currentLeader() === leaderId,
       {
         description: "baseline leader before mismatched rollout outage",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -623,7 +623,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       async () => hasClusterValue(cluster.nodes, "hash:mismatch-before", { phase: "before" }),
       {
         description: "baseline replication before mismatched leader loss",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -633,7 +633,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       async () => staleFollower.currentLeader() === staleFollowerId,
       {
         description: "stale-config follower promotes itself after leader loss",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -648,7 +648,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       async () => fullyConfiguredFollower.currentLeader() === staleFollowerId,
       {
         description: "fully configured follower still routes to stale-config leader",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -665,7 +665,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
         fullyConfiguredFollower.currentLeader() === leaderId,
       {
         description: "fully configured nodes recover stable leader after restart",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -677,7 +677,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
       async () => hasClusterValue(cluster.nodes, "hash:mismatch-after", { phase: "after" }),
       {
         description: "writes recover after consistent leader returns",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -720,7 +720,7 @@ test("offline follower misses writes, then catches up with full history after re
       },
       {
         description: "live nodes converge while one follower is offline",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -785,7 +785,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       async () => hasClusterValue(cluster.nodes, "hash:leader-before", { phase: "before" }),
       {
         description: "baseline write before leader outage",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -798,7 +798,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       },
       {
         description: "leader failover after original leader stops",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -821,7 +821,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       },
       {
         description: "failover leader accepts writes after original leader outage",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
     assert.equal(duringFailover.actor, failoverLeaderId)
@@ -830,7 +830,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       async () => hasClusterValue(cluster.nodes, "hash:leader-during", { phase: "during" }),
       {
         description: "surviving nodes replicate failover write",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -870,7 +870,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       },
       {
         description: "agreed leader accepts post-restart write",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -878,7 +878,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       async () => hasClusterValue(cluster.nodes, "hash:leader-after", { phase: "after" }),
       {
         description: "post-restart write converges to all nodes",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -935,7 +935,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       async () => hasClusterValue(cluster.nodes, "hash:partition-before", { phase: "before" }),
       {
         description: "baseline convergence before live isolation",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -963,7 +963,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       async () => connectedFollowers.every((node) => node.currentLeader() === expectedConnectedLeaderId),
       {
         description: "connected side elects next live leader during isolation",
-        onTimeout: () => collectReplicationStatus(connectedFollowers)
+        onTimeout: () => collectClusterDiagnostics(cluster, connectedFollowers)
       }
     )
 
@@ -980,7 +980,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       async () => hasClusterValue(connectedFollowers, "hash:partition-during", { phase: "during" }),
       {
         description: "connected side continues durable writes during isolation",
-        onTimeout: () => collectReplicationStatus(connectedFollowers)
+        onTimeout: () => collectClusterDiagnostics(cluster, connectedFollowers)
       }
     )
 
@@ -1007,7 +1007,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       async () => hasClusterValue(cluster.nodes, "hash:partition-after", { phase: "after" }),
       {
         description: "post-heal write converges to full cluster",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1046,7 +1046,7 @@ test("isolated follower serves stale reads until heal and status shows stale con
         hasClusterValue(cluster.nodes, "hash:stale-delete", { phase: "before-delete" }),
       {
         description: "baseline replication before follower isolation",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1080,7 +1080,7 @@ test("isolated follower serves stale reads until heal and status shows stale con
       },
       {
         description: "connected nodes converge while follower is stale",
-        onTimeout: () => collectReplicationStatus(cluster.nodes.filter((node) => node.options.identity.publicKeyId !== isolatedFollowerId))
+        onTimeout: () => collectClusterDiagnostics(cluster, cluster.nodes.filter((node) => node.options.identity.publicKeyId !== isolatedFollowerId))
       }
     )
 
@@ -1157,7 +1157,7 @@ test("bootstrap outage after discovery does not break writes for already connect
       async () => hasClusterValue(cluster.nodes, "hash:bootstrap-outage", { outage: true }),
       {
         description: "connected peers continue replicating after bootstrap outage",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1182,7 +1182,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 4),
       {
         description: "initial four-node convergence",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1194,7 +1194,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
       async () => hasClusterValue(cluster.nodes, "hash:rolling-0", { cycle: 0 }),
       {
         description: "baseline write before rolling restarts",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1217,7 +1217,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
         },
         {
           description: `cluster availability after restart ${index + 1}`,
-          onTimeout: () => collectReplicationStatus(cluster.nodes)
+          onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
 
@@ -1236,7 +1236,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
         },
         {
           description: `durable write after restart ${index + 1}`,
-          onTimeout: () => collectReplicationStatus(cluster.nodes)
+          onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
       assert.ok(writeResult)
@@ -1245,7 +1245,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
         async () => hasClusterValue(cluster.nodes, `hash:rolling-${index + 1}`, { cycle: index + 1 }),
         {
           description: `write convergence after restart ${index + 1}`,
-          onTimeout: () => collectReplicationStatus(cluster.nodes)
+          onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
     }
@@ -1273,7 +1273,7 @@ test("follower write forwarding fails while the old leader is unreachable and re
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
       {
         description: "initial leader convergence before forwarding test",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1292,7 +1292,7 @@ test("follower write forwarding fails while the old leader is unreachable and re
       async () => follower.currentLeader() !== leaderId && follower.currentLeader() !== null,
       {
         description: "failover after leader loss",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1305,7 +1305,7 @@ test("follower write forwarding fails while the old leader is unreachable and re
       async () => hasClusterValue(cluster.nodes, targetKey, { recovered: true }),
       {
         description: "post-failover forwarded write converges",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
   } finally {
@@ -1332,7 +1332,7 @@ test("concurrent writes across failover do not create duplicate accepted operati
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
       {
         description: "initial leader convergence before concurrent failover writes",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1362,7 +1362,7 @@ test("concurrent writes across failover do not create duplicate accepted operati
       async () => follower.currentLeader() !== leaderId && follower.currentLeader() !== null,
       {
         description: "failover completes during concurrent write test",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1380,7 +1380,7 @@ test("concurrent writes across failover do not create duplicate accepted operati
       async () => hasClusterValue(cluster.nodes, "hash:concurrent-recovered", { recovered: true }),
       {
         description: "confirmed post-failover write after concurrent batch",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
     assert.ok(recovered.opId)
@@ -1390,7 +1390,7 @@ test("concurrent writes across failover do not create duplicate accepted operati
         async () => hasClusterValue(cluster.nodes, key, { key }),
         {
           description: `successful failover write converges for ${key}`,
-          onTimeout: () => collectReplicationStatus(cluster.nodes)
+          onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
 
@@ -1422,7 +1422,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
       async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
       {
         description: "cluster convergence before HTTP durability test",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1434,7 +1434,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
       {
         description: "leader convergence before HTTP durability test",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
@@ -1517,7 +1517,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
       },
       {
         description: "recovered HTTP write reaches restarted follower",
-        onTimeout: () => collectReplicationStatus(cluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
   } finally {
@@ -1654,7 +1654,7 @@ test("deterministic churn preserves convergence and write outcome invariants", {
         async () => hasClusterValue(cluster.nodes, result.key, { step: Number(result.key.slice(-1)) }),
         {
           description: `final convergence for ${result.key}`,
-          onTimeout: () => collectReplicationStatus(cluster.nodes)
+          onTimeout: () => collectClusterDiagnostics(cluster)
         }
       )
     }
@@ -1693,7 +1693,7 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
       },
       {
         description: "pre-restart tombstone convergence",
-        onTimeout: () => collectReplicationStatus(initialCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(initialCluster)
       }
     )
 
@@ -1719,7 +1719,7 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
       async () => hasClusterValue(restartedCluster.nodes, "hash:cold-1", { cold: 1 }),
       {
         description: "cold restart preserves live value",
-        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(restartedCluster)
       }
     )
     await waitFor(
@@ -1729,7 +1729,7 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
       },
       {
         description: "cold restart preserves tombstone",
-        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(restartedCluster)
       }
     )
 
@@ -1740,7 +1740,7 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
       async () => hasClusterValue(restartedCluster.nodes, "hash:cold-3", { cold: 3 }),
       {
         description: "post-cold-restart write converges",
-        onTimeout: () => collectReplicationStatus(restartedCluster.nodes)
+        onTimeout: () => collectClusterDiagnostics(restartedCluster)
       }
     )
 
@@ -1783,7 +1783,7 @@ async function waitForClusterConvergence(cluster) {
     async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.nodes.length),
     {
       description: "cluster heartbeat convergence",
-      onTimeout: () => collectReplicationStatus(cluster.nodes)
+      onTimeout: () => collectClusterDiagnostics(cluster)
     }
   )
   await waitFor(
@@ -1793,7 +1793,7 @@ async function waitForClusterConvergence(cluster) {
     },
     {
       description: "cluster leader convergence",
-      onTimeout: () => collectReplicationStatus(cluster.nodes)
+      onTimeout: () => collectClusterDiagnostics(cluster)
     }
   )
 }
@@ -1827,7 +1827,7 @@ async function waitForDurableClusterWrite(cluster, key, value, description) {
     },
     {
       description,
-      onTimeout: () => collectReplicationStatus(cluster.nodes)
+      onTimeout: () => collectClusterDiagnostics(cluster)
     }
   )
   return result
