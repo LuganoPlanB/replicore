@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node -e \"require('./test/run-all-tests.cjs')\"",
+    "test:reliability": "node test/reliability-churn.mjs",
     "start:bootstrap": "node bin/run-bootstrap.js",
     "start:node": "node bin/run-node.js",
     "snapshot": "node bin/snapshot.js"

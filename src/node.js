@@ -664,6 +664,7 @@ export class HolepunchSwarmNode {
       .filter(([nodeId]) => nodeId !== leader)
       .filter(([nodeId]) => !this.#isRevokedNode(nodeId))
       .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
+      .filter(([nodeId]) => this.#isLeaderReachable(nodeId))
       .map(([nodeId]) => nodeId)
   }
 

@@ -208,14 +208,41 @@ Revoked writers remain part of the explicit cluster membership record, but nodes
 npm test
 ```
 
+Longer local reliability pass:
+
+```powershell
+npm run test:reliability
+```
+
 The tests currently cover:
 
 - replication and restart recovery
 - leader failover and follower forwarding
+- single-node isolation and connected-side continuation
+- stale reads on isolated followers until rejoin
 - HTTP CRUD and status routes
 - operation validation
 - snapshot restore
 - config loading
+
+## Reliability Semantics
+
+The current test suite verifies these non-malicious failure behaviors:
+
+- follower crashes and restarts catch up from replicated feeds
+- former leaders can disappear, a new leader can write, and the old leader can rejoin and catch up
+- a single isolated node can continue serving local reads but cannot make durable writes
+- a connected subset with a live leader plus at least one follower can continue writing
+- isolated followers can serve stale reads until they heal and catch up
+- writes may fail transiently during failover windows while leader view and reachability converge
+- snapshot restore and persisted data directories recover current state after severe outage or full restart
+
+Not covered:
+
+- malevolent or Byzantine nodes
+- dynamic membership through the replicated log
+- production-grade consensus semantics
+- production auth, backup lifecycle, or deployment packaging
 
 ## Notes
 

@@ -70,7 +70,22 @@ test("five-node static membership supports forwarding, replication, and deletes"
       }
     )
 
-    await leader.delete("hash:five-node")
+    let deleteOperation = null
+    await waitFor(
+      async () => {
+        try {
+          deleteOperation = await leader.delete("hash:five-node")
+          return true
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "five-node durable delete",
+        onTimeout: () => leader.getReplicationStatus()
+      }
+    )
+    assert.ok(deleteOperation)
 
     await waitFor(
       async () => {
@@ -887,6 +902,105 @@ test("isolated leader blocks minority writes while connected followers continue 
     assert.equal(isolatedHistory.length, 1)
     assert.equal(isolatedHistory[0].opId, duringIsolation.opId)
     assert.ok(afterHeal.operation.opId)
+
+    await assertClusterInvariants(cluster)
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
+test("isolated follower serves stale reads until heal and status shows stale connectivity", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leaderId = currentLeaderId(cluster)
+    const leader = cluster.record(leaderId).node
+    const isolatedFollowerId = liveFollowerIds(cluster, leaderId)[0]
+    const isolatedFollower = cluster.record(isolatedFollowerId).node
+
+    await leader.put("hash:stale-value", { phase: "before" })
+    await leader.put("hash:stale-delete", { phase: "before-delete" })
+    await waitFor(
+      async () =>
+        hasClusterValue(cluster.nodes, "hash:stale-value", { phase: "before" }) &&
+        hasClusterValue(cluster.nodes, "hash:stale-delete", { phase: "before-delete" }),
+      {
+        description: "baseline replication before follower isolation",
+        onTimeout: () => collectReplicationStatus(cluster.nodes)
+      }
+    )
+
+    await cluster.isolateNode(isolatedFollowerId)
+
+    await waitFor(
+      async () => {
+        const status = await isolatedFollower.getReplicationStatus()
+        return status.connections === 0 && status.feeds[leaderId]?.connectedPeers === 0
+      },
+      {
+        description: "isolated follower loses live connectivity",
+        onTimeout: () => isolatedFollower.getReplicationStatus()
+      }
+    )
+
+    await leader.put("hash:stale-value", { phase: "after" })
+    await leader.delete("hash:stale-delete")
+
+    await waitFor(
+      async () => {
+        const liveNodes = cluster.nodes.filter((node) => node.options.identity.publicKeyId !== isolatedFollowerId)
+        const current = await Promise.all([
+          ...liveNodes.map((node) => node.get("hash:stale-value")),
+          ...liveNodes.map((node) => node.get("hash:stale-delete"))
+        ])
+        return (
+          current.slice(0, liveNodes.length).every((value) => value?.value?.phase === "after") &&
+          current.slice(liveNodes.length).every((value) => value?.deleted === true)
+        )
+      },
+      {
+        description: "connected nodes converge while follower is stale",
+        onTimeout: () => collectReplicationStatus(cluster.nodes.filter((node) => node.options.identity.publicKeyId !== isolatedFollowerId))
+      }
+    )
+
+    const staleValue = await isolatedFollower.get("hash:stale-value")
+    const staleDelete = await isolatedFollower.get("hash:stale-delete")
+    assert.deepEqual(staleValue?.value, { phase: "before" })
+    assert.deepEqual(staleDelete?.value, { phase: "before-delete" })
+
+    await waitFor(
+      async () => {
+        const status = await isolatedFollower.getReplicationStatus()
+        return status.feeds[leaderId]?.alive === false
+      },
+      {
+        description: "isolated follower marks leader heartbeat stale after TTL",
+        onTimeout: () => isolatedFollower.getReplicationStatus()
+      }
+    )
+
+    await cluster.healNode(isolatedFollowerId)
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const healedValue = await isolatedFollower.get("hash:stale-value")
+        const healedDelete = await isolatedFollower.get("hash:stale-delete")
+        return healedValue?.value?.phase === "after" && healedDelete?.deleted === true
+      },
+      {
+        description: "healed follower catches up after stale-read window",
+        onTimeout: () => isolatedFollower.getReplicationStatus()
+      }
+    )
 
     await assertClusterInvariants(cluster)
   } finally {
