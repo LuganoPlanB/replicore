@@ -302,7 +302,8 @@ export class HolepunchSwarmNode {
     for (const conn of this.connections) conn.destroy()
     if (this.swarm) await this.swarm.destroy()
     for (const extension of this.rpcExtensions.values()) extension.destroy()
-    for (const core of this.feedCores.values()) await core.close()
+    await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
+    await Promise.allSettled(this.syncPromises.values())
     if (this.viewBee) await this.viewBee.close()
     if (this.store) await this.store.close()
   }
@@ -311,6 +312,10 @@ export class HolepunchSwarmNode {
    * @param {string} nodeId
    */
   async syncFeed(nodeId) {
+    if (this.closing && !this.syncPromises.has(nodeId)) {
+      return
+    }
+
     if (this.syncPromises.has(nodeId)) {
       this.pendingSync.add(nodeId)
       return this.syncPromises.get(nodeId)
@@ -327,7 +332,7 @@ export class HolepunchSwarmNode {
       }
     } finally {
       this.syncPromises.delete(nodeId)
-      if (this.pendingSync.has(nodeId)) {
+      if (!this.closing && this.pendingSync.has(nodeId)) {
         this.pendingSync.delete(nodeId)
         await this.syncFeed(nodeId)
       }
@@ -343,6 +348,8 @@ export class HolepunchSwarmNode {
     let applied = await this.view.getApplied(node.feedKey)
 
     while (applied < core.length) {
+      if (this.closing) return
+
       const operation = await core.get(applied)
       validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
       if (!verifySignedOperation(operation, node.publicKey)) {
