@@ -177,16 +177,22 @@ export async function createSwarmCluster(options = {}) {
       }
 
       const node = new HolepunchSwarmNode(nodeOptions)
-
-      await this.timed(`cluster.startNode:${record.label}`, node.start(), {
-        timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
-        timeoutDetails: {
-          selector,
-          label: record.label,
-          nodeId: record.identity.publicKeyId
-        }
-      })
       record.node = node
+
+      try {
+        await this.timed(`cluster.startNode:${record.label}`, node.start(), {
+          timeoutMs: NODE_LIFECYCLE_TIMEOUT_MS,
+          timeoutDetails: {
+            selector,
+            label: record.label,
+            nodeId: record.identity.publicKeyId
+          }
+        })
+      } catch (error) {
+        record.node = null
+        await Promise.allSettled([node.close()])
+        throw error
+      }
       trace.record("cluster.startNode.end", {
         selector,
         label: record.label,
