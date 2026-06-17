@@ -49,6 +49,8 @@ When changing behavior around replication, forwarding, leader election, durabili
 
 The default suite groups perturbation scenarios into smaller `node --test` runs through the `npm test` script so they do not all share one Node test process. The live-isolation helpers are in [test/helpers/swarm-cluster.js](C:/Users/denis/devel/planb-cleard/test/helpers/swarm-cluster.js:1) and rely on the node-level networking hooks in [src/node.js](C:/Users/denis/devel/planb-cleard/src/node.js:1).
 
+Use `isolateNode()` when the scenario needs full networking suspension for one process. Use `partitionGroups()` when the scenario needs live subgroup filtering that keeps nodes running and preserves only in-group links. Stay with these built-in hooks before reaching for external chaos tooling.
+
 For longer local churn checks, run:
 
 ```powershell
