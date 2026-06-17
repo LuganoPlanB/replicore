@@ -920,6 +920,98 @@ test("committed feed progress survives follower restart after watermark-driven a
   }
 })
 
+test("a staged delete stays out of reads, history, and snapshots until committed", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("watermark-delete-leader"))
+    const followerIdentity = generateIdentity(seed("watermark-delete-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 500,
+      durability: {
+        requiredFollowerAcks: 1,
+        timeoutMs: 4000
+      }
+    })
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap,
+      ackDelayMs: 500
+    })
+
+    nodes.push(first, second)
+    await first.start()
+    await second.start()
+
+    const currentLeaderId = [leaderIdentity, followerIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    const leaderNode = currentLeaderId === leaderIdentity.publicKeyId ? first : second
+    const followerNode = leaderNode === first ? second : first
+
+    await waitFor(async () => first.currentLeader() === currentLeaderId)
+    await waitFor(async () => second.currentLeader() === currentLeaderId)
+
+    const putOperation = await leaderNode.put("hash:watermark-delete", { phase: "before-delete" })
+    await waitFor(async () => (await followerNode.get("hash:watermark-delete"))?.value?.phase === "before-delete")
+
+    const pendingDelete = leaderNode.delete("hash:watermark-delete")
+    pendingDelete.catch(() => {})
+
+    await waitFor(async () => (await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count === 1)
+
+    const stagedValue = await followerNode.get("hash:watermark-delete")
+    assert.equal(stagedValue?.value?.phase, "before-delete")
+
+    const stagedHistory = await followerNode.getHistory("hash:watermark-delete")
+    assert.equal(stagedHistory.length, 1)
+    assert.equal(stagedHistory[0].opId, putOperation.opId)
+
+    const stagedSnapshot = await followerNode.createSnapshot()
+    const stagedCurrent = stagedSnapshot.entries.find((entry) => entry.key === "kv/current/default/hash:watermark-delete")
+    assert.equal(stagedCurrent?.value?.deleted, false)
+    assert.ok(stagedSnapshot.entries.some((entry) => entry.key === "kv/value/default/hash:watermark-delete"))
+    assert.ok(stagedSnapshot.entries.every((entry) => !String(entry.key).includes("/staged/")))
+
+    await pendingDelete
+    await waitFor(async () => (await followerNode.get("hash:watermark-delete"))?.deleted === true)
+
+    const committedHistory = await followerNode.getHistory("hash:watermark-delete")
+    assert.equal(committedHistory.length, 2)
+    assert.equal(committedHistory[0].opId, putOperation.opId)
+    assert.equal(committedHistory[1].type, "delete")
+
+    const committedSnapshot = await followerNode.createSnapshot()
+    const committedCurrent = committedSnapshot.entries.find((entry) => entry.key === "kv/current/default/hash:watermark-delete")
+    assert.equal(committedCurrent?.value?.deleted, true)
+    assert.ok(committedSnapshot.entries.every((entry) => entry.key !== "kv/value/default/hash:watermark-delete"))
+    assert.ok(committedSnapshot.entries.every((entry) => !String(entry.key).includes("/staged/")))
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("closing a leader rejects a delayed durability wait without leaving a live timer behind", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
