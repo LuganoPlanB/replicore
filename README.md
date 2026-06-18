@@ -1,23 +1,33 @@
 # Replicore
 
-Resilient multi-node K/V storage for high availability, based on the Holepunch / Hypercore stack
+Resilient multi-node K/V storage for high availability, based on the Holepunch / Hypercore stack.
 
-This repository implements a small multi-node service with these properties:
+Replicore is an app running on remote servers to form a dynamically extensible network of nodes self-governed by Raft leadership elections.
 
-- Each node has its own writable Hypercore feed.
-- The application state is a signed append-only operation log.
-- A local Hyperbee is the derived K/V view, not the source of truth.
-- Only the current leader writes K/V operations.
-- Followers replicate feeds, serve reads, and forward writes to the leader.
-- Writes are considered successful only after leader-local append plus one follower acknowledgement.
+The nodes may have three roles:
+2. Notary: is the primary node by election, the only one who can write
+3. Witness: eligible as candidate for next elections, read-only and transparent proxy to the Notary on writes
+4. Archivist: needs authorization to become a Witness and provides read-only access.
+
+Replicore implements a small multi-node service with these properties:
+- The data is stored as append-only feed that that can reconcile after network splits.
+- The K/V database is a derived view im Hyperbee from a Hypercore feed of signed entries. 
+- Witness nodes replicate feeds, qualify join requests, serve reads, forward writes to the Notary.
+- Writes are considered successful only after a Notary write and one Witness acknowledges.
+
+The must be minimum two nodes for functioning.
 
 The current implementation is a prototype. It is useful for local runs and architecture validation, not production deployment.
 
 ## Current Features
 
+- Ease of use.
+- Post-Quantum resistant join protocol.
+- Noise protocol for internal node communication.
+- Config-less DHT based networking setup.
 - Signed K/V operations and signed heartbeat records
-- Deterministic leader selection from live heartbeats
-- Follower-to-leader write forwarding over Hypercore extensions
+- Quorum based election, Raft like
+- Witness to Notary write forwarding over Hypercore extensions
 - Derived Hyperbee current view and history view
 - Static bearer-token ACLs by keyspace
 - HTTP routes for CRUD and status
@@ -38,7 +48,7 @@ The current implementation is a prototype. It is useful for local runs and archi
 
 ## Requirements
 
-- Node.js 24 or newer
+- Node.js 24.6 or newer
 - npm
 
 ## Install
