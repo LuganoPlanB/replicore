@@ -188,6 +188,12 @@ test("new and restarted followers read the same authoritative leader-log prefix"
       assert.equal(status.term, leaderLog.term)
     }
 
+    const follower1Replication = await follower1.getReplicationStatus()
+    assert.equal(follower1Replication.authoritativeLog.nodeId, leaderLog.nodeId)
+    assert.equal(follower1Replication.authoritativeLog.feedKey, leaderLog.feedKey)
+    assert.equal(follower1Replication.authoritativeLog.length, leaderLog.length)
+    assert.equal(follower1Replication.authoritativeLog.term, leaderLog.term)
+
     const leaderCoreEntry = await leader.feedCores.get(leaderId).get(forwarded.seq)
     const lateFollowerHistory = await lateFollower.getHistory("hash:authoritative-prefix")
     assert.equal(lateFollowerHistory.length, 1)
@@ -212,13 +218,16 @@ test("new and restarted followers read the same authoritative leader-log prefix"
     await waitFor(async () => (await restartedFollower.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
     await waitFor(
       async () => {
-        const leaderStatus = await leader.getAuthoritativeLogStatus()
+        const leaderLogStatus = await leader.getAuthoritativeLogStatus()
+        const restartedReplication = await restartedFollower.getReplicationStatus()
         const restartedLog = await restartedFollower.getAuthoritativeLogStatus()
         return (
-          restartedLog.nodeId === leaderStatus.nodeId &&
-          restartedLog.feedKey === leaderStatus.feedKey &&
-          restartedLog.term === leaderStatus.term &&
-          restartedLog.length === leaderStatus.length
+          restartedLog.nodeId === leaderLogStatus.nodeId &&
+          restartedLog.feedKey === leaderLogStatus.feedKey &&
+          restartedLog.term === leaderLogStatus.term &&
+          restartedLog.length === leaderLogStatus.length &&
+          restartedReplication.authoritativeLog.feedKey === leaderLogStatus.feedKey &&
+          restartedReplication.authoritativeLog.length === leaderLogStatus.length
         )
       },
       {

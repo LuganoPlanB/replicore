@@ -339,6 +339,8 @@ export class HolepunchSwarmNode {
     const heartbeats = await this.view.getHeartbeats()
     const feeds = {}
     const now = Date.now()
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const authoritativeApplied = await this.view.getApplied(authoritativeLog.feedKey)
 
     for (const node of this.options.authorizedNodes) {
       const core = this.feedCores.get(node.nodeId)
@@ -367,6 +369,11 @@ export class HolepunchSwarmNode {
         commitIndex: this.consensusState.commitIndex,
         lastApplied: this.consensusState.lastApplied,
         knownLeader: this.currentLeader() ?? this.#lastKnownLeaderId()
+      },
+      authoritativeLog: {
+        ...authoritativeLog,
+        applied: authoritativeApplied,
+        lag: authoritativeLog.length - authoritativeApplied
       },
       splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
