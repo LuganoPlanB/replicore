@@ -30,7 +30,12 @@ import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identit
 const JOIN_REQUEST_MAX_SKEW_MS = 5 * 60 * 1000
 
 /**
- * Minimal multi-node swarm with one feed per node and leader-only writes.
+ * Minimal multi-node swarm whose committed cluster history is represented by
+ * one authoritative leader log.
+ *
+ * During the storage transition, that authoritative log is modeled as the
+ * current leader's Hypercore feed. Other per-node feeds still exist as
+ * replication scaffolding, but they are not the authoritative CRUD history.
  */
 export class HolepunchSwarmNode {
   /**
@@ -409,6 +414,29 @@ export class HolepunchSwarmNode {
 
   async getConsensusState() {
     return { ...this.consensusState }
+  }
+
+  /**
+   * Return the single authoritative Raft log descriptor that this node is
+   * currently following.
+   *
+   * While the physical storage migration is still in progress, the
+   * authoritative cluster log is the current leader feed, or the last known
+   * leader feed while this node is fenced and reconnecting.
+   */
+  async getAuthoritativeLogStatus() {
+    const nodeId = this.#authoritativeLogNodeId()
+    const node = this.#getAuthorizedNode(nodeId)
+    const core = this.feedCores.get(nodeId)
+
+    return {
+      nodeId,
+      feedKey: node.feedKey,
+      length: core?.length ?? 0,
+      term: this.consensusState.currentTerm,
+      commitIndex: this.consensusState.commitIndex,
+      lastApplied: this.consensusState.lastApplied
+    }
   }
 
   async submitPromotionCredential(credential) {
@@ -1111,6 +1139,17 @@ export class HolepunchSwarmNode {
 
   #localCore() {
     return this.feedCores.get(this.options.identity.publicKeyId)
+  }
+
+  /**
+   * Resolve the authoritative cluster log node for the current storage model.
+   *
+   * The leader feed stays authoritative even while a disconnected node is
+   * split-fenced; in that case the last known leader remains the only log this
+   * node should treat as cluster authority.
+   */
+  #authoritativeLogNodeId() {
+    return this.currentLeader() ?? this.#lastKnownLeaderId() ?? this.options.identity.publicKeyId
   }
 
   #localNodeRecord() {

@@ -115,6 +115,123 @@ test("leader operations replicate to followers and rebuild after restart", { con
   }
 })
 
+test("new and restarted followers read the same authoritative leader-log prefix", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("authoritative-leader"))
+    const follower1Identity = generateIdentity(seed("authoritative-follower-1"))
+    const follower2Identity = generateIdentity(seed("authoritative-follower-2"))
+    const authorizedNodes = [leaderIdentity, follower1Identity, follower2Identity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await leader.start()
+    nodes.push(leader)
+
+    const follower1 = await createFollower({
+      dirs,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: follower1Identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    nodes.push(follower1)
+
+    let leaderId = null
+    await waitFor(async () => {
+      const current = leader.currentLeader()
+      if (!current || follower1.currentLeader() !== current) return false
+      leaderId = current
+      return true
+    })
+
+    const forwarded = await follower1.put("hash:authoritative-prefix", { source: "forwarded" })
+    await waitFor(async () => (await leader.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
+
+    const lateFollower = await createFollower({
+      dirs,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: follower2Identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    nodes.push(lateFollower)
+
+    await waitFor(async () => (await lateFollower.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
+
+    const leaderLog = await leader.getAuthoritativeLogStatus()
+    const follower1Log = await follower1.getAuthoritativeLogStatus()
+    const lateFollowerLog = await lateFollower.getAuthoritativeLogStatus()
+    for (const status of [follower1Log, lateFollowerLog]) {
+      assert.equal(status.nodeId, leaderLog.nodeId)
+      assert.equal(status.feedKey, leaderLog.feedKey)
+      assert.equal(status.length, leaderLog.length)
+      assert.equal(status.term, leaderLog.term)
+    }
+
+    const leaderCoreEntry = await leader.feedCores.get(leaderId).get(forwarded.seq)
+    const lateFollowerHistory = await lateFollower.getHistory("hash:authoritative-prefix")
+    assert.equal(lateFollowerHistory.length, 1)
+    assert.equal(lateFollowerHistory[0].opId, leaderCoreEntry.opId)
+    assert.equal(lateFollowerHistory[0].feed, leaderLog.feedKey)
+
+    await lateFollower.close()
+    nodes.splice(nodes.indexOf(lateFollower), 1)
+
+    const restartedFollower = await createFollower({
+      dirs: [],
+      dataDir: lateFollower.options.dataDir,
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: follower2Identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    nodes.push(restartedFollower)
+
+    await waitFor(async () => (await restartedFollower.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
+    await waitFor(
+      async () => {
+        const leaderStatus = await leader.getAuthoritativeLogStatus()
+        const restartedLog = await restartedFollower.getAuthoritativeLogStatus()
+        return (
+          restartedLog.nodeId === leaderStatus.nodeId &&
+          restartedLog.feedKey === leaderStatus.feedKey &&
+          restartedLog.term === leaderStatus.term &&
+          restartedLog.length === leaderStatus.length
+        )
+      },
+      {
+        description: "restarted follower authoritative log prefix catch-up"
+      }
+    )
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test(
   "followers forward writes to the computed leader and become split-fenced when that leader disappears",
   { concurrency: false },
