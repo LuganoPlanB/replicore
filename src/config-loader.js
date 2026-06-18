@@ -29,7 +29,7 @@ export async function loadRuntimeConfig(configPath) {
     configPath: absolutePath,
     dataDir: path.resolve(path.dirname(absolutePath), raw.dataDir),
     clusterId: requireString(raw.clusterId, "clusterId"),
-    topicSalt: requireString(raw.topicSalt, "topicSalt"),
+    clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
     bootstrap: normalizeBootstrap(raw.bootstrap ?? []),
     heartbeatIntervalMs: raw.heartbeatIntervalMs ?? 500,
     heartbeatTtlMs: raw.heartbeatTtlMs ?? 3000,

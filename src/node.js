@@ -29,7 +29,8 @@ export class HolepunchSwarmNode {
    * @param {{
    *   dataDir: string,
    *   clusterId: string,
-   *   topicSalt: string,
+   *   clusterSecret?: Buffer,
+   *   topicSalt?: string,
    *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
    *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
    *   revokedNodeIds?: string[],
@@ -544,9 +545,10 @@ export class HolepunchSwarmNode {
   }
 
   async #startNetworking() {
+    const topic = await deriveTopic(this.options)
     this.network ??= new SwarmNetwork({
       bootstrap: this.options.bootstrap,
-      topic: deriveTopic(this.options),
+      topic,
       localNodeId: this.options.identity.publicKeyId,
       authorizedNodes: this.options.authorizedNodes,
       isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),

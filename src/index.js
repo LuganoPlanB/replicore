@@ -1,4 +1,11 @@
 export { canonicalize } from "./canonical.js"
+export {
+  CLUSTER_SECRET_KDF_PARAMS,
+  deriveClusterScopedBytes,
+  deriveDiscoveryTopic,
+  deriveLegacyTopic,
+  deriveNoiseSeed
+} from "./cluster-secret.js"
 export { ConsensusStateStore } from "./consensus-state.js"
 export { deriveTopic } from "./config.js"
 export { loadRuntimeConfig } from "./config-loader.js"
