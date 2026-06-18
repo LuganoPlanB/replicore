@@ -14,10 +14,15 @@ export async function loadRuntimeConfig(configPath) {
 
   const identitySeed = requireHex(raw.identitySeed, "identitySeed")
   const identity = generateIdentity(identitySeed)
+  const role = normalizeRole(raw.role)
 
   const authorizedNodes = normalizeAuthorizedNodes(raw)
-  if (!authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)) {
+  const localIncluded = authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)
+  if (role === "voter" && !localIncluded) {
     throw new Error("Authorized nodes do not include the local identity")
+  }
+  if (role === "learner" && localIncluded) {
+    throw new Error("Learner config must not include the local identity in authorizedNodes")
   }
   const revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
   if (revokedNodeIds.includes(identity.publicKeyId)) {
@@ -30,6 +35,7 @@ export async function loadRuntimeConfig(configPath) {
     dataDir: path.resolve(path.dirname(absolutePath), raw.dataDir),
     clusterId: requireString(raw.clusterId, "clusterId"),
     clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
+    role,
     machineId: raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId"),
     nodeIdentitySeed:
       raw.nodeIdentitySeed === undefined
@@ -55,6 +61,12 @@ export async function loadRuntimeConfig(configPath) {
       tokens: raw.auth?.tokens ?? {}
     }
   }
+}
+
+function normalizeRole(value) {
+  if (value === undefined) return "voter"
+  if (value === "voter" || value === "learner") return value
+  throw new Error("role must be either voter or learner")
 }
 
 function normalizeAuthorizedNodes(raw) {

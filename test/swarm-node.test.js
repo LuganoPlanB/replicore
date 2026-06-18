@@ -529,6 +529,106 @@ test("same-secret unknown peers are surfaced as learner candidates without joini
   }
 })
 
+test("a learner catches up for reads, stays out of quorum, and rejects writes", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "1111111111111111111111111111111111111111111111111111111111111111",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("learner-leader"))
+    const followerIdentity = generateIdentity(seed("learner-follower"))
+    const learnerIdentity = generateIdentity(seed("learner-observer"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-cluster",
+      clusterSecret,
+      machineId: "learner-voter-leader",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await leader.start()
+    nodes.push(leader)
+
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-cluster",
+      clusterSecret,
+      machineId: "learner-voter-follower",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await follower.start()
+    nodes.push(follower)
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    await waitFor(async () => leader.currentLeader() === leaderId && follower.currentLeader() === leaderId)
+
+    const leaderNode = leaderId === leaderIdentity.publicKeyId ? leader : follower
+    await leaderNode.put("hash:learner-visible", { value: "before-learner" })
+
+    const learner = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-cluster",
+      clusterSecret,
+      machineId: "learner-read-only",
+      identity: learnerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learner.start()
+    nodes.push(learner)
+
+    await waitFor(async () => {
+      const visible = await learner.get("hash:learner-visible")
+      return visible?.value?.value === "before-learner" && learner.currentLeader() === leaderId
+    })
+
+    const learnerStatus = await learner.getReplicationStatus()
+    assert.equal(learnerStatus.role, "learner")
+    assert.equal(learner.getWritersStatus().role, "learner")
+    assert.equal((await learner.getLeaderStatus()).role, "learner")
+    assert.equal(leader.getWritersStatus().authorizedNodes.length, 2)
+
+    await assert.rejects(
+      learner.put("hash:learner-write", { value: "forbidden" }),
+      (error) =>
+        error?.code === "READ_ONLY_LEARNER" &&
+        error?.leader === leaderId &&
+        /read-only learner/.test(error.message)
+    )
+    await assert.rejects(
+      learner.delete("hash:learner-visible"),
+      (error) => error?.code === "READ_ONLY_LEARNER"
+    )
+
+    await leaderNode.put("hash:learner-after", { value: "after-learner" })
+    await waitFor(async () => {
+      const replicated = await learner.get("hash:learner-after")
+      return replicated?.value?.value === "after-learner"
+    })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
 test("operation validation rejects mismatched feed metadata", () => {
   const identity = generateIdentity(seed("validation"))
   const operation = {

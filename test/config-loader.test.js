@@ -126,6 +126,33 @@ test("loadRuntimeConfig accepts explicit node transport identity overrides", asy
   }
 })
 
+test("loadRuntimeConfig allows learner configs without local voter membership", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-learner-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+    raw.role = "learner"
+    raw.identitySeed = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    raw.authorizedNodeSeeds = raw.authorizedNodeSeeds.slice(1)
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    const config = await loadRuntimeConfig(configPath)
+    assert.equal(config.role, "learner")
+    assert.equal(config.authorizedNodes.length, 2)
+    assert.equal(
+      config.authorizedNodes.some((node) => node.nodeId === config.identity.publicKeyId),
+      false
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("cluster secret derivation is deterministic and purpose-separated", async () => {
   const clusterSecret = Buffer.from(
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

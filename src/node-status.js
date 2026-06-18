@@ -3,6 +3,7 @@
  */
 export function buildNodeStatus({
   nodeId,
+  role,
   leader,
   knownHeartbeats,
   connections,
@@ -11,6 +12,7 @@ export function buildNodeStatus({
 }) {
   return {
     nodeId,
+    role,
     leader,
     knownHeartbeats,
     connections,
@@ -21,6 +23,7 @@ export function buildNodeStatus({
 
 export function buildReplicationStatus({
   nodeId,
+  role,
   leader,
   connections,
   lastDurableSequence,
@@ -34,6 +37,7 @@ export function buildReplicationStatus({
 }) {
   return {
     nodeId,
+    role,
     leader,
     connections,
     lastDurableSequence,
@@ -48,6 +52,7 @@ export function buildReplicationStatus({
 }
 
 export function buildWritersStatus({
+  role,
   currentLeader,
   revokedNodeIds,
   encryptionKeyId,
@@ -55,6 +60,7 @@ export function buildWritersStatus({
   authorizedNodes
 }) {
   return {
+    role,
     currentLeader,
     revokedNodeIds,
     encryptionKeyId,
@@ -65,12 +71,14 @@ export function buildWritersStatus({
 
 export function buildLeaderStatus({
   nodeId,
+  role,
   currentLeader,
   reachable,
   heartbeat
 }) {
   return {
     nodeId,
+    role,
     currentLeader,
     reachable,
     heartbeat

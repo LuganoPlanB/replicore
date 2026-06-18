@@ -31,6 +31,7 @@ export class HolepunchSwarmNode {
    *   dataDir: string,
    *   clusterId: string,
    *   clusterSecret?: Buffer,
+   *   role?: "voter" | "learner",
    *   machineId?: string,
    *   nodeIdentitySeed?: Buffer,
    *   topicSalt?: string,
@@ -172,15 +173,17 @@ export class HolepunchSwarmNode {
       })
     }
 
-    await this.#runHeartbeat()
-    this.heartbeatTimer = setInterval(() => {
-      void this.#runHeartbeat().catch((error) => {
-        if (!this.closing && error?.code !== "SESSION_CLOSED") {
-          throw error
-        }
-      })
-    }, this.options.heartbeatIntervalMs)
-    this.heartbeatTimer.unref?.()
+    if (!this.#isLearner()) {
+      await this.#runHeartbeat()
+      this.heartbeatTimer = setInterval(() => {
+        void this.#runHeartbeat().catch((error) => {
+          if (!this.closing && error?.code !== "SESSION_CLOSED") {
+            throw error
+          }
+        })
+      }, this.options.heartbeatIntervalMs)
+      this.heartbeatTimer.unref?.()
+    }
   }
 
   /**
@@ -198,7 +201,9 @@ export class HolepunchSwarmNode {
     if (this.closing) return
 
     await this.network?.resume()
-    await this.#runHeartbeat()
+    if (!this.#isLearner()) {
+      await this.#runHeartbeat()
+    }
   }
 
   /**
@@ -214,6 +219,7 @@ export class HolepunchSwarmNode {
   get status() {
     return buildNodeStatus({
       nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
       leader: this.currentLeader(),
       knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
       connections: this.network?.connectionCount ?? 0,
@@ -244,6 +250,9 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async put(key, value, options = {}) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "put", key, value, options })
     }
@@ -256,6 +265,9 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async delete(key, options = {}) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "delete", key, options })
     }
@@ -317,6 +329,7 @@ export class HolepunchSwarmNode {
 
     return buildReplicationStatus({
       nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
       leader: this.currentLeader(),
       connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
@@ -332,6 +345,7 @@ export class HolepunchSwarmNode {
 
   getWritersStatus() {
     return buildWritersStatus({
+      role: this.#role(),
       currentLeader: this.currentLeader(),
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
@@ -350,6 +364,7 @@ export class HolepunchSwarmNode {
 
     return buildLeaderStatus({
       nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
       currentLeader: leader,
       reachable: leader ? this.#isLeaderReachable(leader) : false,
       heartbeat: leader ? (heartbeats[leader] ?? null) : null
@@ -502,6 +517,7 @@ export class HolepunchSwarmNode {
 
   async #appendHeartbeat() {
     if (this.closing) return
+    if (this.#isLearner()) return
 
     const leader = this.currentLeader()
     const heartbeat = {
@@ -619,6 +635,9 @@ export class HolepunchSwarmNode {
   }
 
   async #forwardWrite(request) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
     if (!this.options.forwarding) {
       throw new Error("Write forwarding is disabled on this node")
     }
@@ -715,6 +734,24 @@ export class HolepunchSwarmNode {
       .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
       .filter(([nodeId]) => this.#isLeaderReachable(nodeId))
       .map(([nodeId]) => nodeId)
+  }
+
+  #role() {
+    return this.#isLearner() ? "learner" : "voter"
+  }
+
+  #isLearner() {
+    return !this.options.authorizedNodes.some(
+      (node) => node.nodeId === this.options.identity.publicKeyId
+    )
+  }
+
+  #createLearnerWriteError() {
+    const error = new Error("This node is a read-only learner and cannot accept or proxy writes")
+    error.code = "READ_ONLY_LEARNER"
+    error.statusCode = 403
+    error.leader = this.currentLeader()
+    return error
   }
 
   #isLeaderReachable(nodeId) {
