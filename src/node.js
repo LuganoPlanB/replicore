@@ -687,7 +687,7 @@ export class HolepunchSwarmNode {
     if (this.closing) return
     if (this.#isLearner()) return
 
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     if (this.closing) return
 
     try {
@@ -770,9 +770,20 @@ export class HolepunchSwarmNode {
       return
     }
 
-    if (currentLeader || this.#lastKnownLeaderId()) {
-      this.#enterSplitFence("leader-heartbeat-expired", currentLeader ?? this.#lastKnownLeaderId())
-      await this.#persistSplitState()
+    const lastKnownLeader = currentLeader ?? this.#lastKnownLeaderId()
+    if (lastKnownLeader) {
+      if (!this.#isSplitFenced()) {
+        this.#enterSplitFence("leader-heartbeat-expired", lastKnownLeader)
+        await this.#persistSplitState()
+        this.#scheduleElectionTimer()
+        return
+      }
+
+      if (await this.#canTriggerWitnessReelection(lastKnownLeader)) {
+        await this.#startElection()
+        return
+      }
+
       this.#scheduleElectionTimer()
       return
     }
@@ -1205,7 +1216,60 @@ export class HolepunchSwarmNode {
 
   #acceptsPeerConnection(nodeId) {
     if (!this.#isSplitFenced()) return true
-    return nodeId === this.#lastKnownLeaderId()
+    if (nodeId === this.#lastKnownLeaderId()) return true
+    return this.#acceptsWitnessPeerConnection(nodeId)
+  }
+
+  /**
+   * Keep witness traffic alive only for the narrow reelection path where the
+   * cluster is proving that only the leader disappeared.
+   *
+   * @param {string} nodeId
+   */
+  #acceptsWitnessPeerConnection(nodeId) {
+    if (this.splitState.reason !== "leader-heartbeat-expired") return false
+    if (this.#effectiveVoterNodeIds().length < 3) return false
+    if (nodeId === this.options.identity.publicKeyId) return false
+    if (nodeId === this.#lastKnownLeaderId()) return false
+    return this.#effectiveVoterNodeIds().includes(nodeId)
+  }
+
+  /**
+   * Allow autonomous reelection only when recent witness evidence shows the
+   * established leader disappeared and every other voter is still live.
+   *
+   * @param {string} leaderNodeId
+   */
+  async #canTriggerWitnessReelection(leaderNodeId) {
+    const voterNodeIds = this.#effectiveVoterNodeIds()
+    if (voterNodeIds.length < 3) return false
+    if (!voterNodeIds.includes(this.options.identity.publicKeyId)) return false
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return false
+
+    const witnessNodeIds = voterNodeIds.filter((nodeId) => nodeId !== leaderNodeId)
+    for (const nodeId of witnessNodeIds) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      if (!this.#isLeaderReachable(nodeId)) return false
+    }
+
+    const heartbeats = await this.view.getHeartbeats()
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    for (const nodeId of witnessNodeIds) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) return false
+      if (new Date(heartbeat.ts).getTime() < freshnessCutoff) return false
+      if (heartbeat.observedLeader !== leaderNodeId) return false
+      if (heartbeat.reachableLeader !== false) return false
+      if (
+        Number.isInteger(heartbeat.membershipVersion) &&
+        heartbeat.membershipVersion !== this.membershipState.current.version
+      ) {
+        return false
+      }
+    }
+
+    return true
   }
 
   async #persistSplitState() {

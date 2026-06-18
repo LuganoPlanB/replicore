@@ -339,7 +339,7 @@ test("startup election converges on a single leader with a persisted term", { co
   }
 })
 
-test("leader loss split-fences survivors and preserves the current term until recovery", { concurrency: false }, async () => {
+test("leader-only loss in a three-voter cluster elects a replacement after witness verification", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -380,16 +380,151 @@ test("leader loss split-fences survivors and preserves the current term until re
     nodes.splice(nodes.indexOf(firstLeaderNode), 1)
 
     await waitFor(async () => {
-      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
-      return statuses.every((status) =>
-        status.splitStatus?.fenced === true &&
-        status.splitStatus?.leaderNodeId === firstLeaderId
-      )
+      const leaders = nodes.map((node) => node.currentLeader())
+      return leaders.every((leaderId) => leaderId && leaderId !== firstLeaderId) &&
+        new Set(leaders).size === 1
     })
 
     const replacementStates = await Promise.all(nodes.map((node) => node.getConsensusState()))
-    assert.ok(replacementStates.every((state) => state.currentTerm === initialTerm))
+    assert.ok(replacementStates.every((state) => state.currentTerm > initialTerm))
     assert.ok(replacementStates.every((state) => state.currentTerm === replacementStates[0].currentTerm))
+
+    const follower = nodes.find((node) => node.currentLeader() !== node.options.identity.publicKeyId)
+    const write = await follower.put("hash:replacement-after-leader-loss", { ok: true })
+    assert.equal(write.type, "put")
+    await waitFor(async () => {
+      const values = await Promise.all(nodes.map((node) => node.get("hash:replacement-after-leader-loss")))
+      return values.every((entry) => entry?.value?.ok === true)
+    })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("two-node leader loss stays split-fenced and does not autonomously reelect", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identities = [
+      generateIdentity(seed("two-node-leader-loss-leader")),
+      generateIdentity(seed("two-node-leader-loss-follower"))
+    ]
+    const authorizedNodes = identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of identities) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "two-node-leader-loss-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    const initialTerm = (await nodes[0].getConsensusState()).currentTerm
+
+    const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
+    await firstLeaderNode.close()
+    nodes.splice(nodes.indexOf(firstLeaderNode), 1)
+
+    const survivor = nodes[0]
+    await waitFor(async () => {
+      const status = await survivor.getReplicationStatus()
+      return status.splitStatus?.fenced === true &&
+        status.splitStatus?.leaderNodeId === firstLeaderId &&
+        status.readStatus.reason === "split-fenced"
+    })
+
+    await assert.rejects(
+      survivor.put("hash:two-node-leader-loss", { blocked: true }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
+    )
+
+    await new Promise((resolve) => setTimeout(resolve, 2_500))
+
+    assert.notEqual(survivor.currentLeader(), survivor.options.identity.publicKeyId)
+    const finalState = await survivor.getConsensusState()
+    assert.equal(finalState.currentTerm, initialTerm)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("leader loss plus a second missing voter keeps the remaining voters split-fenced", { concurrency: false }, async () => {
+  const testnet = await createTestnet(4)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identities = [
+      generateIdentity(seed("blocked-reelection-leader")),
+      generateIdentity(seed("blocked-reelection-follower-1")),
+      generateIdentity(seed("blocked-reelection-follower-2")),
+      generateIdentity(seed("blocked-reelection-follower-3"))
+    ]
+    const authorizedNodes = identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of identities) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "blocked-reelection-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    const initialTerm = (await nodes[0].getConsensusState()).currentTerm
+
+    const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
+    const secondMissingNode = nodes.find((node) => node.options.identity.publicKeyId !== firstLeaderId)
+    await firstLeaderNode.close()
+    await secondMissingNode.close()
+    nodes.splice(nodes.indexOf(firstLeaderNode), 1)
+    nodes.splice(nodes.indexOf(secondMissingNode), 1)
+
+    await waitFor(async () => {
+      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
+      return statuses.every((status) =>
+        status.splitStatus?.fenced === true &&
+        status.splitStatus?.leaderNodeId === firstLeaderId &&
+        status.readStatus.reason === "split-fenced"
+      )
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 2_500))
+
+    assert.ok(nodes.every((node) => node.currentLeader() !== node.options.identity.publicKeyId))
+    const states = await Promise.all(nodes.map((node) => node.getConsensusState()))
+    assert.ok(states.every((state) => state.currentTerm === initialTerm))
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
