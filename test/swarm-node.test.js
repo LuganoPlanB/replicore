@@ -244,6 +244,98 @@ test("new and restarted followers read the same authoritative leader-log prefix"
   }
 })
 
+test("a reconnected follower truncates a divergent authoritative tail and replays the exact leader suffix", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const firstIdentity = generateIdentity(seed("authoritative-divergent-first"))
+    const secondIdentity = generateIdentity(seed("authoritative-divergent-second"))
+    const thirdIdentity = generateIdentity(seed("authoritative-divergent-third"))
+    const authorizedNodes = [firstIdentity, secondIdentity, thirdIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of [firstIdentity, secondIdentity, thirdIdentity]) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "test-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    let leaderId = null
+    await waitFor(async () => {
+      const current = nodes[0].currentLeader()
+      if (!current) return false
+      return nodes.every((node) => node.currentLeader() === current) && (leaderId = current)
+    })
+
+    const leader = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
+    const [staleFollower] = nodes.filter((node) => node !== leader)
+    assert.ok(leader)
+    assert.ok(staleFollower)
+
+    await leader.put("hash:authoritative-base", { phase: "base" })
+    await waitFor(async () => (await staleFollower.get("hash:authoritative-base"))?.value?.phase === "base")
+
+    await staleFollower.suspendNetworking()
+
+    const staleCore = staleFollower.authoritativeLogCore
+    const staleSeq = staleCore.length
+    const previousOperation = staleSeq === 0 ? null : await staleCore.get(staleSeq - 1)
+    const divergentOperation = createSignedOperation({
+      kind: "kv",
+      type: "put",
+      key: "hash:divergent-local-tail",
+      value: { phase: "divergent" },
+      seq: staleSeq,
+      term: previousOperation?.term ?? 0,
+      index: staleSeq,
+      prevIndex: previousOperation?.index ?? -1,
+      prevHash: previousOperation?.entryHash ?? null,
+      feed: staleFollower.authoritativeLogIdentity.feedKey,
+      actor: staleFollower.options.identity.publicKeyId,
+      secretKey: staleFollower.authoritativeLogIdentity.secretKey,
+      encryptionKey: staleFollower.encryption.keys[staleFollower.encryption.currentKeyId],
+      encryptionKeyId: staleFollower.encryption.currentKeyId
+    })
+    await staleCore.append(divergentOperation)
+    await staleFollower.syncAuthoritativeLog()
+    assert.equal(await staleFollower.get("hash:divergent-local-tail"), null)
+
+    await leader.put("hash:authoritative-replayed", { phase: "leader" })
+
+    await staleFollower.resumeNetworking()
+    await waitFor(async () => (await staleFollower.get("hash:authoritative-replayed"))?.value?.phase === "leader")
+
+    const leaderHistory = await leader.getHistory("hash:authoritative-replayed")
+    const followerHistory = await staleFollower.getHistory("hash:authoritative-replayed")
+    assert.equal(followerHistory.length, 1)
+    assert.equal(followerHistory[0].opId, leaderHistory[0].opId)
+
+    const staleStatus = await staleFollower.getAuthoritativeLogStatus()
+    const leaderStatus = await leader.getAuthoritativeLogStatus()
+    assert.equal(staleStatus.length, leaderStatus.length)
+    assert.equal(staleStatus.tail.at(-1)?.seq, leaderStatus.tail.at(-1)?.seq)
+    assert.equal(await staleFollower.get("hash:divergent-local-tail"), null)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test(
   "followers forward writes to the computed leader and become split-fenced when that leader disappears",
   { concurrency: false },
@@ -1793,6 +1885,10 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       "hex"
     )
     const encryptionKey = randomBytes(32)
+    const durability = {
+      requiredFollowerAcks: 1,
+      timeoutMs: 10_000
+    }
     const leaderIdentity = generateIdentity(seed("replacement-membership-leader"))
     const followerIdentity = generateIdentity(seed("replacement-membership-follower"))
     const retiredIdentity = generateIdentity(seed("replacement-membership-retired"))
@@ -1811,6 +1907,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       identity: leaderIdentity,
       authorizedNodes: initialAuthorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const followerNode = new HolepunchSwarmNode({
@@ -1821,6 +1918,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       identity: followerIdentity,
       authorizedNodes: initialAuthorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const retiredNode = new HolepunchSwarmNode({
@@ -1831,6 +1929,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       identity: retiredIdentity,
       authorizedNodes: initialAuthorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
 
@@ -1871,6 +1970,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       identity: replacementIdentity,
       authorizedNodes: [],
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     await replacement.start()
@@ -2285,6 +2385,10 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
 
   try {
     const encryptionKey = randomBytes(32)
+    const durability = {
+      requiredFollowerAcks: 1,
+      timeoutMs: 10_000
+    }
     const leaderIdentity = generateIdentity(seed("leader"))
     const followerIdentity = generateIdentity(seed("follower-1"))
     const observerIdentity = generateIdentity(seed("follower-2"))
@@ -2305,6 +2409,7 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
       identity: leaderIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const follower = new HolepunchSwarmNode({
@@ -2314,6 +2419,7 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
       identity: followerIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const observer = new HolepunchSwarmNode({
@@ -2323,6 +2429,7 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
       identity: observerIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
 

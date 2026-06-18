@@ -190,6 +190,7 @@ export class HolepunchSwarmNode {
           : this.#appendKvOperation("delete", message.request.key, undefined, message.request.options ?? {})
       },
       onVoteRequest: async (message) => this.#handleVoteRequest(message),
+      onAppendEntries: async (message) => this.#handleAppendEntries(message),
       onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
     })
     this.authoritativeLogCore = await this.#ensureAuthoritativeLogCore()
@@ -1172,6 +1173,20 @@ export class HolepunchSwarmNode {
     }
   }
 
+  async #handleAppendEntries(message) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (message.from !== message.leaderNodeId) return
+    if (this.#membershipRole(message.leaderNodeId) !== "voter") return
+    if (!Number.isInteger(message.term) || message.term < this.consensusState.currentTerm) return
+
+    if (message.term > this.consensusState.currentTerm) {
+      await this.#stepDown(message.term, message.leaderNodeId)
+    }
+
+    await this.#reconcileAuthoritativeTailFromAppendEntries(message)
+    await this.syncAuthoritativeLog()
+  }
+
   async #becomeLeader(term) {
     if (this.closing) return
     const transition = this.consensusEngine.becomeLeader({
@@ -1348,6 +1363,7 @@ export class HolepunchSwarmNode {
         )
         ackPromise.catch(() => {})
         await authoritativeCore.append(operation)
+        void this.#notifyAuthoritativeAppend(operation).catch(() => {})
         await this.syncAuthoritativeLog()
         try {
           await ackPromise
@@ -1466,6 +1482,51 @@ export class HolepunchSwarmNode {
   #recordAck(nodeId, seq) {
     if (nodeId === this.options.identity.publicKeyId) return
     this.durabilityWaiter.record(nodeId, seq)
+  }
+
+  async #notifyCurrentAuthoritativeTail(nodeId) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() !== this.options.identity.publicKeyId) return
+    if (!nodeId || nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(nodeId)) return
+
+    const operation = await this.#previousAuthoritativeOperation()
+    if (!operation) return
+    await this.#notifyAuthoritativeAppend(operation, [nodeId])
+  }
+
+  async #notifyAuthoritativeAppend(operation, targetNodeIds = null) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() !== this.options.identity.publicKeyId) return
+
+    const previousOperation = operation.prevIndex >= 0
+      ? await this.#authoritativeLogCore().get(operation.prevIndex)
+      : null
+
+    const request = {
+      term: operation.term,
+      leaderNodeId: this.options.identity.publicKeyId,
+      prevLogIndex: operation.prevIndex,
+      prevLogTerm: previousOperation?.term ?? -1,
+      prevLogHash: operation.prevHash,
+      logLength: operation.seq + 1,
+      entryHash: operation.entryHash,
+      leaderCommitIndex: this.consensusState.commitIndex
+    }
+
+    const targets = targetNodeIds
+      ? this.options.authorizedNodes.filter((node) => targetNodeIds.includes(node.nodeId))
+      : this.options.authorizedNodes
+
+    for (const node of targets) {
+      if (node.nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(node.nodeId)) continue
+      const peer = this.#peerForNodeId(node.nodeId)
+      if (!peer) continue
+      this.rpc.sendAppendEntries({
+        targetNodeId: node.nodeId,
+        peer,
+        request
+      })
+    }
   }
 
   #localCore() {
@@ -1632,9 +1693,16 @@ export class HolepunchSwarmNode {
   async #truncateUncommittedAuthoritativeTail() {
     if (!this.#usesSharedAuthoritativeLog()) return
 
-    const core = this.#authoritativeLogCore()
     const feedKey = this.#authoritativeLogFeedKey()
     const keepLength = await this.view.getApplied(feedKey)
+    await this.#truncateAuthoritativeTail(keepLength)
+  }
+
+  async #truncateAuthoritativeTail(keepLength) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const core = this.#authoritativeLogCore()
+    const feedKey = this.#authoritativeLogFeedKey()
     if (core.length > keepLength) {
       await core.truncate(keepLength)
     }
@@ -1676,8 +1744,46 @@ export class HolepunchSwarmNode {
       return
     }
 
-    await core.truncate(keepLength)
-    await this.view.discardUncommittedSuffix(feedKey, keepLength)
+    await this.#truncateAuthoritativeTail(keepLength)
+  }
+
+  async #reconcileAuthoritativeTailFromAppendEntries(message) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const leaderLength = Math.max(0, message.logLength ?? 0)
+
+    if (leaderLength < committedApplied) {
+      throw new Error("Leader append request cannot roll back the committed authoritative prefix")
+    }
+    if (core.length > leaderLength && leaderLength >= committedApplied) {
+      await this.#truncateAuthoritativeTail(leaderLength)
+    }
+
+    if (message.prevLogIndex >= 0 && core.length > message.prevLogIndex) {
+      const previousOperation = await core.get(message.prevLogIndex)
+      const previousMismatch =
+        previousOperation.term !== message.prevLogTerm ||
+        previousOperation.entryHash !== message.prevLogHash
+      if (previousMismatch) {
+        if (message.prevLogIndex < committedApplied) {
+          throw new Error("AppendEntries mismatch reached the committed authoritative prefix")
+        }
+        await this.#truncateAuthoritativeTail(committedApplied)
+      }
+    }
+
+    if (leaderLength > 0 && typeof message.entryHash === "string" && core.length >= leaderLength) {
+      const tailOperation = await core.get(leaderLength - 1)
+      if (tailOperation.entryHash !== message.entryHash) {
+        if (leaderLength - 1 < committedApplied) {
+          throw new Error("AppendEntries tail mismatch reached the committed authoritative prefix")
+        }
+        await this.#truncateAuthoritativeTail(committedApplied)
+      }
+    }
   }
 
   /**
@@ -2319,6 +2425,7 @@ export class HolepunchSwarmNode {
       core.on("peer-add", (peer) => {
         this.network?.trackPeer(true, node.nodeId, peer)
         this.rpc?.sendHello({ targetNodeId: node.nodeId, peer })
+        void this.#notifyCurrentAuthoritativeTail(node.nodeId).catch(() => {})
       })
       core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
       core.on("append", () => {
@@ -2916,6 +3023,7 @@ export class HolepunchSwarmNode {
           )
           ackPromise.catch(() => {})
           await authoritativeCore.append(operation)
+          void this.#notifyAuthoritativeAppend(operation).catch(() => {})
           await this.syncAuthoritativeLog()
           try {
             await ackPromise

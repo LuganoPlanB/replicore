@@ -1,8 +1,8 @@
 const RPC_EXTENSION = "planb-cleard-rpc-v1"
 
 /**
- * Manage internal Hypercore RPC extensions for forwarded writes and follower
- * acknowledgements.
+ * Manage internal Hypercore RPC extensions for forwarded writes, leader-log
+ * append notifications, and follower acknowledgements.
  */
 export class NodeRpcRouter {
   /**
@@ -13,10 +13,11 @@ export class NodeRpcRouter {
  *   onPeerIdentity?: (nodeId: string, peer: any) => void,
  *   onWriteRequest: (message: { request: any }) => Promise<unknown>,
  *   onVoteRequest?: (message: { term: number, candidateNodeId: string, lastLogIndex: number, lastLogTerm: number, membershipVersion?: number }) => Promise<unknown>,
+ *   onAppendEntries?: (message: { term: number, leaderNodeId: string, prevLogIndex: number, prevLogTerm: number, prevLogHash: string | null, logLength: number, entryHash: string | null, leaderCommitIndex: number }) => Promise<void>,
  *   onWriteAck: (nodeId: string, seq: number) => void
  * }} options
  */
-  constructor(options) {
+ constructor(options) {
     this.options = options
     this.extensions = new Map()
     this.inflightRequests = new Map()
@@ -56,6 +57,11 @@ export class NodeRpcRouter {
               { type: "vote-response", requestId: message.requestId, ok: true, result },
               peer
             )
+            return
+          }
+
+          if (message.type === "append-entries") {
+            await this.options.onAppendEntries?.(message)
             return
           }
 
@@ -154,6 +160,35 @@ export class NodeRpcRouter {
     )
 
     return response
+  }
+
+  /**
+   * @param {{
+   *   targetNodeId: string,
+   *   peer: any,
+   *   request: {
+   *     term: number,
+   *     leaderNodeId: string,
+   *     prevLogIndex: number,
+   *     prevLogTerm: number,
+   *     prevLogHash: string | null,
+   *     logLength: number,
+   *     entryHash: string | null,
+   *     leaderCommitIndex: number
+   *   }
+   * }} options
+   */
+  sendAppendEntries({ targetNodeId, peer, request }) {
+    if (this.closed) return
+
+    this.#extensionFor(targetNodeId)?.send(
+      {
+        type: "append-entries",
+        from: this.options.localNodeId,
+        ...request
+      },
+      peer
+    )
   }
 
   /**
