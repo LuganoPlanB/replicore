@@ -193,6 +193,10 @@ test("new and restarted followers read the same authoritative leader-log prefix"
     assert.equal(follower1Replication.authoritativeLog.feedKey, leaderLog.feedKey)
     assert.equal(follower1Replication.authoritativeLog.length, leaderLog.length)
     assert.equal(follower1Replication.authoritativeLog.term, leaderLog.term)
+    assert.equal(
+      follower1Replication.authoritativeLog.feedKey,
+      follower1Replication.feeds[leaderLog.nodeId].feedKey
+    )
 
     const leaderCoreEntry = await leader.feedCores.get(leaderId).get(forwarded.seq)
     const lateFollowerHistory = await lateFollower.getHistory("hash:authoritative-prefix")
@@ -226,6 +230,7 @@ test("new and restarted followers read the same authoritative leader-log prefix"
           restartedLog.feedKey === leaderLogStatus.feedKey &&
           restartedLog.term === leaderLogStatus.term &&
           restartedLog.length === leaderLogStatus.length &&
+          restartedReplication.authoritativeLog.nodeId === leaderLogStatus.nodeId &&
           restartedReplication.authoritativeLog.feedKey === leaderLogStatus.feedKey &&
           restartedReplication.authoritativeLog.length === leaderLogStatus.length
         )

@@ -339,26 +339,18 @@ export class HolepunchSwarmNode {
     const heartbeats = await this.view.getHeartbeats()
     const feeds = {}
     const now = Date.now()
-    const authoritativeLog = await this.getAuthoritativeLogStatus()
-    const authoritativeApplied = await this.view.getApplied(authoritativeLog.feedKey)
 
     for (const node of this.options.authorizedNodes) {
-      const core = this.feedCores.get(node.nodeId)
-      if (!core) continue
-      const applied = await this.view.getApplied(node.feedKey)
-      const staged = await this.view.getStagedSummary(node.feedKey)
-      const heartbeat = heartbeats[node.nodeId] ?? null
-      feeds[node.nodeId] = {
-        feedKey: node.feedKey,
-        length: core.length,
-        applied,
-        lag: core.length - applied,
-        staged,
-        connectedPeers: core.peers.length,
-        alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
-        heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null
-      }
+      const status = await this.#feedReplicationStatus(node.nodeId, heartbeats, now)
+      if (!status) continue
+      feeds[node.nodeId] = status
     }
+
+    const authoritativeLogNodeId = this.#authoritativeLogNodeId()
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const authoritativeReplication =
+      feeds[authoritativeLogNodeId] ??
+      (await this.#feedReplicationStatus(authoritativeLogNodeId, heartbeats, now))
 
     return buildReplicationStatus({
       nodeId: this.options.identity.publicKeyId,
@@ -372,8 +364,18 @@ export class HolepunchSwarmNode {
       },
       authoritativeLog: {
         ...authoritativeLog,
-        applied: authoritativeApplied,
-        lag: authoritativeLog.length - authoritativeApplied
+        applied: authoritativeReplication?.applied ?? 0,
+        lag: authoritativeReplication?.lag ?? authoritativeLog.length,
+        staged: authoritativeReplication?.staged ?? {
+          count: 0,
+          firstSeq: null,
+          lastSeq: null,
+          latestOpId: null,
+          latestKey: null
+        },
+        connectedPeers: authoritativeReplication?.connectedPeers ?? 0,
+        alive: authoritativeReplication?.alive ?? false,
+        heartbeatAgeMs: authoritativeReplication?.heartbeatAgeMs ?? null
       },
       splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
@@ -432,12 +434,11 @@ export class HolepunchSwarmNode {
    * leader feed while this node is fenced and reconnecting.
    */
   async getAuthoritativeLogStatus() {
-    const nodeId = this.#authoritativeLogNodeId()
-    const node = this.#getAuthorizedNode(nodeId)
-    const core = this.feedCores.get(nodeId)
+    const node = this.#authoritativeLogRecord()
+    const core = this.#authoritativeLogCore()
 
     return {
-      nodeId,
+      nodeId: node.nodeId,
       feedKey: node.feedKey,
       length: core?.length ?? 0,
       term: this.consensusState.currentTerm,
@@ -1149,6 +1150,15 @@ export class HolepunchSwarmNode {
   }
 
   /**
+   * Return the tracked Hypercore for one authorized node ID.
+   *
+   * @param {string} nodeId
+   */
+  #nodeCore(nodeId) {
+    return this.feedCores.get(nodeId) ?? null
+  }
+
+  /**
    * Resolve the authoritative cluster log node for the current storage model.
    *
    * The leader feed stays authoritative even while a disconnected node is
@@ -1157,6 +1167,42 @@ export class HolepunchSwarmNode {
    */
   #authoritativeLogNodeId() {
     return this.currentLeader() ?? this.#lastKnownLeaderId() ?? this.options.identity.publicKeyId
+  }
+
+  #authoritativeLogRecord() {
+    return this.#getAuthorizedNode(this.#authoritativeLogNodeId())
+  }
+
+  #authoritativeLogCore() {
+    return this.#nodeCore(this.#authoritativeLogNodeId())
+  }
+
+  /**
+   * Build one node/feed replication summary for diagnostics.
+   *
+   * @param {string} nodeId
+   * @param {Record<string, any>} heartbeats
+   * @param {number} now
+   */
+  async #feedReplicationStatus(nodeId, heartbeats, now) {
+    const node = this.#getAuthorizedNode(nodeId)
+    const core = this.#nodeCore(nodeId)
+    if (!core) return null
+
+    const applied = await this.view.getApplied(node.feedKey)
+    const staged = await this.view.getStagedSummary(node.feedKey)
+    const heartbeat = heartbeats[nodeId] ?? null
+
+    return {
+      feedKey: node.feedKey,
+      length: core.length,
+      applied,
+      lag: core.length - applied,
+      staged,
+      connectedPeers: core.peers.length,
+      alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
+      heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null
+    }
   }
 
   #localNodeRecord() {
