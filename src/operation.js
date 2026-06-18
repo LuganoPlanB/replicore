@@ -15,9 +15,13 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
   *   feed: string,
   *   actor: string,
  *   secretKey: Buffer,
-  *   encryptionKey: Buffer,
+ *   encryptionKey: Buffer,
   *   encryptionKeyId?: string,
  *   ttlMs?: number,
+ *   term?: number,
+ *   index?: number,
+ *   prevIndex?: number,
+ *   prevHash?: string | null,
  *   kind?: "kv" | "heartbeat",
  *   heartbeat?: null | {
  *     observedLeader: string | null,
@@ -32,6 +36,7 @@ export function createSignedOperation(input) {
   const ts = new Date().toISOString()
   const expiresAt = new Date(Date.now() + (input.ttlMs ?? 1000 * 60 * 60 * 24 * 30 * 6)).toISOString()
   const kind = input.kind ?? "kv"
+  const index = input.index ?? input.seq
   const value =
     kind === "kv" && input.type === "put"
       ? {
@@ -44,6 +49,10 @@ export function createSignedOperation(input) {
     v: 1,
     kind,
     feed: input.feed,
+    term: input.term ?? 0,
+    index,
+    prevIndex: input.prevIndex ?? (index === 0 ? -1 : index - 1),
+    prevHash: input.prevHash ?? null,
     seq: input.seq,
     type: input.type,
     key: input.key,
@@ -56,11 +65,13 @@ export function createSignedOperation(input) {
   }
 
   const unsignedBytes = Buffer.from(canonicalize(unsigned))
-  const opId = createHash("sha256").update(unsignedBytes).digest("hex")
+  const entryHash = createHash("sha256").update(unsignedBytes).digest("hex")
+  const opId = entryHash
   const signature = signPayload(input.secretKey, unsignedBytes)
 
   return {
     ...unsigned,
+    entryHash,
     opId,
     signature
   }
@@ -72,12 +83,12 @@ export function createSignedOperation(input) {
  * @returns {boolean}
  */
 export function verifySignedOperation(operation, publicKey) {
-  const { signature, opId, ...unsigned } = operation
-  if (typeof signature !== "string" || typeof opId !== "string") return false
+  const { signature, opId, entryHash, ...unsigned } = operation
+  if (typeof signature !== "string" || typeof opId !== "string" || typeof entryHash !== "string") return false
 
   const unsignedBytes = Buffer.from(canonicalize(unsigned))
-  const expectedOpId = createHash("sha256").update(unsignedBytes).digest("hex")
-  if (expectedOpId !== opId) return false
+  const expectedEntryHash = createHash("sha256").update(unsignedBytes).digest("hex")
+  if (expectedEntryHash !== entryHash || expectedEntryHash !== opId) return false
 
   return verifyPayload(publicKey, unsignedBytes, signature)
 }
@@ -110,8 +121,40 @@ export function validateOperation(operation, expected, options = {}) {
     throw new Error("Operation sequence must be a non-negative integer")
   }
 
-  if (typeof operation.opId !== "string" || typeof operation.signature !== "string") {
-    throw new Error("Operation must include opId and signature")
+  if (typeof operation.term !== "number" || operation.term < 0 || !Number.isInteger(operation.term)) {
+    throw new Error("Operation term must be a non-negative integer")
+  }
+
+  if (typeof operation.index !== "number" || operation.index < 0 || !Number.isInteger(operation.index)) {
+    throw new Error("Operation logical index must be a non-negative integer")
+  }
+
+  if (operation.index !== operation.seq) {
+    throw new Error(`Operation logical index mismatch: expected ${operation.seq}`)
+  }
+
+  if (typeof operation.prevIndex !== "number" || !Number.isInteger(operation.prevIndex)) {
+    throw new Error("Operation previous index must be an integer")
+  }
+
+  if (operation.index === 0) {
+    if (operation.prevIndex !== -1) {
+      throw new Error("Genesis operation must use prevIndex=-1")
+    }
+    if (operation.prevHash !== null) {
+      throw new Error("Genesis operation must use prevHash=null")
+    }
+  } else {
+    if (operation.prevIndex !== operation.index - 1) {
+      throw new Error(`Operation previous index mismatch: expected ${operation.index - 1}`)
+    }
+    if (typeof operation.prevHash !== "string" || operation.prevHash.length === 0) {
+      throw new Error("Non-genesis operation must include prevHash")
+    }
+  }
+
+  if (typeof operation.entryHash !== "string" || typeof operation.opId !== "string" || typeof operation.signature !== "string") {
+    throw new Error("Operation must include entryHash, opId, and signature")
   }
 
   if (operation.kind === "heartbeat") {
@@ -142,6 +185,53 @@ export function validateOperation(operation, expected, options = {}) {
 
   if (operation.type === "delete" && operation.value !== null) {
     throw new Error("Delete operation must store a null value payload")
+  }
+}
+
+/**
+ * Validate one operation against the previously accepted entry in the same
+ * physical feed.
+ *
+ * @param {Record<string, unknown>} operation
+ * @param {Record<string, unknown> | null} previousOperation
+ * @param {number} slot
+ */
+export function validateLogLink(operation, previousOperation, slot) {
+  if (operation.index !== slot) {
+    throw new Error(`Operation feed slot mismatch: expected logical index ${slot}`)
+  }
+
+  if (slot === 0) {
+    if (previousOperation !== null) {
+      throw new Error("Genesis operation cannot have a previous entry")
+    }
+    return
+  }
+
+  if (!previousOperation) {
+    throw new Error(`Missing previous operation for slot ${slot}`)
+  }
+
+  if (previousOperation.index !== slot - 1) {
+    throw new Error(`Previous operation index mismatch at slot ${slot}`)
+  }
+
+  if (operation.prevIndex !== previousOperation.index) {
+    throw new Error(`Operation previous index does not match slot ${slot - 1}`)
+  }
+
+  if (operation.prevHash !== previousOperation.entryHash) {
+    const error = new Error(`Operation previous hash mismatch at slot ${slot}`)
+    error.code = "LOG_MISMATCH"
+    error.lastMatchingIndex = previousOperation.index
+    throw error
+  }
+
+  if (operation.term < previousOperation.term) {
+    const error = new Error(`Operation term regression at slot ${slot}`)
+    error.code = "LOG_MISMATCH"
+    error.lastMatchingIndex = previousOperation.index
+    throw error
   }
 }
 

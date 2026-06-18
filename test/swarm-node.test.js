@@ -12,6 +12,7 @@ import {
   generateIdentity,
   HolepunchHttpServer,
   HolepunchSwarmNode,
+  validateLogLink,
   validateOperation
 } from "../src/index.js"
 import { waitFor } from "./helpers/eventual.js"
@@ -334,8 +335,13 @@ test("operation validation rejects mismatched feed metadata", () => {
   const operation = {
     v: 1,
     kind: "kv",
+    entryHash: "x",
     opId: "x",
     signature: "y",
+    term: 0,
+    index: 0,
+    prevIndex: -1,
+    prevHash: null,
     feed: "wrong-feed",
     seq: 0,
     type: "delete",
@@ -354,6 +360,38 @@ test("operation validation rejects mismatched feed metadata", () => {
       feedKey: identity.feedKey
     })
   }, /feed mismatch/)
+})
+
+test("operation validation rejects inconsistent logical log metadata", () => {
+  const identity = generateIdentity(seed("validation-log"))
+  const operation = {
+    v: 1,
+    kind: "kv",
+    entryHash: "hash",
+    opId: "hash",
+    signature: "sig",
+    term: 0,
+    index: 1,
+    prevIndex: -1,
+    prevHash: null,
+    feed: identity.feedKey,
+    seq: 0,
+    type: "delete",
+    key: "hash:key",
+    keyspace: "default",
+    value: null,
+    heartbeat: null,
+    ts: new Date().toISOString(),
+    expiresAt: new Date().toISOString(),
+    actor: identity.publicKeyId
+  }
+
+  assert.throws(() => {
+    validateOperation(operation, {
+      nodeId: identity.publicKeyId,
+      feedKey: identity.feedKey
+    })
+  }, /logical index mismatch/)
 })
 
 test("operation validation rejects revoked writers", () => {
@@ -380,6 +418,95 @@ test("operation validation rejects revoked writers", () => {
       { revokedNodeIds: new Set([identity.publicKeyId]) }
     )
   }, /revoked/)
+})
+
+test("logical log link validation rejects previous hash mismatch", () => {
+  const previous = {
+    index: 0,
+    entryHash: "expected-hash",
+    term: 2
+  }
+  const operation = {
+    index: 1,
+    prevIndex: 0,
+    prevHash: "wrong-hash",
+    term: 2
+  }
+
+  assert.throws(() => {
+    validateLogLink(operation, previous, 1)
+  }, /previous hash mismatch/)
+})
+
+test("sync rejects a feed entry with a bad previous hash", { concurrency: false }, async () => {
+  await withStandaloneNode(seed("bad-prev-hash"), async ({ node, identity }) => {
+    const localCore = node.feedCores.get(identity.publicKeyId)
+    const slot = localCore.length
+    const previous = slot === 0 ? null : await localCore.get(slot - 1)
+    const operation = createSignedOperation({
+      kind: "heartbeat",
+      type: "put",
+      key: `heartbeat:${identity.publicKeyId}`,
+      keyspace: "system",
+      seq: slot,
+      term: 0,
+      index: slot,
+      prevIndex: previous?.index ?? -1,
+      prevHash: "bad-prev-hash",
+      feed: identity.feedKey,
+      actor: identity.publicKeyId,
+      secretKey: identity.secretKey,
+      encryptionKey: randomBytes(32),
+      heartbeat: {
+        observedLeader: identity.publicKeyId,
+        reachableLeader: true,
+        appliedFeeds: {},
+        rejectedFeeds: {},
+        membershipFingerprint: "fingerprint"
+      }
+    })
+
+    await localCore.append(operation)
+
+    await assert.rejects(node.syncFeed(identity.publicKeyId), /previous hash mismatch/)
+  })
+})
+
+test("sync rejects a feed entry with a corrupted signature", { concurrency: false }, async () => {
+  await withStandaloneNode(seed("bad-signature"), async ({ node, identity }) => {
+    const localCore = node.feedCores.get(identity.publicKeyId)
+    const slot = localCore.length
+    const previous = slot === 0 ? null : await localCore.get(slot - 1)
+    const operation = createSignedOperation({
+      kind: "heartbeat",
+      type: "put",
+      key: `heartbeat:${identity.publicKeyId}`,
+      keyspace: "system",
+      seq: slot,
+      term: 0,
+      index: slot,
+      prevIndex: previous?.index ?? -1,
+      prevHash: previous?.entryHash ?? null,
+      feed: identity.feedKey,
+      actor: identity.publicKeyId,
+      secretKey: identity.secretKey,
+      encryptionKey: randomBytes(32),
+      heartbeat: {
+        observedLeader: identity.publicKeyId,
+        reachableLeader: true,
+        appliedFeeds: {},
+        rejectedFeeds: {},
+        membershipFingerprint: "fingerprint"
+      }
+    })
+
+    await localCore.append({
+      ...operation,
+      signature: operation.signature.replace(/.$/, operation.signature.endsWith("a") ? "b" : "a")
+    })
+
+    await assert.rejects(node.syncFeed(identity.publicKeyId), /Invalid operation/)
+  })
 })
 
 test(
@@ -1169,6 +1296,37 @@ async function createFollower(options) {
   })
   await follower.start()
   return follower
+}
+
+async function withStandaloneNode(identitySeed, run) {
+  const dirs = []
+  const identity = generateIdentity(identitySeed)
+  const authorizedNodes = [
+    {
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }
+  ]
+  const encryptionKey = randomBytes(32)
+  let node = null
+
+  try {
+    node = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "standalone-node",
+      topicSalt: "standalone-node",
+      identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: []
+    })
+    await node.start()
+    await run({ node, identity })
+  } finally {
+    await Promise.allSettled([node?.close()].filter(Boolean))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
 }
 
 function seed(label) {

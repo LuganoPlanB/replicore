@@ -15,6 +15,7 @@ export { HolepunchHttpServer } from "./http-server.js"
 export {
   createSignedOperation,
   decryptOperationValue,
+  validateLogLink,
   validateOperation,
   verifySignedOperation
 } from "./operation.js"

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { HolepunchHttpServer } from "../src/index.js"
+import { HolepunchHttpServer, validateLogLink } from "../src/index.js"
 import {
   assertClusterValue,
   collectClusterDiagnostics,
@@ -1325,6 +1325,7 @@ test("isolated leader blocks minority writes while connected followers continue 
     const isolatedHistory = await originalLeader.getHistory("hash:partition-during")
     assert.equal(isolatedHistory.length, 1)
     assert.equal(isolatedHistory[0].opId, duringIsolation.opId)
+    await assertFeedChainValid(originalLeader, expectedConnectedLeaderId)
     assert.equal(afterHeal.actor, originalLeaderId)
     assert.ok(afterHeal.opId)
 
@@ -1478,6 +1479,7 @@ test(
       const history = await originalLeader.getHistory("hash:subgroup-during")
       assert.equal(history.length, 1)
       assert.equal(history[0].opId, duringPartition.opId)
+      await assertFeedChainValid(originalLeader, majorityLeaderId)
 
       await assertClusterInvariants(cluster)
     } finally {
@@ -2597,6 +2599,17 @@ async function assertClusterInvariants(cluster) {
       assert.ok(feed.applied <= feed.length)
       assert.ok(feed.lag >= 0)
     }
+  }
+}
+
+async function assertFeedChainValid(node, sourceNodeId) {
+  const core = node.feedCores.get(sourceNodeId)
+  let previous = null
+
+  for (let slot = 0; slot < core.length; slot += 1) {
+    const operation = await core.get(slot)
+    validateLogLink(operation, previous, slot)
+    previous = operation
   }
 }
 

@@ -11,6 +11,7 @@ import { DurabilityWaiter } from "./durability-waiter.js"
 import {
   createSignedOperation,
   decryptOperationValue,
+  validateLogLink,
   validateOperation,
   verifySignedOperation
 } from "./operation.js"
@@ -448,6 +449,8 @@ export class HolepunchSwarmNode {
       if (!verifySignedOperation(operation, node.publicKey)) {
         throw new Error(`Invalid operation at sequence ${rawApplied} for ${nodeId}`)
       }
+      const previousOperation = rawApplied === 0 ? null : await core.get(rawApplied - 1)
+      validateLogLink(operation, previousOperation, rawApplied)
       if (operation.kind === "heartbeat") {
         await this.view.applyHeartbeat(operation, node.feedKey)
         await this.view.setRawProgress(node.feedKey, {
@@ -502,12 +505,17 @@ export class HolepunchSwarmNode {
 
     try {
       await this.#withLocalAppendLock(async () => {
+        const previousOperation = await this.#previousLocalOperation()
         const operation = createSignedOperation({
           kind: "heartbeat",
           type: "put",
           key: `heartbeat:${this.options.identity.publicKeyId}`,
           keyspace: "system",
           seq: this.#localCore().length,
+          term: this.consensusState.currentTerm,
+          index: this.#localCore().length,
+          prevIndex: previousOperation?.index ?? -1,
+          prevHash: previousOperation?.entryHash ?? null,
           feed: this.options.identity.feedKey,
           actor: this.options.identity.publicKeyId,
           secretKey: this.options.identity.secretKey,
@@ -557,6 +565,7 @@ export class HolepunchSwarmNode {
     let operation = null
     let ackPromise = null
     await this.#withLocalAppendLock(async () => {
+      const previousOperation = await this.#previousLocalOperation()
       operation = createSignedOperation({
         kind: "kv",
         type,
@@ -564,6 +573,10 @@ export class HolepunchSwarmNode {
         keyspace: options.keyspace,
         value,
         seq: this.#localCore().length,
+        term: this.consensusState.currentTerm,
+        index: this.#localCore().length,
+        prevIndex: previousOperation?.index ?? -1,
+        prevHash: previousOperation?.entryHash ?? null,
         feed: this.options.identity.feedKey,
         actor: this.options.identity.publicKeyId,
         secretKey: this.options.identity.secretKey,
@@ -663,6 +676,12 @@ export class HolepunchSwarmNode {
     } finally {
       release()
     }
+  }
+
+  async #previousLocalOperation() {
+    const core = this.#localCore()
+    if (core.length === 0) return null
+    return core.get(core.length - 1)
   }
 
   #getAuthorizedNode(nodeId) {
