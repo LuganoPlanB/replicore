@@ -102,10 +102,14 @@ export class SwarmNetwork {
   }
 
   networkStatus() {
+    const learnerCandidates = []
     const connectedNodeIds = new Set(
-      [...this.connections]
-        .map((conn) => this.remoteNodeIdsByConnectionKey.get(this.#connectionKey(conn.remotePublicKey)))
-        .filter(Boolean)
+      [...this.connections].flatMap((conn) => {
+        const connectionKey = this.#connectionKey(conn.remotePublicKey)
+        const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
+        if (!remoteNodeId && connectionKey) learnerCandidates.push(connectionKey)
+        return remoteNodeId ? [remoteNodeId] : []
+      })
     )
 
     const peers = {}
@@ -120,6 +124,7 @@ export class SwarmNetwork {
     return {
       policyActive: Boolean(this.networkPolicy),
       allowedNodeIds: this.#allowedNodeIds(),
+      learnerCandidates: learnerCandidates.sort(),
       peers
     }
   }

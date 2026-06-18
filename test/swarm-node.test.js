@@ -417,6 +417,118 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
   }
 })
 
+test("same-secret unknown peers are surfaced as learner candidates without joining membership", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "hex"
+    )
+    const wrongSecret = Buffer.from(
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const firstIdentity = generateIdentity(seed("learner-candidate-first"))
+    const secondIdentity = generateIdentity(seed("learner-candidate-second"))
+    const thirdIdentity = generateIdentity(seed("learner-candidate-third"))
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-candidate-cluster",
+      clusterSecret,
+      machineId: "learner-machine-first",
+      identity: firstIdentity,
+      authorizedNodes: [
+        {
+          nodeId: firstIdentity.publicKeyId,
+          publicKey: firstIdentity.publicKey,
+          feedKey: firstIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await first.start()
+    nodes.push(first)
+
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-candidate-cluster",
+      clusterSecret,
+      machineId: "learner-machine-second",
+      identity: secondIdentity,
+      authorizedNodes: [
+        {
+          nodeId: secondIdentity.publicKeyId,
+          publicKey: secondIdentity.publicKey,
+          feedKey: secondIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await second.start()
+    nodes.push(second)
+
+    const wrongSecretNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-candidate-cluster",
+      clusterSecret: wrongSecret,
+      machineId: "learner-machine-third",
+      identity: thirdIdentity,
+      authorizedNodes: [
+        {
+          nodeId: thirdIdentity.publicKeyId,
+          publicKey: thirdIdentity.publicKey,
+          feedKey: thirdIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await wrongSecretNode.start()
+    nodes.push(wrongSecretNode)
+
+    await waitFor(async () => {
+      const firstStatus = await first.getReplicationStatus()
+      const secondStatus = await second.getReplicationStatus()
+      return (
+        firstStatus.connections > 0 &&
+        secondStatus.connections > 0 &&
+        firstStatus.network.learnerCandidates.includes(second.transportIdentity.publicKeyHex) &&
+        secondStatus.network.learnerCandidates.includes(first.transportIdentity.publicKeyHex)
+      )
+    })
+
+    const firstStatus = await first.getReplicationStatus()
+    const secondStatus = await second.getReplicationStatus()
+    const wrongSecretStatus = await wrongSecretNode.getReplicationStatus()
+
+    assert.deepEqual(firstStatus.membership.mismatchedNodeIds, [])
+    assert.deepEqual(secondStatus.membership.mismatchedNodeIds, [])
+    assert.deepEqual(firstStatus.network.learnerCandidates, [second.transportIdentity.publicKeyHex])
+    assert.deepEqual(secondStatus.network.learnerCandidates, [first.transportIdentity.publicKeyHex])
+    assert.equal(firstStatus.knownPeerNodeIds.length, 1)
+    assert.equal(secondStatus.knownPeerNodeIds.length, 1)
+    assert.equal(wrongSecretStatus.connections, 0)
+    assert.deepEqual(wrongSecretStatus.network.learnerCandidates, [])
+
+    await first.put("hash:learner-candidate", { state: "leader-only" })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(await second.get("hash:learner-candidate"), null)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
 test("operation validation rejects mismatched feed metadata", () => {
   const identity = generateIdentity(seed("validation"))
   const operation = {
@@ -589,7 +701,11 @@ test("sync rejects a feed entry with a corrupted signature", { concurrency: fals
 
     await localCore.append({
       ...operation,
-      signature: operation.signature.replace(/.$/, operation.signature.endsWith("a") ? "b" : "a")
+      signature: (() => {
+        const signature = Buffer.from(operation.signature, "base64url")
+        signature[0] ^= 0x01
+        return signature.toString("base64url")
+      })()
     })
 
     await assert.rejects(node.syncFeed(identity.publicKeyId), /Invalid operation/)
