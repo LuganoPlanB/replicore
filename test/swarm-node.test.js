@@ -71,6 +71,13 @@ test("leader operations replicate to followers and rebuild after restart", { con
     })
     nodes.push(follower2)
 
+    const leaderId = [leaderIdentity, follower1Identity, follower2Identity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    await waitFor(async () => leader.currentLeader() === leaderId)
+    await waitFor(async () => follower1.currentLeader() === leaderId)
+    await waitFor(async () => follower2.currentLeader() === leaderId)
+
     const putOp = await leader.put("hash:alpha", { message: "hello" })
 
     await waitFor(async () => (await follower1.get("hash:alpha"))?.value?.message === "hello")
@@ -175,18 +182,26 @@ test(
     nodes.splice(nodes.indexOf(currentLeaderNode), 1)
     const survivingObserver = nodes[0]
 
-    const expectedNextLeader = [leaderIdentity, follower1Identity, follower2Identity]
-      .map((identity) => identity.publicKeyId)
-      .filter((nodeId) => nodeId !== leaderId)
-      .sort()[0]
+    let electedLeaderId = null
+    await waitFor(async () => {
+      const leaders = nodes.map((node) => node.currentLeader())
+      if (leaders.some((value) => value === null || value === leaderId)) return false
+      const uniqueLeaders = [...new Set(leaders)]
+      if (uniqueLeaders.length !== 1) return false
+      electedLeaderId = uniqueLeaders[0]
+      return true
+    }, {
+      description: "surviving nodes converge on one new leader",
+      onTimeout: () => survivingObserver.getReplicationStatus()
+    })
 
-    const nextLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedNextLeader)
+    const forwardingNode = nodes.find((node) => node.options.identity.publicKeyId !== electedLeaderId)
     let result = null
     await waitFor(
       async () => {
         try {
-          result = await nextLeaderNode.put("hash:gamma", { failover: true })
-          return result.actor === expectedNextLeader
+          result = await forwardingNode.put("hash:gamma", { failover: true })
+          return result.actor === electedLeaderId
         } catch {
           return false
         }
@@ -197,7 +212,7 @@ test(
       }
     )
 
-    assert.equal(result.actor, expectedNextLeader)
+    assert.equal(result.actor, electedLeaderId)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -267,11 +282,16 @@ test("history keeps actor audit data and logical index order across leader failo
     await firstLeaderNode.close()
     nodes.splice(nodes.indexOf(firstLeaderNode), 1)
 
-    const secondLeaderId = nodes
-      .map((node) => node.options.identity.publicKeyId)
-      .sort()[0]
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return (
+        leaderIds[0] !== null &&
+        leaderIds[0] !== firstLeaderId &&
+        leaderIds.every((leaderId) => leaderId === leaderIds[0])
+      )
+    })
+    const secondLeaderId = nodes[0].currentLeader()
     const secondLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === secondLeaderId)
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === secondLeaderId))
 
     const secondWrite = await secondLeaderNode.put("hash:history-order", { phase: "after" })
     await waitFor(async () => {
@@ -288,6 +308,165 @@ test("history keeps actor audit data and logical index order across leader failo
     assert.ok(history[0].index < history[1].index)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("startup election converges on a single leader with a persisted term", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identities = [
+      generateIdentity(seed("election-startup-leader")),
+      generateIdentity(seed("election-startup-follower-1")),
+      generateIdentity(seed("election-startup-follower-2"))
+    ]
+    const authorizedNodes = identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of identities) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "election-startup-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    const expectedLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === expectedLeaderId))
+
+    const states = await Promise.all(nodes.map((node) => node.getConsensusState()))
+    assert.ok(states.every((state) => state.currentTerm >= 1))
+    assert.ok(states.every((state) => state.currentTerm === states[0].currentTerm))
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("leader failover elects one replacement and increments the term", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identities = [
+      generateIdentity(seed("election-failover-leader")),
+      generateIdentity(seed("election-failover-follower-1")),
+      generateIdentity(seed("election-failover-follower-2"))
+    ]
+    const authorizedNodes = identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of identities) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "election-failover-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    const initialTerm = (await nodes[0].getConsensusState()).currentTerm
+
+    const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
+    await firstLeaderNode.close()
+    nodes.splice(nodes.indexOf(firstLeaderNode), 1)
+
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return (
+        leaderIds[0] !== null &&
+        leaderIds[0] !== firstLeaderId &&
+        leaderIds.every((leaderId) => leaderId === leaderIds[0])
+      )
+    })
+    const replacementLeaderId = nodes[0].currentLeader()
+
+    const replacementStates = await Promise.all(nodes.map((node) => node.getConsensusState()))
+    assert.ok(replacementStates.every((state) => state.currentTerm > initialTerm))
+    assert.ok(replacementStates.every((state) => state.currentTerm === replacementStates[0].currentTerm))
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("consensus state persists votedFor across restart", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identity = generateIdentity(seed("election-persisted-vote"))
+    const peerIdentity = generateIdentity(seed("election-persisted-peer"))
+    const authorizedNodes = [identity, peerIdentity].map((entry) => ({
+      nodeId: entry.publicKeyId,
+      publicKey: entry.publicKey,
+      feedKey: entry.feedKey
+    }))
+
+    const dataDir = await tempDir(dirs)
+    let node = new HolepunchSwarmNode({
+      dataDir,
+      clusterId: "election-persisted-cluster",
+      topicSalt: "test-salt",
+      identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await node.start()
+
+    await node.setConsensusState({
+      currentTerm: 7,
+      votedFor: peerIdentity.publicKeyId
+    })
+    await node.close()
+
+    node = new HolepunchSwarmNode({
+      dataDir,
+      clusterId: "election-persisted-cluster",
+      topicSalt: "test-salt",
+      identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await node.start()
+
+    const state = await node.getConsensusState()
+    assert.equal(state.currentTerm, 7)
+    assert.equal(state.votedFor, peerIdentity.publicKeyId)
+
+    await node.close()
+  } finally {
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
@@ -576,10 +755,14 @@ test("a learner can join through the leader control channel, catch up, and later
     await secondVoter.start()
     nodes.push(secondVoter)
 
-    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    await waitFor(async () => {
+      const firstLeader = firstVoter.currentLeader()
+      const secondLeader = secondVoter.currentLeader()
+      return firstLeader !== null && firstLeader === secondLeader
+    })
+    const leaderId = firstVoter.currentLeader()
     const leader = leaderId === leaderIdentity.publicKeyId ? firstVoter : secondVoter
     const follower = leader === firstVoter ? secondVoter : firstVoter
-    await waitFor(async () => firstVoter.currentLeader() === leaderId && secondVoter.currentLeader() === leaderId)
     await leader.put("hash:join-before", { value: "before-join" })
 
     const learner = new HolepunchSwarmNode({
@@ -608,6 +791,7 @@ test("a learner can join through the leader control channel, catch up, and later
       voters.map((entry) => entry.nodeId).sort()
     )
     assert.equal(leader.getWritersStatus().authorizedNodes.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
+    const promotionWindow = nextCredentialWindow()
 
     const credential = createPromotionCredential({
       payload: {
@@ -618,8 +802,8 @@ test("a learner can join through the leader control channel, catch up, and later
         learnerNodeId: learnerIdentity.publicKeyId,
         learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
         targetRole: "voter",
-        issuedAt: "2026-06-18T14:00:00.000Z",
-        expiresAt: "2026-06-18T15:00:00.000Z",
+        issuedAt: promotionWindow.issuedAt,
+        expiresAt: promotionWindow.expiresAt,
         nonce: "join-flow-promotion",
         signerNodeId: leaderIdentity.publicKeyId
       },
@@ -812,10 +996,14 @@ test("a live learner connection does not satisfy voter durability after a follow
     await secondVoter.start()
     nodes.push(secondVoter)
 
-    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    await waitFor(async () => {
+      const firstLeader = firstVoter.currentLeader()
+      const secondLeader = secondVoter.currentLeader()
+      return firstLeader !== null && firstLeader === secondLeader
+    })
+    const leaderId = firstVoter.currentLeader()
     const leaderNode = leaderId === leaderIdentity.publicKeyId ? firstVoter : secondVoter
     const followerNode = leaderNode === firstVoter ? secondVoter : firstVoter
-    await waitFor(async () => firstVoter.currentLeader() === leaderId && secondVoter.currentLeader() === leaderId)
     await leaderNode.put("hash:learner-durability-baseline", { value: "ready" })
 
     const learner = new HolepunchSwarmNode({
@@ -903,9 +1091,13 @@ test("a learner can store a valid promotion credential without becoming a voter 
     await follower.start()
     nodes.push(follower)
 
-    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    await waitFor(async () => {
+      const leaderNodeId = leader.currentLeader()
+      const followerLeaderId = follower.currentLeader()
+      return leaderNodeId !== null && leaderNodeId === followerLeaderId
+    })
+    const leaderId = leader.currentLeader()
     const leaderNode = leaderId === leaderIdentity.publicKeyId ? leader : follower
-    await waitFor(async () => leader.currentLeader() === leaderId && follower.currentLeader() === leaderId)
     await leaderNode.put("hash:promotion-baseline", { value: "ready" })
 
     const learner = new HolepunchSwarmNode({
@@ -920,6 +1112,7 @@ test("a learner can store a valid promotion credential without becoming a voter 
     })
     await learner.start()
     nodes.push(learner)
+    const earlyCredentialWindow = nextCredentialWindow()
 
     const earlyCredential = createPromotionCredential({
       payload: {
@@ -930,8 +1123,8 @@ test("a learner can store a valid promotion credential without becoming a voter 
         learnerNodeId: learnerIdentity.publicKeyId,
         learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
         targetRole: "voter",
-        issuedAt: "2026-06-18T10:00:00.000Z",
-        expiresAt: "2026-06-18T11:00:00.000Z",
+        issuedAt: earlyCredentialWindow.issuedAt,
+        expiresAt: earlyCredentialWindow.expiresAt,
         nonce: "promotion-early",
         signerNodeId: leaderIdentity.publicKeyId
       },
@@ -944,6 +1137,7 @@ test("a learner can store a valid promotion credential without becoming a voter 
       const visible = await learner.get("hash:promotion-baseline")
       return visible?.value?.value === "ready"
     })
+    const credentialWindow = nextCredentialWindow()
 
     const credential = createPromotionCredential({
       payload: {
@@ -954,8 +1148,8 @@ test("a learner can store a valid promotion credential without becoming a voter 
         learnerNodeId: learnerIdentity.publicKeyId,
         learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
         targetRole: "voter",
-        issuedAt: "2026-06-18T10:00:00.000Z",
-        expiresAt: "2026-06-18T11:00:00.000Z",
+        issuedAt: credentialWindow.issuedAt,
+        expiresAt: credentialWindow.expiresAt,
         nonce: "promotion-valid",
         signerNodeId: leaderIdentity.publicKeyId
       },
@@ -1125,6 +1319,7 @@ test("a removed voter cannot regain write authority or satisfy durability after 
       restartedRemovedNode.put("hash:removed-restart-write", { value: "still-forbidden" }),
       (error) =>
         error?.code === "READ_ONLY_LEARNER" ||
+        /No current leader is available/.test(error?.message ?? "") ||
         /Durability requirement not met/.test(error?.message ?? "")
     )
 
@@ -1242,6 +1437,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       const value = await replacement.get("hash:replacement-membership-before")
       return value?.value?.value === "before-replacement"
     })
+    const replacementPromotionWindow = nextCredentialWindow()
 
     const credential = createPromotionCredential({
       payload: {
@@ -1252,8 +1448,8 @@ test("a replacement learner can join after removal, be promoted, and restore dur
         learnerNodeId: replacementIdentity.publicKeyId,
         learnerNoisePublicKey: replacement.transportIdentity.publicKeyHex,
         targetRole: "voter",
-        issuedAt: "2026-06-18T16:00:00.000Z",
-        expiresAt: "2026-06-18T17:00:00.000Z",
+        issuedAt: replacementPromotionWindow.issuedAt,
+        expiresAt: replacementPromotionWindow.expiresAt,
         nonce: "replacement-membership-promotion",
         signerNodeId: leaderIdentity.publicKeyId
       },
@@ -1906,11 +2102,14 @@ test("concurrent leader appends keep signed sequence equal to feed slot", { conc
     await first.start()
     await second.start()
 
-    const leaderId = [firstIdentity, secondIdentity].map((identity) => identity.publicKeyId).sort()[0]
+    await waitFor(async () => {
+      const firstLeader = first.currentLeader()
+      const secondLeader = second.currentLeader()
+      return firstLeader !== null && firstLeader === secondLeader
+    })
+    const leaderId = first.currentLeader()
     const leader = first.options.identity.publicKeyId === leaderId ? first : second
     const follower = leader === first ? second : first
-    await waitFor(async () => first.currentLeader() === leaderId)
-    await waitFor(async () => second.currentLeader() === leaderId)
 
     const writes = await Promise.all(
       Array.from({ length: 5 }, (_, index) => leader.put(`hash:append-lock-${index}`, { index }))
@@ -2306,6 +2505,15 @@ async function withStandaloneNode(identitySeed, run) {
 
 function seed(label) {
   return createHash("sha256").update(label).digest()
+}
+
+function nextCredentialWindow() {
+  const issuedAt = new Date(Date.now() - 60_000)
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000)
+  return {
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: expiresAt.toISOString()
+  }
 }
 
 /**

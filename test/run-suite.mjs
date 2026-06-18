@@ -3,6 +3,10 @@ import { spawn } from "node:child_process"
 const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "180000")
 const steps = [
   {
+    label: "raft-engine",
+    args: ["--test", "--test-concurrency=1", "test/raft-engine.test.js"]
+  },
+  {
     label: "config-loader",
     args: ["--test", "--test-concurrency=1", "test/config-loader.test.js"]
   },

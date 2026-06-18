@@ -12,6 +12,7 @@ export class NodeRpcRouter {
  *   ackDelayMs?: number,
  *   onPeerIdentity?: (nodeId: string, peer: any) => void,
  *   onWriteRequest: (message: { request: any }) => Promise<unknown>,
+ *   onVoteRequest?: (message: { term: number, candidateNodeId: string, lastLogIndex: number, lastLogTerm: number, membershipVersion?: number }) => Promise<unknown>,
  *   onWriteAck: (nodeId: string, seq: number) => void
  * }} options
  */
@@ -49,7 +50,21 @@ export class NodeRpcRouter {
             return
           }
 
+          if (message.type === "vote-request") {
+            const result = await this.options.onVoteRequest?.(message)
+            this.#extensionFor(message.from)?.send(
+              { type: "vote-response", requestId: message.requestId, ok: true, result },
+              peer
+            )
+            return
+          }
+
           if (message.type === "write-response") {
+            this.#resolveRequest(message)
+            return
+          }
+
+          if (message.type === "vote-response") {
             this.#resolveRequest(message)
             return
           }
@@ -58,11 +73,11 @@ export class NodeRpcRouter {
             this.options.onWriteAck(message.from, message.seq)
           }
         } catch (error) {
-          if (message.type !== "write-request") return
+          if (message.type !== "write-request" && message.type !== "vote-request") return
 
           this.#extensionFor(message.from)?.send(
             {
-              type: "write-response",
+              type: message.type === "vote-request" ? "vote-response" : "write-response",
               requestId: message.requestId,
               ok: false,
               error: error instanceof Error ? error.message : String(error)
@@ -102,6 +117,38 @@ export class NodeRpcRouter {
         requestId,
         from: this.options.localNodeId,
         request
+      },
+      peer
+    )
+
+    return response
+  }
+
+  /**
+   * @param {{ targetNodeId: string, peer: any, request: { term: number, candidateNodeId: string, lastLogIndex: number, lastLogTerm: number, membershipVersion?: number } }} options
+   */
+  async requestVote({ targetNodeId, peer, request }) {
+    if (this.closed) {
+      throw new Error("Node is closing")
+    }
+
+    const extension = this.#extensionFor(targetNodeId)
+    const requestId = `${this.options.localNodeId}-${++this.requestId}`
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.inflightRequests.delete(requestId)
+        reject(new Error(`Timed out forwarding vote request ${requestId}`))
+      }, this.options.timeoutMs)
+      this.inflightRequests.set(requestId, { resolve, reject, timer })
+    })
+    response.catch(() => {})
+
+    extension?.send(
+      {
+        type: "vote-request",
+        requestId,
+        from: this.options.localNodeId,
+        ...request
       },
       peer
     )

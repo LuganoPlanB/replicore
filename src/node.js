@@ -22,6 +22,7 @@ import { MaterializedView } from "./materialized-view.js"
 import { NodeRpcRouter } from "./node-rpc.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { validatePromotionCredential } from "./promotion-credential.js"
+import { ConsensusEngine, majoritySize } from "./raft-engine.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
 import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
@@ -49,6 +50,8 @@ export class HolepunchSwarmNode {
    *   bootstrap?: Array<string | { host: string, port: number }>,
    *   heartbeatIntervalMs?: number,
    *   heartbeatTtlMs?: number,
+   *   electionTimeoutMinMs?: number,
+   *   electionTimeoutMaxMs?: number,
    *   forwarding?: boolean,
    *   ackDelayMs?: number,
    *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
@@ -59,6 +62,8 @@ export class HolepunchSwarmNode {
     this.options = {
       heartbeatIntervalMs: 500,
       heartbeatTtlMs: 3000,
+      electionTimeoutMinMs: 900,
+      electionTimeoutMaxMs: 1500,
       forwarding: true,
       durability: {
         requiredFollowerAcks: 1,
@@ -91,6 +96,7 @@ export class HolepunchSwarmNode {
     this.feedCores = new Map()
     this.heartbeatTimer = null
     this.heartbeatPromise = null
+    this.electionTimer = null
     this.syncPromises = new Map()
     this.pendingSync = new Set()
     this.localAppendLock = Promise.resolve()
@@ -106,6 +112,10 @@ export class HolepunchSwarmNode {
     this.sentJoinRequestKeys = new Set()
     this.seenJoinRequestNonces = new Set()
     this.lastHeartbeatByNode = new Map()
+    this.consensusEngine = new ConsensusEngine({
+      localNodeId: this.options.identity.publicKeyId
+    })
+    this.electionState = this.consensusEngine.state
     this.closing = false
   }
 
@@ -145,6 +155,7 @@ export class HolepunchSwarmNode {
           ? this.#appendKvOperation("put", message.request.key, message.request.value, message.request.options ?? {})
           : this.#appendKvOperation("delete", message.request.key, undefined, message.request.options ?? {})
       },
+      onVoteRequest: async (message) => this.#handleVoteRequest(message),
       onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
     })
     await this.#ensureFeedCore(this.#localNodeRecord())
@@ -171,6 +182,7 @@ export class HolepunchSwarmNode {
     }
 
     if (!this.#isLearner()) {
+      this.#scheduleElectionTimer()
       await this.#runHeartbeat()
       this.heartbeatTimer = setInterval(() => {
         void this.#runHeartbeat().catch((error) => {
@@ -228,16 +240,10 @@ export class HolepunchSwarmNode {
   }
 
   currentLeader() {
-    const now = Date.now()
-    return this.#voterNodes()
-      .filter((node) => {
-        if (node.nodeId === this.options.identity.publicKeyId) return true
-        const heartbeat = this.lastHeartbeatByNode.get(node.nodeId)
-        if (!heartbeat) return false
-        return now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs
-      })
-      .map((node) => node.nodeId)
-      .sort()[0] ?? null
+    return this.consensusEngine.currentLeader({
+      isLearner: this.#isLearner(),
+      heartbeatTtlMs: this.options.heartbeatTtlMs
+    })
   }
 
   /**
@@ -536,6 +542,7 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    if (this.electionTimer) clearTimeout(this.electionTimer)
     await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
@@ -621,6 +628,7 @@ export class HolepunchSwarmNode {
         if (Number.isInteger(watermark) && watermark > 0) {
           await this.#advanceCommittedFeed(nodeId, watermark)
         }
+        await this.#observeRemoteOperation(nodeId, operation)
       } else if (operation.kind === "kv") {
         await this.view.stageEntry(node.feedKey, {
           nodeId,
@@ -635,6 +643,7 @@ export class HolepunchSwarmNode {
         if (nodeId !== this.options.identity.publicKeyId) {
           void this.#sendAck(nodeId, operation.seq)
         }
+        await this.#observeRemoteOperation(nodeId, operation)
       } else if (operation.kind === "membership") {
         await this.view.setRawProgress(node.feedKey, {
           applied: operation.seq + 1,
@@ -643,6 +652,7 @@ export class HolepunchSwarmNode {
         if (nodeId !== this.options.identity.publicKeyId) {
           void this.#sendAck(nodeId, operation.seq)
         }
+        await this.#observeRemoteOperation(nodeId, operation)
       }
       rawApplied += 1
     }
@@ -701,6 +711,173 @@ export class HolepunchSwarmNode {
     })
     this.heartbeatPromise = heartbeatPromise
     return heartbeatPromise
+  }
+
+  #scheduleElectionTimer() {
+    if (this.closing || this.#isLearner() || this.consensusEngine.role === "leader") return
+    if (this.electionTimer) clearTimeout(this.electionTimer)
+
+    const { timeoutMs } = this.consensusEngine.planElectionTimeout({
+      minMs: this.options.electionTimeoutMinMs,
+      maxMs: this.options.electionTimeoutMaxMs,
+      voterNodeIds: this.membershipState.current.voters
+    })
+    this.electionTimer = setTimeout(() => {
+      void this.#handleElectionTimeout().catch((error) => {
+        if (!this.closing && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }, timeoutMs)
+    this.electionTimer.unref?.()
+  }
+
+  async #handleElectionTimeout() {
+    if (this.closing || this.#isLearner() || this.consensusEngine.role === "leader") return
+    if (this.currentLeader()) {
+      this.#scheduleElectionTimer()
+      return
+    }
+
+    await this.#startElection()
+  }
+
+  async #startElection() {
+    if (this.closing || this.#isLearner()) return
+
+    const voterNodeIds = this.membershipState.current.voters
+    const lastLog = await this.#localLastLogInfo()
+    const election = this.consensusEngine.startElection({
+      currentTerm: this.consensusState.currentTerm,
+      voterNodeIds,
+      lastLog,
+      membershipVersion: this.membershipState.current.version
+    })
+    const nextTerm = election.nextTerm
+    this.consensusState = await this.consensusStateStore.save(election.persistPatch)
+    const votes = new Set([this.options.identity.publicKeyId])
+    const requiredVotes = election.requiredVotes
+    const peers = voterNodeIds
+      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
+      .map((nodeId) => {
+        const core = this.feedCores.get(nodeId)
+        const peer = core?.peers?.[0] ?? null
+        return peer ? { nodeId, peer } : null
+      })
+      .filter(Boolean)
+
+    for (const { nodeId, peer } of peers) {
+      void this.rpc.requestVote({
+        targetNodeId: nodeId,
+        peer,
+        request: election.voteRequest
+      }).then(async (response) => {
+        if (!this.consensusEngine.isCandidateForTerm(nextTerm) || this.consensusState.currentTerm !== nextTerm) return
+        if (response?.term > this.consensusState.currentTerm) {
+          await this.#stepDown(response.term, response.leaderNodeId ?? null)
+          return
+        }
+        if (response?.voteGranted) {
+          votes.add(nodeId)
+          if (votes.size >= requiredVotes) {
+            await this.#becomeLeader(nextTerm)
+          }
+        }
+      }).catch(() => {})
+    }
+
+    if (votes.size >= requiredVotes) {
+      await this.#becomeLeader(nextTerm)
+      return
+    }
+
+    this.#scheduleElectionTimer()
+  }
+
+  async #handleVoteRequest(message) {
+    const decision = this.consensusEngine.evaluateVoteRequest({
+      consensusState: this.consensusState,
+      voterNodeIds: this.membershipState.current.voters,
+      isLearner: this.#isLearner(),
+      localLog: await this.#localLastLogInfo(),
+      localMembershipVersion: this.membershipState.current.version,
+      message
+    })
+    if (decision.persistPatch) {
+      this.consensusState = await this.consensusStateStore.save(decision.persistPatch)
+    }
+    this.#scheduleElectionTimer()
+    return {
+      ...decision.response,
+      term: this.consensusState.currentTerm,
+      leaderNodeId: this.currentLeader()
+    }
+  }
+
+  async #becomeLeader(term) {
+    if (this.closing) return
+    const transition = this.consensusEngine.becomeLeader({
+      term,
+      currentTerm: this.consensusState.currentTerm,
+      electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
+    })
+    if (!transition.becameLeader) return
+    if (this.electionTimer) {
+      clearTimeout(this.electionTimer)
+      this.electionTimer = null
+    }
+    this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    await this.#runHeartbeat()
+  }
+
+  async #stepDown(nextTerm, leaderNodeId = null) {
+    const transition = this.consensusEngine.stepDown({
+      nextTerm,
+      currentTerm: this.consensusState.currentTerm,
+      leaderNodeId
+    })
+    this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    this.#scheduleElectionTimer()
+  }
+
+  async #observeRemoteOperation(nodeId, operation) {
+    const observation = this.consensusEngine.observeRemoteOperation({
+      nodeId,
+      voterNodeIds: this.membershipState.current.voters,
+      currentTerm: this.consensusState.currentTerm,
+      operation,
+      electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
+    })
+    if (observation.persistPatch) {
+      this.consensusState = await this.consensusStateStore.save(observation.persistPatch)
+    }
+    if (observation.acceptedLeader || observation.persistPatch) {
+      this.#scheduleElectionTimer()
+    }
+  }
+
+  async #localLastLogInfo() {
+    const core = this.#localCore()
+    for (let index = core.length - 1; index >= 0; index -= 1) {
+      const operation = await core.get(index)
+      if (this.#countsForElectionLog(operation)) {
+        return {
+          index: operation.index ?? index,
+          term: operation.term ?? -1
+        }
+      }
+    }
+
+    return {
+      index: -1,
+      term: -1
+    }
+  }
+
+  #countsForElectionLog(operation) {
+    if (!operation || typeof operation !== "object") return false
+    if (operation.kind !== "heartbeat") return true
+    return operation.heartbeat?.observedLeader === operation.actor
   }
 
   async #startNetworking() {
@@ -1362,6 +1539,10 @@ export class HolepunchSwarmNode {
       }
       if (message.redirect && message.leaderNodeId) {
         this.joinState.leaderNodeId = message.leaderNodeId
+        this.consensusEngine.noteKnownLeader({
+          leaderNodeId: message.leaderNodeId,
+          electionTimeoutMs: this.options.electionTimeoutMaxMs
+        })
       }
       return
     }
@@ -1382,6 +1563,12 @@ export class HolepunchSwarmNode {
     this.joinState = {
       accepted: true,
       leaderNodeId: message.leaderNodeId ?? null
+    }
+    if (message.leaderNodeId) {
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId: message.leaderNodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
     }
   }
 
@@ -1787,13 +1974,14 @@ export class HolepunchSwarmNode {
   }
 
   #majoritySize(size) {
-    return Math.floor(size / 2) + 1
+    return majoritySize(size)
   }
 
   async #refreshHeartbeatRole(previousRole) {
     const currentRole = this.#role()
     if (previousRole !== "voter" && currentRole === "voter") {
       if (!this.heartbeatTimer && !this.closing) {
+        this.#scheduleElectionTimer()
         await this.#runHeartbeat()
         this.heartbeatTimer = setInterval(() => {
           void this.#runHeartbeat().catch((error) => {
@@ -1810,6 +1998,10 @@ export class HolepunchSwarmNode {
     if (previousRole === "voter" && currentRole !== "voter" && this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
+    }
+    if (previousRole === "voter" && currentRole !== "voter" && this.electionTimer) {
+      clearTimeout(this.electionTimer)
+      this.electionTimer = null
     }
   }
 }
