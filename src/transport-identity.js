@@ -1,9 +1,10 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
+import crypto from "hypercore-crypto"
 import DHT from "hyperdht"
 
-import { deriveNoiseSeed } from "./cluster-secret.js"
+import { deriveJoinSeed, deriveMachineId, deriveNoiseSeed } from "./cluster-secret.js"
 
 const TRANSPORT_IDENTITY_FILE = "transport-identity.json"
 
@@ -14,60 +15,103 @@ const TRANSPORT_IDENTITY_FILE = "transport-identity.json"
  * @param {{
  *   dataDir: string,
  *   clusterSecret?: Buffer,
- *   machineId?: string,
- *   nodeIdentitySeed?: Buffer
+ *   machineId?: string
  * }} options
  * @returns {Promise<null | {
+ *   machineId: string,
  *   keyPair: { publicKey: Buffer, secretKey: Buffer },
+ *   joinKeyPair: { publicKey: Buffer, secretKey: Buffer },
  *   publicKey: Buffer,
  *   publicKeyHex: string,
- *   seedSource: string
+ *   joinPublicKey: Buffer,
+ *   joinPublicKeyHex: string,
+ *   machineIdentitySource: string
  * }>}
  */
 export async function resolveTransportIdentity(options) {
-  const seed = await resolveTransportSeed(options)
-  if (!seed) return null
+  const derived = await resolveDerivedIdentity(options)
+  if (!derived) return null
 
-  const keyPair = DHT.keyPair(seed)
+  const keyPair = DHT.keyPair(derived.noiseSeed)
+  const joinKeyPair = crypto.keyPair(derived.joinSeed)
   await persistTransportIdentity({
     dataDir: options.dataDir,
+    machineId: derived.machineId,
     publicKeyHex: keyPair.publicKey.toString("hex"),
-    seedSource:
-      options.nodeIdentitySeed ? "nodeIdentitySeed" : options.machineId ? "machineId" : "/etc/machine-id"
+    joinPublicKeyHex: joinKeyPair.publicKey.toString("hex"),
+    machineIdentitySource: derived.machineIdentitySource
   })
 
   return {
+    machineId: derived.machineId,
     keyPair,
+    joinKeyPair,
     publicKey: keyPair.publicKey,
     publicKeyHex: keyPair.publicKey.toString("hex"),
-    seedSource:
-      options.nodeIdentitySeed ? "nodeIdentitySeed" : options.machineId ? "machineId" : "/etc/machine-id"
+    joinPublicKey: joinKeyPair.publicKey,
+    joinPublicKeyHex: joinKeyPair.publicKey.toString("hex"),
+    machineIdentitySource: derived.machineIdentitySource
   }
 }
 
 /**
  * @param {{
  *   clusterSecret?: Buffer,
- *   machineId?: string,
- *   nodeIdentitySeed?: Buffer
+ *   machineId?: string
  * }} options
- * @returns {Promise<Buffer | null>}
+ * @returns {Promise<null | {
+ *   machineId: string,
+ *   noiseSeed: Buffer,
+ *   joinSeed: Buffer,
+ *   machineIdentitySource: string
+ * }>}
  */
-async function resolveTransportSeed(options) {
-  if (options.nodeIdentitySeed) {
-    if (!Buffer.isBuffer(options.nodeIdentitySeed) || options.nodeIdentitySeed.length !== 32) {
-      throw new Error("nodeIdentitySeed must decode to 32 bytes")
-    }
-    return options.nodeIdentitySeed
-  }
-
+async function resolveDerivedIdentity(options) {
   if (!options.clusterSecret) return null
 
   const machineIdentity = options.machineId ?? (await readMachineIdentity())
-  return deriveNoiseSeed({
+  const machineIdentitySource = options.machineId ? "config.machineId" : "/etc/machine-id"
+  const machineId = (
+    await deriveMachineId({
+      clusterSecret: options.clusterSecret,
+      machineIdentity
+    })
+  ).toString("hex")
+  const [noiseSeed, joinSeed] = await Promise.all([
+    deriveNoiseSeed({
+      clusterSecret: options.clusterSecret,
+      machineId
+    }),
+    deriveJoinSeed({
+      clusterSecret: options.clusterSecret,
+      machineId
+    })
+  ])
+
+  return {
+    machineId,
+    noiseSeed,
+    joinSeed,
+    machineIdentitySource
+  }
+}
+
+/**
+ * Derive the join-signing key pair for one cluster-scoped machine identifier.
+ *
+ * @param {{ clusterSecret: Buffer, machineId: string }} options
+ */
+export async function deriveJoinKeyPair(options) {
+  const seed = await deriveJoinSeed({
     clusterSecret: options.clusterSecret,
-    machineIdentity
+    machineId: options.machineId
   })
+  const keyPair = crypto.keyPair(seed)
+  return {
+    keyPair,
+    publicKey: keyPair.publicKey,
+    publicKeyHex: keyPair.publicKey.toString("hex")
+  }
 }
 
 /**
@@ -82,7 +126,13 @@ async function readMachineIdentity() {
 }
 
 /**
- * @param {{ dataDir: string, publicKeyHex: string, seedSource: string }} options
+ * @param {{
+ *   dataDir: string,
+ *   machineId: string,
+ *   publicKeyHex: string,
+ *   joinPublicKeyHex: string,
+ *   machineIdentitySource: string
+ * }} options
  */
 async function persistTransportIdentity(options) {
   await mkdir(options.dataDir, { recursive: true })
@@ -90,7 +140,11 @@ async function persistTransportIdentity(options) {
 
   try {
     const existing = JSON.parse(await readFile(filePath, "utf8"))
-    if (existing.publicKey !== options.publicKeyHex) {
+    if (
+      existing.machineId !== options.machineId ||
+      existing.publicKey !== options.publicKeyHex ||
+      existing.joinPublicKey !== options.joinPublicKeyHex
+    ) {
       throw new Error(
         `Persisted transport identity does not match derived identity in ${filePath}`
       )
@@ -104,9 +158,11 @@ async function persistTransportIdentity(options) {
     filePath,
     JSON.stringify(
       {
-        version: 1,
+        version: 2,
+        machineId: options.machineId,
         publicKey: options.publicKeyHex,
-        seedSource: options.seedSource
+        joinPublicKey: options.joinPublicKeyHex,
+        machineIdentitySource: options.machineIdentitySource
       },
       null,
       2

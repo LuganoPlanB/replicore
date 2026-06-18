@@ -34,7 +34,6 @@ export class HolepunchSwarmNode {
    *   clusterSecret?: Buffer,
    *   role?: "voter" | "learner",
    *   machineId?: string,
-   *   nodeIdentitySeed?: Buffer,
    *   topicSalt?: string,
    *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
    *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
@@ -99,8 +98,7 @@ export class HolepunchSwarmNode {
     this.transportIdentity = await resolveTransportIdentity({
       dataDir: this.options.dataDir,
       clusterSecret: this.options.clusterSecret,
-      machineId: this.options.machineId,
-      nodeIdentitySeed: this.options.nodeIdentitySeed
+      machineId: this.options.machineId
     })
 
     this.store = new Corestore(join(this.options.dataDir, "corestore"))

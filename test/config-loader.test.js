@@ -7,6 +7,8 @@ import assert from "node:assert/strict"
 import {
   CLUSTER_SECRET_KDF_PARAMS,
   deriveDiscoveryTopic,
+  deriveJoinSeed,
+  deriveMachineId,
   deriveNoiseSeed,
   generateIdentity,
   loadRuntimeConfig,
@@ -132,7 +134,7 @@ test("loadRuntimeConfig supports encryption keyrings and revoked writers", async
   }
 })
 
-test("loadRuntimeConfig accepts explicit node transport identity overrides", async () => {
+test("loadRuntimeConfig accepts an explicit machine identity source override", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-transport-"))
 
   try {
@@ -142,14 +144,11 @@ test("loadRuntimeConfig accepts explicit node transport identity overrides", asy
     )
     raw.dataDir = "./data"
     raw.machineId = "override-machine"
-    raw.nodeIdentitySeed =
-      "abababababababababababababababababababababababababababababababab"
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.machineId, "override-machine")
-    assert.equal(config.nodeIdentitySeed.length, 32)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -205,24 +204,45 @@ test("cluster secret derivation is deterministic and purpose-separated", async (
   })
   const noiseA = await deriveNoiseSeed({
     clusterSecret,
-    machineIdentity: "machine-a"
+    machineId: "machine-a"
   })
   const noiseARepeat = await deriveNoiseSeed({
     clusterSecret,
-    machineIdentity: "machine-a"
+    machineId: "machine-a"
   })
   const noiseB = await deriveNoiseSeed({
     clusterSecret,
+    machineId: "machine-b"
+  })
+  const machineA = await deriveMachineId({
+    clusterSecret,
+    machineIdentity: "machine-a"
+  })
+  const machineARepeat = await deriveMachineId({
+    clusterSecret,
+    machineIdentity: "machine-a"
+  })
+  const machineB = await deriveMachineId({
+    clusterSecret,
     machineIdentity: "machine-b"
+  })
+  const joinA = await deriveJoinSeed({
+    clusterSecret,
+    machineId: machineA.toString("hex")
   })
 
   assert.equal(topicA.length, 32)
+  assert.equal(machineA.length, 32)
   assert.equal(noiseA.length, 32)
   assert.deepEqual(topicA, topicARepeat)
+  assert.deepEqual(machineA, machineARepeat)
   assert.deepEqual(noiseA, noiseARepeat)
   assert.notDeepEqual(topicA, topicB)
+  assert.notDeepEqual(machineA, machineB)
   assert.notDeepEqual(noiseA, noiseB)
   assert.notDeepEqual(topicA, noiseA)
+  assert.notDeepEqual(machineA, noiseA)
+  assert.notDeepEqual(joinA, noiseA)
 })
 
 test("resolveTransportIdentity derives stable machine-scoped transport keys", async () => {
@@ -259,9 +279,16 @@ test("resolveTransportIdentity derives stable machine-scoped transport keys", as
       machineId: "machine-a"
     })
 
+    assert.equal(machineA.machineId.length, 64)
+    assert.equal(machineA.machineId, machineARepeat.machineId)
     assert.equal(machineA.publicKeyHex, machineARepeat.publicKeyHex)
+    assert.equal(machineA.joinPublicKeyHex, machineARepeat.joinPublicKeyHex)
+    assert.notEqual(machineA.machineId, "machine-a")
+    assert.notEqual(machineA.machineId, machineB.machineId)
+    assert.notEqual(machineA.machineId, clusterB.machineId)
     assert.notEqual(machineA.publicKeyHex, machineB.publicKeyHex)
     assert.notEqual(machineA.publicKeyHex, clusterB.publicKeyHex)
+    assert.notEqual(machineA.joinPublicKeyHex, machineB.joinPublicKeyHex)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

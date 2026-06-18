@@ -3,7 +3,9 @@ export {
   CLUSTER_SECRET_KDF_PARAMS,
   deriveClusterScopedBytes,
   deriveDiscoveryTopic,
+  deriveJoinSeed,
   deriveLegacyTopic,
+  deriveMachineId,
   deriveNoiseSeed
 } from "./cluster-secret.js"
 export { ConsensusStateStore } from "./consensus-state.js"
@@ -33,4 +35,4 @@ export {
   hashPromotionCredential,
   validatePromotionCredential
 } from "./promotion-credential.js"
-export { resolveTransportIdentity } from "./transport-identity.js"
+export { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"

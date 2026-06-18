@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-import { argon2id } from "hash-wasm"
+import { argon2d, argon2id } from "hash-wasm"
 
 export const CLUSTER_SECRET_KDF_PARAMS = Object.freeze({
   memorySize: 65536,
@@ -9,7 +9,9 @@ export const CLUSTER_SECRET_KDF_PARAMS = Object.freeze({
 })
 
 export const DISCOVERY_TOPIC_PURPOSE = "replicore:dht-topic:v1"
+export const MACHINE_ID_PURPOSE = "replicore:machine-id:v1"
 export const NOISE_NODE_KEY_PURPOSE = "replicore:noise-node-key:v1"
+export const JOIN_SIGNING_KEY_PURPOSE = "replicore:join-signing-key:v1"
 export const CLUSTER_SECRET_SALT_PREFIX = "replicore:kdf:v1"
 
 /**
@@ -67,18 +69,71 @@ export function deriveDiscoveryTopic(input) {
 }
 
 /**
- * Derive a Noise seed for one machine identity input.
+ * Derive a Noise seed for one cluster-scoped machine identifier.
  *
- * @param {{ clusterSecret: Buffer, machineIdentity: string }} input
+ * @param {{ clusterSecret: Buffer, machineId: string }} input
  * @returns {Promise<Buffer>}
  */
 export function deriveNoiseSeed(input) {
   return deriveClusterScopedBytes({
     clusterSecret: input.clusterSecret,
     purpose: NOISE_NODE_KEY_PURPOSE,
-    context: input.machineIdentity,
+    context: input.machineId,
     length: 32
   })
+}
+
+/**
+ * Derive a cluster-scoped machine identifier from the shared secret and one
+ * local machine identity source.
+ *
+ * @param {{ clusterSecret: Buffer, machineIdentity: string }} input
+ * @returns {Promise<Buffer>}
+ */
+export async function deriveMachineId(input) {
+  if (!Buffer.isBuffer(input.clusterSecret) || input.clusterSecret.length === 0) {
+    throw new Error("clusterSecret must be a non-empty Buffer")
+  }
+
+  const machineIdentity = normalizeMachineIdentity(input.machineIdentity)
+  const output = await argon2d({
+    password: machineIdentity,
+    secret: input.clusterSecret,
+    salt: Buffer.from(`${CLUSTER_SECRET_SALT_PREFIX}:${MACHINE_ID_PURPOSE}`, "utf8"),
+    ...CLUSTER_SECRET_KDF_PARAMS,
+    hashLength: 32,
+    outputType: "binary"
+  })
+
+  return Buffer.from(output)
+}
+
+/**
+ * Derive a join-signing seed from one cluster-scoped machine identifier.
+ *
+ * @param {{ clusterSecret: Buffer, machineId: string }} input
+ * @returns {Promise<Buffer>}
+ */
+export function deriveJoinSeed(input) {
+  return deriveClusterScopedBytes({
+    clusterSecret: input.clusterSecret,
+    purpose: JOIN_SIGNING_KEY_PURPOSE,
+    context: input.machineId,
+    length: 32
+  })
+}
+
+function normalizeMachineIdentity(value) {
+  if (typeof value !== "string") {
+    throw new Error("machineIdentity must be a non-empty string")
+  }
+
+  const normalized = value.trim()
+  if (normalized.length === 0) {
+    throw new Error("machineIdentity must be a non-empty string")
+  }
+
+  return normalized
 }
 
 /**

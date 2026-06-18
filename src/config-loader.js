@@ -47,10 +47,6 @@ export async function loadRuntimeConfig(configPath) {
     compatibilityMode,
     role,
     machineId: raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId"),
-    nodeIdentitySeed:
-      raw.nodeIdentitySeed === undefined
-        ? undefined
-        : requireHex(raw.nodeIdentitySeed, "nodeIdentitySeed", 32),
     bootstrap: normalizeBootstrap(raw.bootstrap ?? []),
     heartbeatIntervalMs: raw.heartbeatIntervalMs ?? 500,
     heartbeatTtlMs: raw.heartbeatTtlMs ?? 3000,
