@@ -117,6 +117,7 @@ export class HolepunchSwarmNode {
       localNodeId: this.options.identity.publicKeyId,
       timeoutMs: this.options.durability.timeoutMs,
       ackDelayMs: this.options.ackDelayMs,
+      onPeerIdentity: (nodeId, peer) => this.network?.observePeerIdentity(nodeId, peer),
       onWriteRequest: async (message) => {
         if (this.currentLeader() !== this.options.identity.publicKeyId) {
           throw new Error("This node is not the current leader")
@@ -144,7 +145,10 @@ export class HolepunchSwarmNode {
 
       await core.ready()
       if (!isLocal) {
-        core.on("peer-add", (peer) => this.network?.trackPeer(true, node.nodeId, peer))
+        core.on("peer-add", (peer) => {
+          this.network?.trackPeer(true, node.nodeId, peer)
+          this.rpc?.sendHello({ targetNodeId: node.nodeId, peer })
+        })
         core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
         core.on("append", () => {
           void this.syncFeed(node.nodeId).catch((error) => {
@@ -233,9 +237,8 @@ export class HolepunchSwarmNode {
 
   currentLeader() {
     const now = Date.now()
-    return this.options.authorizedNodes
+    return this.#voterNodes()
       .filter((node) => {
-        if (this.#isRevokedNode(node.nodeId)) return false
         if (node.nodeId === this.options.identity.publicKeyId) return true
         const heartbeat = this.lastHeartbeatByNode.get(node.nodeId)
         if (!heartbeat) return false
@@ -352,9 +355,11 @@ export class HolepunchSwarmNode {
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
       membershipFingerprint: this.#membershipFingerprint(),
+      membership: this.#membershipEntries(),
       authorizedNodes: this.options.authorizedNodes.map((node) => ({
         nodeId: node.nodeId,
         feedKey: node.feedKey,
+        role: this.#membershipRole(node.nodeId),
         revoked: this.#isRevokedNode(node.nodeId)
       }))
     })
@@ -716,6 +721,8 @@ export class HolepunchSwarmNode {
    * @param {number} seq
    */
   #recordAck(nodeId, seq) {
+    if (nodeId === this.options.identity.publicKeyId) return
+    if (this.#membershipRole(nodeId) !== "voter") return
     this.durabilityWaiter.record(nodeId, seq)
   }
 
@@ -766,7 +773,7 @@ export class HolepunchSwarmNode {
     const now = Date.now()
     return [...this.lastHeartbeatByNode.entries()]
       .filter(([nodeId]) => nodeId !== leader)
-      .filter(([nodeId]) => !this.#isRevokedNode(nodeId))
+      .filter(([nodeId]) => this.#membershipRole(nodeId) === "voter")
       .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
       .filter(([nodeId]) => this.#isLeaderReachable(nodeId))
       .map(([nodeId]) => nodeId)
@@ -825,14 +832,12 @@ export class HolepunchSwarmNode {
   #isLeaderReachable(nodeId) {
     if (this.#isRevokedNode(nodeId)) return false
     if (nodeId === this.options.identity.publicKeyId) return true
-    const core = this.feedCores.get(nodeId)
-    return !!core?.peers?.length
+    return this.network?.isNodeConnected(nodeId) ?? false
   }
 
   async #appliedFeeds() {
     const applied = {}
-    for (const node of this.options.authorizedNodes) {
-      if (this.#isRevokedNode(node.nodeId)) continue
+    for (const node of this.#voterNodes()) {
       if (node.nodeId === this.options.identity.publicKeyId) {
         const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
         applied[node.feedKey] = Math.max(await this.view.getApplied(node.feedKey), durableApplied)
@@ -847,8 +852,7 @@ export class HolepunchSwarmNode {
   async #rejectedFeeds() {
     const rejected = {}
 
-    for (const node of this.options.authorizedNodes) {
-      if (this.#isRevokedNode(node.nodeId)) continue
+    for (const node of this.#voterNodes()) {
       if (node.nodeId !== this.options.identity.publicKeyId) continue
 
       const rejectedSeqs = await this.view.getSkippedEntries(node.feedKey)
@@ -912,18 +916,19 @@ export class HolepunchSwarmNode {
     const membership = this.options.authorizedNodes.map((node) => ({
       nodeId: node.nodeId,
       feedKey: node.feedKey,
-      revoked: this.#isRevokedNode(node.nodeId)
+      role: this.#membershipRole(node.nodeId)
     }))
     return createHash("sha256").update(canonicalize(membership)).digest("hex")
   }
 
   #membershipStatus(heartbeats) {
     const localFingerprint = this.#membershipFingerprint()
+    const entries = this.#membershipEntries()
     const peerFingerprints = {}
     const mismatchedNodeIds = []
     const matchingNodeIds = []
 
-    for (const node of this.options.authorizedNodes) {
+    for (const node of this.#voterNodes()) {
       if (node.nodeId === this.options.identity.publicKeyId) continue
 
       const fingerprint = heartbeats[node.nodeId]?.membershipFingerprint ?? null
@@ -935,6 +940,10 @@ export class HolepunchSwarmNode {
 
     return {
       localFingerprint,
+      localRole: this.#role(),
+      voters: entries.filter((entry) => entry.role === "voter"),
+      learners: entries.filter((entry) => entry.role === "learner"),
+      removed: entries.filter((entry) => entry.role === "removed"),
       peerFingerprints,
       mismatchedNodeIds: mismatchedNodeIds.sort(),
       matchingNodeIds: matchingNodeIds.sort()
@@ -975,5 +984,32 @@ export class HolepunchSwarmNode {
    */
   #isRevokedNode(nodeId) {
     return this.revokedNodeIds.has(nodeId)
+  }
+
+  #membershipRole(nodeId) {
+    if (!this.options.authorizedNodes.some((node) => node.nodeId === nodeId)) {
+      return nodeId === this.options.identity.publicKeyId ? "learner" : null
+    }
+    return this.#isRevokedNode(nodeId) ? "removed" : "voter"
+  }
+
+  #membershipEntries() {
+    const entries = this.options.authorizedNodes.map((node) => ({
+      nodeId: node.nodeId,
+      feedKey: node.feedKey,
+      role: this.#membershipRole(node.nodeId)
+    }))
+    if (this.#isLearner()) {
+      entries.push({
+        nodeId: this.options.identity.publicKeyId,
+        feedKey: this.options.identity.feedKey,
+        role: "learner"
+      })
+    }
+    return entries.sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+  }
+
+  #voterNodes() {
+    return this.options.authorizedNodes.filter((node) => this.#membershipRole(node.nodeId) === "voter")
   }
 }

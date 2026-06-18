@@ -602,6 +602,14 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
 
     const learnerStatus = await learner.getReplicationStatus()
     assert.equal(learnerStatus.role, "learner")
+    assert.equal(learnerStatus.membership.localRole, "learner")
+    assert.deepEqual(
+      learnerStatus.membership.voters.map((entry) => entry.nodeId).sort(),
+      authorizedNodes.map((entry) => entry.nodeId).sort()
+    )
+    assert.deepEqual(learnerStatus.membership.learners.map((entry) => entry.nodeId), [
+      learnerIdentity.publicKeyId
+    ])
     assert.equal(learner.getWritersStatus().role, "learner")
     assert.equal((await learner.getLeaderStatus()).role, "learner")
     assert.equal(leader.getWritersStatus().authorizedNodes.length, 2)
@@ -623,6 +631,97 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
       const replicated = await learner.get("hash:learner-after")
       return replicated?.value?.value === "after-learner"
     })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("a live learner connection does not satisfy voter durability after a follower stops", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "3333333333333333333333333333333333333333333333333333333333333333",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("learner-durability-leader"))
+    const followerIdentity = generateIdentity(seed("learner-durability-follower"))
+    const learnerIdentity = generateIdentity(seed("learner-durability-learner"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const firstVoter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-durability-cluster",
+      clusterSecret,
+      machineId: "learner-durability-voter-1",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await firstVoter.start()
+    nodes.push(firstVoter)
+
+    const secondVoter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-durability-cluster",
+      clusterSecret,
+      machineId: "learner-durability-voter-2",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await secondVoter.start()
+    nodes.push(secondVoter)
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    const leaderNode = leaderId === leaderIdentity.publicKeyId ? firstVoter : secondVoter
+    const followerNode = leaderNode === firstVoter ? secondVoter : firstVoter
+    await waitFor(async () => firstVoter.currentLeader() === leaderId && secondVoter.currentLeader() === leaderId)
+    await leaderNode.put("hash:learner-durability-baseline", { value: "ready" })
+
+    const learner = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "learner-durability-cluster",
+      clusterSecret,
+      machineId: "learner-durability-learner",
+      identity: learnerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learner.start()
+    nodes.push(learner)
+
+    await waitFor(async () => {
+      const visible = await learner.get("hash:learner-durability-baseline")
+      return visible?.value?.value === "ready"
+    })
+
+    await followerNode.close()
+    nodes.splice(nodes.indexOf(followerNode), 1)
+
+    await waitFor(async () => {
+      const status = await leaderNode.getReplicationStatus()
+      return status.connections === 1
+    })
+
+    await assert.rejects(
+      leaderNode.put("hash:learner-durability-rejected", { value: "forbidden" }),
+      /Durability requirement not met/
+    )
+    assert.equal(await leaderNode.get("hash:learner-durability-rejected"), null)
+    assert.equal(await learner.get("hash:learner-durability-rejected"), null)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

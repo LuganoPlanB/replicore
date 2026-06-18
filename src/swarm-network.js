@@ -22,6 +22,7 @@ export class SwarmNetwork {
     this.discovery = null
     this.connections = new Set()
     this.remoteNodeIdsByConnectionKey = new Map()
+    this.observedNodeIdsByConnectionKey = new Map()
     this.networkPolicy = options.networkPolicy ?? null
   }
 
@@ -89,8 +90,25 @@ export class SwarmNetwork {
     this.#enforceConnectionPolicyForKey(connectionKey)
   }
 
+  /**
+   * Observe the application-level node ID currently using a live transport
+   * connection. This is stronger than feed-based peer inference because an
+   * unknown learner may replicate voter feeds without being that voter.
+   *
+   * @param {string} nodeId
+   * @param {{ stream?: { remotePublicKey?: Buffer }, remotePublicKey?: Buffer }} peer
+   */
+  observePeerIdentity(nodeId, peer) {
+    const connectionKey = this.#connectionKey(peer.stream?.remotePublicKey ?? peer.remotePublicKey)
+    if (!connectionKey) return
+
+    this.observedNodeIdsByConnectionKey.set(connectionKey, nodeId)
+    this.#enforceConnectionPolicyForKey(connectionKey)
+  }
+
   clear() {
     this.remoteNodeIdsByConnectionKey.clear()
+    this.observedNodeIdsByConnectionKey.clear()
   }
 
   get connectionCount() {
@@ -106,8 +124,10 @@ export class SwarmNetwork {
     const connectedNodeIds = new Set(
       [...this.connections].flatMap((conn) => {
         const connectionKey = this.#connectionKey(conn.remotePublicKey)
-        const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
-        if (!remoteNodeId && connectionKey) learnerCandidates.push(connectionKey)
+        const remoteNodeId = this.observedNodeIdsByConnectionKey.get(connectionKey)
+        if ((!remoteNodeId || !this.#isAuthorizedNode(remoteNodeId)) && connectionKey) {
+          learnerCandidates.push(connectionKey)
+        }
         return remoteNodeId ? [remoteNodeId] : []
       })
     )
@@ -127,6 +147,19 @@ export class SwarmNetwork {
       learnerCandidates: learnerCandidates.sort(),
       peers
     }
+  }
+
+  /**
+   * @param {string} nodeId
+   */
+  isNodeConnected(nodeId) {
+    for (const conn of this.connections) {
+      const connectionKey = this.#connectionKey(conn.remotePublicKey)
+      if (this.observedNodeIdsByConnectionKey.get(connectionKey) === nodeId) {
+        return true
+      }
+    }
+    return false
   }
 
   #allowedNodeIds() {
@@ -159,7 +192,9 @@ export class SwarmNetwork {
   #enforceConnectionPolicyForKey(connectionKey) {
     if (!connectionKey) return
 
-    const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
+    const remoteNodeId =
+      this.observedNodeIdsByConnectionKey.get(connectionKey) ??
+      this.remoteNodeIdsByConnectionKey.get(connectionKey)
     if (!remoteNodeId || this.#isConnectionAllowed(remoteNodeId)) return
 
     for (const conn of this.connections) {
@@ -174,5 +209,12 @@ export class SwarmNetwork {
    */
   #connectionKey(publicKey) {
     return publicKey ? publicKey.toString("hex") : null
+  }
+
+  /**
+   * @param {string} nodeId
+   */
+  #isAuthorizedNode(nodeId) {
+    return this.options.authorizedNodes.some((node) => node.nodeId === nodeId)
   }
 }

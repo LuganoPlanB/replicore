@@ -90,6 +90,11 @@ Use these terms consistently in code, tests, and docs:
 - `learner`: a same-secret peer that may replicate committed data and serve
   read-only local queries, but cannot vote, lead, proxy durable writes, or
   accept durable writes.
+- `voter`: a committed membership peer that may participate in quorum, leader
+  election, and durable-write replication.
+- `removed`: a former voter that remains visible in membership history or
+  diagnostics, but must not vote, lead, replicate as an authority, or count
+  toward quorum.
 - `promotion credential`: a user-approved signed object that allows a learner
   to be considered for voter promotion. The learner is not a voter until the
   membership path accepts the promotion.

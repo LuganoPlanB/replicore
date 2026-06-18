@@ -6,14 +6,15 @@ const RPC_EXTENSION = "planb-cleard-rpc-v1"
  */
 export class NodeRpcRouter {
   /**
-   * @param {{
-   *   localNodeId: string,
-   *   timeoutMs: number,
-   *   ackDelayMs?: number,
-   *   onWriteRequest: (message: { request: any }) => Promise<unknown>,
-   *   onWriteAck: (nodeId: string, seq: number) => void
-   * }} options
-   */
+ * @param {{
+ *   localNodeId: string,
+ *   timeoutMs: number,
+ *   ackDelayMs?: number,
+ *   onPeerIdentity?: (nodeId: string, peer: any) => void,
+ *   onWriteRequest: (message: { request: any }) => Promise<unknown>,
+ *   onWriteAck: (nodeId: string, seq: number) => void
+ * }} options
+ */
   constructor(options) {
     this.options = options
     this.extensions = new Map()
@@ -31,6 +32,14 @@ export class NodeRpcRouter {
       encoding: "json",
       onmessage: async (message, peer) => {
         try {
+          if (typeof message?.from === "string") {
+            this.options.onPeerIdentity?.(message.from, peer)
+          }
+
+          if (message.type === "hello") {
+            return
+          }
+
           if (message.type === "write-request") {
             const result = await this.options.onWriteRequest(message)
             this.#extensionFor(message.from)?.send(
@@ -115,6 +124,21 @@ export class NodeRpcRouter {
         from: this.options.localNodeId,
         feedKey: targetNodeId,
         seq
+      },
+      peer
+    )
+  }
+
+  /**
+   * @param {{ targetNodeId: string, peer: any }} options
+   */
+  sendHello({ targetNodeId, peer }) {
+    if (this.closed) return
+
+    this.#extensionFor(targetNodeId)?.send(
+      {
+        type: "hello",
+        from: this.options.localNodeId
       },
       peer
     )
