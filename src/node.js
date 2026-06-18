@@ -30,6 +30,7 @@ import { deriveTopic } from "./config.js"
 import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
 
 const JOIN_REQUEST_MAX_SKEW_MS = 5 * 60 * 1000
+const PEER_HINT_TTL_MS = 15 * 60 * 1000
 
 /**
  * Minimal multi-node swarm whose committed cluster history is represented by
@@ -109,6 +110,8 @@ export class HolepunchSwarmNode {
     this.authoritativeLogIdentity = null
     this.authoritativeLogCore = null
     this.feedCores = new Map()
+    this.peerHints = new Map()
+    this.localHttpAddress = null
     this.heartbeatTimer = null
     this.heartbeatPromise = null
     this.authoritativeSyncTimer = null
@@ -177,6 +180,7 @@ export class HolepunchSwarmNode {
     await this.consensusBee.ready()
     this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
     this.consensusState = await this.consensusStateStore.load()
+    await this.#loadPeerHints()
     this.splitState = {
       fenced: this.consensusState.splitFenced === true,
       reason: this.consensusState.splitReason ?? null,
@@ -341,6 +345,22 @@ export class HolepunchSwarmNode {
     }
 
     return this.#appendKvOperation("delete", key, undefined, options)
+  }
+
+  async qualifyClientWriteEntrypoint() {
+    await this.#refreshAuthoritativeMembership()
+    if (this.currentLeader() === this.options.identity.publicKeyId) {
+      throw this.#createNotWitnessEntrypointError()
+    }
+  }
+
+  async setHttpAddress(address) {
+    this.localHttpAddress = this.#normalizeHttpAddress(address)
+    await this.#recordPeerHint(this.options.identity.publicKeyId, {
+      httpAddress: this.localHttpAddress,
+      peerPublicKey: this.transportIdentity?.publicKeyHex ?? null,
+      role: this.#role()
+    })
   }
 
   /**
@@ -1007,6 +1027,11 @@ export class HolepunchSwarmNode {
           rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
+        await this.#recordPeerHint(nodeId, {
+          httpAddress: operation.heartbeat?.httpAddress ?? null,
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? null,
+          role: this.#membershipRole(nodeId)
+        })
         const watermark = this.#usesSharedAuthoritativeLog()
           ? operation.heartbeat?.leaderCommitIndex
           : operation.heartbeat?.appliedFeeds?.[node.feedKey]
@@ -1118,7 +1143,7 @@ export class HolepunchSwarmNode {
           : await this.#previousLocalOperation()
         const previousHeartbeat = await this.#previousHeartbeatOperation()
         const heartbeatCore = this.#localCore()
-        const heartbeat = {
+      const heartbeat = {
           leaderId: leader,
           leaderCommitIndex: this.consensusState.commitIndex,
           membershipVersion: this.membershipState.current.version,
@@ -1129,7 +1154,8 @@ export class HolepunchSwarmNode {
           reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
           appliedFeeds: await this.#appliedFeeds(),
           rejectedFeeds: await this.#rejectedFeeds(),
-          membershipFingerprint: this.#membershipFingerprint()
+          membershipFingerprint: this.#membershipFingerprint(),
+          httpAddress: this.localHttpAddress
         }
         const operation = createSignedOperation({
           kind: "heartbeat",
@@ -2204,6 +2230,17 @@ export class HolepunchSwarmNode {
     })
   }
 
+  #createNotWitnessEntrypointError() {
+    return this.#createRefusalError({
+      code: "not-witness-entrypoint",
+      internalCode: "NOT_WITNESS_ENTRYPOINT",
+      statusCode: 503,
+      retryable: true,
+      message: "Direct leader-facing CRUD is not supported; send writes to a witness node",
+      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId()
+    })
+  }
+
   #createMembershipChangingError(message = "Durability requirement not met: membership mismatch blocks degraded writes") {
     return this.#createRefusalError({
       code: "membership-changing",
@@ -2260,19 +2297,84 @@ export class HolepunchSwarmNode {
 
   #refusalReconnectHints(leaderNodeId) {
     const recoveryLeaderHints = this.joinState.recovery?.leaderHints ?? null
+    const persistedLeaderHint = leaderNodeId ? this.#peerHint(leaderNodeId) : null
     const leaderHint = leaderNodeId
       ? {
           nodeId: leaderNodeId,
-          peerPublicKey: this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? recoveryLeaderHints?.peerPublicKey ?? null
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(leaderNodeId)
+            ?? persistedLeaderHint?.peerPublicKey
+            ?? recoveryLeaderHints?.peerPublicKey
+            ?? null,
+          httpAddress: persistedLeaderHint?.httpAddress ?? recoveryLeaderHints?.httpAddress ?? null
         }
       : null
-    const witnessNodeIds = this.#reachableVotingNodeIds()
-      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId && nodeId !== leaderNodeId)
-      .sort()
+    const witnesses = this.#witnessHintEntries(leaderNodeId)
 
     return {
       leader: leaderHint,
-      witnessNodeIds
+      witnesses
+    }
+  }
+
+  #witnessHintEntries(leaderNodeId) {
+    return this.#effectiveVoterNodeIds()
+      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId && nodeId !== leaderNodeId)
+      .map((nodeId) => {
+        const hint = this.#peerHint(nodeId)
+        return {
+          nodeId,
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? hint?.peerPublicKey ?? null,
+          httpAddress: hint?.httpAddress ?? null,
+          reachable: this.#isLeaderReachable(nodeId)
+        }
+      })
+      .filter((hint) => hint.peerPublicKey || hint.httpAddress)
+      .sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+  }
+
+  async #loadPeerHints() {
+    const now = Date.now()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "peer-hints/",
+      lt: "peer-hints/~"
+    })) {
+      const hint = entry.value
+      if (!hint?.nodeId) continue
+      if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= now) continue
+      this.peerHints.set(hint.nodeId, hint)
+    }
+  }
+
+  #peerHint(nodeId) {
+    const hint = this.peerHints.get(nodeId) ?? null
+    if (!hint) return null
+    if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= Date.now()) {
+      this.peerHints.delete(nodeId)
+      return null
+    }
+    return hint
+  }
+
+  async #recordPeerHint(nodeId, patch) {
+    const existing = this.#peerHint(nodeId)
+    const next = {
+      nodeId,
+      peerPublicKey: patch.peerPublicKey ?? existing?.peerPublicKey ?? null,
+      httpAddress: patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress,
+      role: patch.role ?? existing?.role ?? null,
+      seenAt: new Date().toISOString(),
+      expiresAt: Date.now() + PEER_HINT_TTL_MS
+    }
+    this.peerHints.set(nodeId, next)
+    await this.consensusBee.put(`peer-hints/${nodeId}`, next)
+  }
+
+  #normalizeHttpAddress(address) {
+    if (!address || typeof address !== "object") return null
+    if (typeof address.address !== "string" || !Number.isInteger(address.port)) return null
+    return {
+      host: address.address,
+      port: address.port
     }
   }
 
@@ -2699,6 +2801,9 @@ export class HolepunchSwarmNode {
   async #ensureJoinedNode(node) {
     const record = this.#ensureAuthorizedNodeRecord(node)
     await this.#ensureFeedCore(record)
+    await this.#recordPeerHint(record.nodeId, {
+      role: this.#membershipRole(record.nodeId)
+    })
     if (record.nodeId !== this.options.identity.publicKeyId) {
       void this.syncFeed(record.nodeId).catch((error) => {
         if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
@@ -2731,8 +2836,10 @@ export class HolepunchSwarmNode {
       witnessLiveness: this.#witnessLivenessSummary(heartbeats, leaderNodeId),
       leaderHints: {
         nodeId: leaderNodeId,
-        peerPublicKey: leaderNodeId ? (this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? null) : null
-      }
+        peerPublicKey: leaderNodeId ? (this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? this.#peerHint(leaderNodeId)?.peerPublicKey ?? null) : null,
+        httpAddress: leaderNodeId ? (this.#peerHint(leaderNodeId)?.httpAddress ?? null) : null
+      },
+      witnessHints: this.#witnessHintEntries(leaderNodeId)
     }
   }
 
@@ -2765,10 +2872,23 @@ export class HolepunchSwarmNode {
       leaderNodeId !== this.options.identity.publicKeyId &&
       this.#membershipRole(leaderNodeId) === "voter"
     ) {
+      await this.#recordPeerHint(leaderNodeId, {
+        httpAddress: recovery.leaderHints?.httpAddress ?? null,
+        peerPublicKey: recovery.leaderHints?.peerPublicKey ?? null,
+        role: this.#membershipRole(leaderNodeId)
+      })
       this.joinState.leaderNodeId = leaderNodeId
       this.consensusEngine.noteKnownLeader({
         leaderNodeId,
         electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+    }
+    for (const witness of recovery.witnessHints ?? []) {
+      if (!witness?.nodeId) continue
+      await this.#recordPeerHint(witness.nodeId, {
+        httpAddress: witness.httpAddress ?? null,
+        peerPublicKey: witness.peerPublicKey ?? null,
+        role: this.#membershipRole(witness.nodeId)
       })
     }
 

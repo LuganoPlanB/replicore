@@ -129,7 +129,8 @@ export class MaterializedView {
       reachableLeader: operation.heartbeat?.reachableLeader ?? false,
       appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
       rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
-      membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
+      membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null,
+      httpAddress: operation.heartbeat?.httpAddress ?? null
     })
   }
 

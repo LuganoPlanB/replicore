@@ -38,6 +38,7 @@ export class HolepunchHttpServer {
     await new Promise((resolve) => {
       this.server.listen(this.options.port, this.options.host, resolve)
     })
+    await this.options.node.setHttpAddress(this.address)
   }
 
   async close() {
@@ -46,6 +47,7 @@ export class HolepunchHttpServer {
       this.server.close((error) => (error ? reject(error) : resolve()))
     })
     this.server = null
+    await this.options.node.setHttpAddress(null)
   }
 
   get address() {
@@ -81,6 +83,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "PUT") {
           this.#authorize(req, keyspace, "write")
+          await this.options.node.qualifyClientWriteEntrypoint()
           const body = await this.#readJson(req)
           const operation = await this.options.node.put(key, body.value, { keyspace })
           return this.#json(res, 200, operation)
@@ -88,6 +91,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "DELETE") {
           this.#authorize(req, keyspace, "write")
+          await this.options.node.qualifyClientWriteEntrypoint()
           const operation = await this.options.node.delete(key, { keyspace })
           return this.#json(res, 200, operation)
         }
