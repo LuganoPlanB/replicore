@@ -2088,6 +2088,7 @@ test("restarted follower reconnects through cached peers while bootstrap remains
         return (
           status.connections > 0 &&
           status.knownPeerNodeIds.length > 0 &&
+          status.network.directPeerPublicKeys.length > 0 &&
           seesLeader &&
           status.readStatus.staleReadsPossible === false &&
           restartedFollower.currentLeader() === leaderId

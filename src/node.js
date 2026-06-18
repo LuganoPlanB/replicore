@@ -115,6 +115,7 @@ export class HolepunchSwarmNode {
     this.heartbeatTimer = null
     this.heartbeatPromise = null
     this.authoritativeSyncTimer = null
+    this.peerMaintenanceTimer = null
     this.electionTimer = null
     this.syncPromises = new Map()
     this.authoritativeSyncPromise = null
@@ -861,6 +862,7 @@ export class HolepunchSwarmNode {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.authoritativeSyncTimer) clearInterval(this.authoritativeSyncTimer)
+    if (this.peerMaintenanceTimer) clearInterval(this.peerMaintenanceTimer)
     if (this.electionTimer) clearTimeout(this.electionTimer)
     await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
     this.#rejectPendingWrites(new Error("Node is closing"))
@@ -1480,6 +1482,7 @@ export class HolepunchSwarmNode {
     })
     await this.network.start()
     this.#refreshDirectPeerConnections()
+    this.#schedulePeerMaintenanceTimer()
   }
 
   async #appendKvOperation(type, key, value, options) {
@@ -2363,6 +2366,15 @@ export class HolepunchSwarmNode {
       seen.add(peerPublicKey)
       prioritizedKeys.push(peerPublicKey)
     }
+    const pushNodeIdPeerKey = (nodeId) => {
+      if (!nodeId || nodeId === this.options.identity.publicKeyId) return
+      const hint = this.#peerHint(nodeId)
+      pushPeerKey(
+        this.network.peerPublicKeyForNodeId(nodeId)
+        ?? hint?.peerPublicKey
+        ?? (nodeId === this.joinState.recovery?.leaderNodeId ? this.joinState.recovery?.leaderHints?.peerPublicKey ?? null : null)
+      )
+    }
 
     const leaderNodeId =
       this.currentLeader()
@@ -2370,20 +2382,19 @@ export class HolepunchSwarmNode {
       ?? this.joinState.leaderNodeId
       ?? this.joinState.recovery?.leaderNodeId
       ?? null
-    const leaderHint = leaderNodeId ? this.#peerHint(leaderNodeId) : null
-    pushPeerKey(
-      leaderNodeId
-        ? (
-            this.network.peerPublicKeyForNodeId(leaderNodeId)
-            ?? leaderHint?.peerPublicKey
-            ?? this.joinState.recovery?.leaderHints?.peerPublicKey
-            ?? null
-          )
-        : null
-    )
 
-    for (const witness of this.#witnessHintEntries(leaderNodeId)) {
-      pushPeerKey(witness.peerPublicKey)
+    if (this.currentLeader() === this.options.identity.publicKeyId) {
+      for (const nodeId of this.#effectiveVoterNodeIds()) {
+        pushNodeIdPeerKey(nodeId)
+      }
+    } else {
+      pushNodeIdPeerKey(leaderNodeId)
+      for (const witness of this.#witnessHintEntries(leaderNodeId)) {
+        pushPeerKey(witness.peerPublicKey)
+      }
+      for (const nodeId of this.#effectiveVoterNodeIds()) {
+        pushNodeIdPeerKey(nodeId)
+      }
     }
 
     const cachedHints = [...this.peerHints.values()]
@@ -2399,6 +2410,15 @@ export class HolepunchSwarmNode {
     }
 
     this.network.setExplicitPeerPublicKeys(prioritizedKeys.slice(0, 8))
+  }
+
+  #schedulePeerMaintenanceTimer() {
+    if (this.closing || this.peerMaintenanceTimer) return
+
+    this.peerMaintenanceTimer = setInterval(() => {
+      this.#refreshDirectPeerConnections()
+    }, this.options.heartbeatIntervalMs)
+    this.peerMaintenanceTimer.unref?.()
   }
 
   #peerHint(nodeId) {
