@@ -1,5 +1,6 @@
 {
   "dataDir": "../../data/node-1",
+  "compatibilityMode": "legacy-static-membership",
   "clusterId": "local-demo",
   "clusterSecret": "9999999999999999999999999999999999999999999999999999999999999999",
   "machineId": "local-demo-node-1",

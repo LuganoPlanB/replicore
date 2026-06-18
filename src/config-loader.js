@@ -15,14 +15,23 @@ export async function loadRuntimeConfig(configPath) {
   const identitySeed = requireHex(raw.identitySeed, "identitySeed")
   const identity = generateIdentity(identitySeed)
   const role = normalizeRole(raw.role)
+  const compatibilityMode = normalizeCompatibilityMode(raw.compatibilityMode)
 
   const authorizedNodes = normalizeAuthorizedNodes(raw)
+  if (compatibilityMode !== "legacy-static-membership") {
+    throw new Error(
+      'Static membership config requires compatibilityMode "legacy-static-membership"'
+    )
+  }
   const localIncluded = authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)
   if (role === "voter" && !localIncluded) {
     throw new Error("Authorized nodes do not include the local identity")
   }
   if (role === "learner" && localIncluded) {
     throw new Error("Learner config must not include the local identity in authorizedNodes")
+  }
+  if (role === "learner") {
+    throw new Error('compatibilityMode "legacy-static-membership" is incompatible with role "learner"')
   }
   const revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
   if (revokedNodeIds.includes(identity.publicKeyId)) {
@@ -35,6 +44,7 @@ export async function loadRuntimeConfig(configPath) {
     dataDir: path.resolve(path.dirname(absolutePath), raw.dataDir),
     clusterId: requireString(raw.clusterId, "clusterId"),
     clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
+    compatibilityMode,
     role,
     machineId: raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId"),
     nodeIdentitySeed:
@@ -67,6 +77,13 @@ function normalizeRole(value) {
   if (value === undefined) return "voter"
   if (value === "voter" || value === "learner") return value
   throw new Error("role must be either voter or learner")
+}
+
+function normalizeCompatibilityMode(value) {
+  if (value === "legacy-static-membership") return value
+  throw new Error(
+    'compatibilityMode must be set to "legacy-static-membership" for file-based static membership configs'
+  )
 }
 
 function normalizeAuthorizedNodes(raw) {

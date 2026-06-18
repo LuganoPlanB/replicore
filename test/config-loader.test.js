@@ -30,6 +30,7 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.clusterId, "local-demo")
     assert.equal(config.clusterSecret.length, 32)
+    assert.equal(config.compatibilityMode, "legacy-static-membership")
     assert.equal(config.machineId, "local-demo-node-1")
     assert.equal(config.http.port, 3001)
     assert.equal(config.authorizedNodes.length, 3)
@@ -66,6 +67,34 @@ test("loadRuntimeConfig requires a 32-byte clusterSecret", async () => {
     await assert.rejects(
       loadRuntimeConfig(configPath),
       /clusterSecret must decode to 32 bytes/
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig requires an explicit legacy compatibility mode for static membership files", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-compat-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    delete raw.compatibilityMode
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /compatibilityMode must be set to "legacy-static-membership"/
+    )
+
+    raw.compatibilityMode = "wrong-mode"
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /compatibilityMode must be set to "legacy-static-membership"/
     )
   } finally {
     await rm(dir, { recursive: true, force: true })
@@ -126,7 +155,7 @@ test("loadRuntimeConfig accepts explicit node transport identity overrides", asy
   }
 })
 
-test("loadRuntimeConfig allows learner configs without local voter membership", async () => {
+test("loadRuntimeConfig rejects learner role in legacy static membership mode", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-learner-"))
 
   try {
@@ -141,12 +170,9 @@ test("loadRuntimeConfig allows learner configs without local voter membership", 
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
-    const config = await loadRuntimeConfig(configPath)
-    assert.equal(config.role, "learner")
-    assert.equal(config.authorizedNodes.length, 2)
-    assert.equal(
-      config.authorizedNodes.some((node) => node.nodeId === config.identity.publicKeyId),
-      false
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /legacy-static-membership" is incompatible with role "learner"/
     )
   } finally {
     await rm(dir, { recursive: true, force: true })

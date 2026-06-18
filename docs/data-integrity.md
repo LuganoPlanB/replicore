@@ -61,6 +61,22 @@ The common cluster secret is for discovery and read-only learner admission only.
 It is not a defense against a node that already knows the secret and behaves
 maliciously.
 
+## Config Modes
+
+The checked-in JSON config files under `examples/local/` are temporary
+compatibility fixtures, not the target production path.
+
+- `compatibilityMode: "legacy-static-membership"` means the file predeclares a
+  static voter set with `authorizedNodeSeeds` or `authorizedNodes`.
+- Legacy static membership is useful for local demos, tests, and staged
+  migration only.
+- Production-ready operation should use `clusterSecret`, secret-derived
+  Holepunch discovery, persisted transport identity, learner admission, and
+  signed promotion rather than a pre-edited static voter file.
+
+Do not mix legacy static membership config with learner admission or later
+dynamic membership in the same running cluster.
+
 ## Protocol Vocabulary
 
 Use these terms consistently in code, tests, and docs:
