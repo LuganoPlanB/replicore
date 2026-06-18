@@ -12,6 +12,7 @@ export const DISCOVERY_TOPIC_PURPOSE = "replicore:dht-topic:v1"
 export const MACHINE_ID_PURPOSE = "replicore:machine-id:v1"
 export const NOISE_NODE_KEY_PURPOSE = "replicore:noise-node-key:v1"
 export const JOIN_SIGNING_KEY_PURPOSE = "replicore:join-signing-key:v1"
+export const CLUSTER_LOG_KEY_PURPOSE = "replicore:cluster-log-key:v1"
 export const CLUSTER_SECRET_SALT_PREFIX = "replicore:kdf:v1"
 
 /**
@@ -119,6 +120,24 @@ export function deriveJoinSeed(input) {
     clusterSecret: input.clusterSecret,
     purpose: JOIN_SIGNING_KEY_PURPOSE,
     context: input.machineId,
+    length: 32
+  })
+}
+
+/**
+ * Derive the shared authoritative log seed from the cluster secret.
+ *
+ * Every voter can derive the same writable Hypercore key pair. Leadership, not
+ * key possession, decides which node may append at runtime.
+ *
+ * @param {{ clusterSecret: Buffer, clusterId: string }} input
+ * @returns {Promise<Buffer>}
+ */
+export function deriveClusterLogSeed(input) {
+  return deriveClusterScopedBytes({
+    clusterSecret: input.clusterSecret,
+    purpose: CLUSTER_LOG_KEY_PURPOSE,
+    context: input.clusterId,
     length: 32
   })
 }

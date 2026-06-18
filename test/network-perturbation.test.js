@@ -349,7 +349,12 @@ test("pre-authorized standby node can join later and catch up without config cha
       identities: cluster.identities.slice(0, 3)
     })
     const leader = cluster.record(leaderId).node
-    await leader.put("hash:standby-before", { standby: "baseline" })
+    await waitForDurableWriteFrom(
+      currentLeaderNode(cluster),
+      "hash:standby-before",
+      { standby: "baseline" },
+      "baseline durable write before standby startup"
+    )
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:standby-before", { standby: "baseline" }),
@@ -388,7 +393,12 @@ test("pre-authorized standby node can join later and catch up without config cha
       }
     )
 
-    await leader.put("hash:standby-after", { standby: "joined" })
+    await waitForDurableWriteFrom(
+      currentLeaderNode(cluster),
+      "hash:standby-after",
+      { standby: "joined" },
+      "durable write after standby joins"
+    )
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:standby-after", { standby: "joined" }),
@@ -535,6 +545,7 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
     )
 
     const learner = cluster.record(learnerIdentity.publicKeyId).node
+    const promotionWindow = nextCredentialWindow()
     const credential = createPromotionCredential({
       payload: {
         v: 1,
@@ -544,8 +555,8 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
         learnerNodeId: learnerIdentity.publicKeyId,
         learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
         targetRole: "voter",
-        issuedAt: "2026-06-18T12:00:00.000Z",
-        expiresAt: "2026-06-18T13:00:00.000Z",
+        issuedAt: promotionWindow.issuedAt,
+        expiresAt: promotionWindow.expiresAt,
         nonce: "joint-promotion-blocked",
         signerNodeId: leaderIdentity.publicKeyId
       },
@@ -603,7 +614,28 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
       }
     )
 
-    const committed = await currentLeaderNode(cluster).commitPromotionCredential(credential)
+    let committed = null
+    let lastPromotionError = null
+    await waitFor(async () => {
+      try {
+        committed = await currentLeaderNode(cluster).commitPromotionCredential(credential)
+        return true
+      } catch (error) {
+        lastPromotionError = error
+        return false
+      }
+    }, {
+      description: "promotion succeeds after heal restores both joint quorums",
+      onTimeout: async () => ({
+        lastPromotionError: lastPromotionError
+          ? {
+              message: lastPromotionError.message,
+              stack: lastPromotionError.stack
+            }
+          : null,
+        diagnostics: await collectClusterDiagnostics(cluster)
+      })
+    })
     assert.equal(committed.version, 1)
     assert.equal(committed.joint, null)
     assert.equal(committed.voters.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
@@ -701,7 +733,28 @@ test("joint-consensus voter removal blocks when only one side of the joint quoru
       }
     )
 
-    const committed = await currentLeaderNode(cluster).removeVoter(removalTargetId)
+    let committed = null
+    let lastRemovalError = null
+    await waitFor(async () => {
+      try {
+        committed = await currentLeaderNode(cluster).removeVoter(removalTargetId)
+        return true
+      } catch (error) {
+        lastRemovalError = error
+        return false
+      }
+    }, {
+      description: "removal succeeds after heal restores both joint quorums",
+      onTimeout: async () => ({
+        lastRemovalError: lastRemovalError
+          ? {
+              message: lastRemovalError.message,
+              stack: lastRemovalError.stack
+            }
+          : null,
+        diagnostics: await collectClusterDiagnostics(cluster)
+      })
+    })
     assert.equal(committed.version, 1)
     assert.equal(committed.joint, null)
     assert.equal(committed.removed.some((entry) => entry.nodeId === removalTargetId), true)
@@ -766,6 +819,12 @@ test("node replacement via revocation and new identity restores service without 
     replacementCluster = await createSwarmCluster({
       identities: activeIdentities,
       authorizedNodes,
+      membership: {
+        version: 0,
+        voters: initialCluster.identities.map((identity) => identity.publicKeyId).sort(),
+        learners: [],
+        removed: []
+      },
       dataDirs: retainedIdentities.map((identity) => initialCluster.record(identity.publicKeyId).dataDir),
       clusterId: initialCluster.options.clusterId,
       topicSalt: initialCluster.options.topicSalt,
@@ -780,6 +839,17 @@ test("node replacement via revocation and new identity restores service without 
     await replacementCluster.startAll()
 
     await waitForClusterConvergence(replacementCluster)
+
+    await waitFor(
+      async () => {
+        const status = await replacementCluster.record(replacementIdentity.publicKeyId).node.getReplicationStatus()
+        return status.membership.localRole === "learner" && status.membership.mismatchedNodeIds.length === 0
+      },
+      {
+        description: "replacement starts as a converged learner",
+        onTimeout: () => collectClusterDiagnostics(replacementCluster)
+      }
+    )
 
     await waitFor(
       async () => hasClusterValue(replacementCluster.nodes, "hash:replacement-before", { replacement: "before" }),
@@ -1044,9 +1114,15 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     await cluster.stopNode(leaderId)
 
     await waitFor(
-      async () => cluster.nodes.every((node) => node.currentLeader() !== leaderId),
+      async () => {
+        const statuses = await Promise.all(cluster.nodes.map((node) => node.getReplicationStatus()))
+        return statuses.every((status) =>
+          status.splitStatus.fenced === true &&
+          status.splitStatus.leaderNodeId === leaderId
+        )
+      },
       {
-        description: "survivors leave the old leader after leader loss",
+        description: "survivors fence writes and keep the old leader address after leader loss",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -1700,9 +1776,9 @@ test("timed-out local append stays uncommitted across leader restart and later h
     )
 
     await waitFor(
-      async () => (await originalLeader.getReplicationStatus()).feeds[leaderId].staged.count === 1,
+      async () => (await originalLeader.getReplicationStatus()).authoritativeLog.staged.count === 0,
       {
-        description: "timed-out local append is retained only as staged state",
+        description: "timed-out local append is removed from the uncommitted authoritative tail",
         onTimeout: () => originalLeader.getReplicationStatus()
       }
     )
@@ -1713,9 +1789,9 @@ test("timed-out local append stays uncommitted across leader restart and later h
 
     const restartedLeader = await cluster.restartNode(leaderId)
     await waitFor(
-      async () => (await restartedLeader.getReplicationStatus()).feeds[leaderId].staged.count === 1,
+      async () => (await restartedLeader.getReplicationStatus()).authoritativeLog.staged.count === 0,
       {
-        description: "staged timed-out append survives leader restart",
+        description: "truncated timed-out append stays absent after leader restart",
         onTimeout: () => restartedLeader.getReplicationStatus()
       }
     )
@@ -2296,7 +2372,7 @@ test("split-fenced follower restart preserves write refusal until the leader ret
     )
 
     const recovered = await restartedFollower.put("hash:restart-split-fenced", { blocked: false })
-    assert.equal(recovered.actor, leaderId)
+    assert.equal(recovered.actor, currentLeaderId(cluster))
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:restart-split-fenced", { blocked: false }),
@@ -2953,5 +3029,14 @@ async function assertRecoveryWindowInvariants(cluster, label) {
       assert.ok(feed.applied <= feed.length, `applied exceeds length after ${label}`)
       assert.ok(feed.lag >= 0, `negative lag after ${label}`)
     }
+  }
+}
+
+function nextCredentialWindow() {
+  const issuedAt = new Date(Date.now() - 60_000)
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000)
+  return {
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: expiresAt.toISOString()
   }
 }

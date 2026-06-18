@@ -193,12 +193,10 @@ test("new and restarted followers read the same authoritative leader-log prefix"
     assert.equal(follower1Replication.authoritativeLog.feedKey, leaderLog.feedKey)
     assert.equal(follower1Replication.authoritativeLog.length, leaderLog.length)
     assert.equal(follower1Replication.authoritativeLog.term, leaderLog.term)
-    assert.equal(
-      follower1Replication.authoritativeLog.feedKey,
-      follower1Replication.feeds[leaderLog.nodeId].feedKey
-    )
 
-    const leaderCoreEntry = await leader.feedCores.get(leaderId).get(forwarded.seq)
+    const leaderCoreEntry = await (leader.options.clusterSecret
+      ? leader.authoritativeLogCore
+      : leader.feedCores.get(leaderId)).get(forwarded.seq)
     const lateFollowerHistory = await lateFollower.getHistory("hash:authoritative-prefix")
     assert.equal(lateFollowerHistory.length, 1)
     assert.equal(lateFollowerHistory[0].opId, leaderCoreEntry.opId)
@@ -1252,6 +1250,10 @@ test("a learner can join through the leader control channel, catch up, and later
       const status = await learner.getReplicationStatus()
       return status.membership.localRole === "voter"
     })
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      return status.membership.matchingNodeIds.includes(learnerIdentity.publicKeyId)
+    })
 
     await follower.close()
     nodes.splice(nodes.indexOf(follower), 1)
@@ -1699,6 +1701,13 @@ test("a removed voter cannot regain write authority or satisfy durability after 
 
     const removedMembership = await leader.removeVoter(removalTargetId)
     assert.equal(removedMembership.removed.some((entry) => entry.nodeId === removalTargetId), true)
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      return (
+        status.membership.joint === null &&
+        status.membership.current.removed.includes(removalTargetId)
+      )
+    })
 
     await waitFor(async () => {
       const status = await removalTarget.getReplicationStatus()
@@ -1744,11 +1753,11 @@ test("a removed voter cannot regain write authority or satisfy durability after 
     await waitFor(async () => {
       const status = await leader.getReplicationStatus()
       return (
-        status.membership.removed.some((entry) => entry.nodeId === removalTargetId) &&
-        !status.membership.learners.some((entry) => entry.nodeId === removalTargetId)
+        status.membership.joint === null &&
+        status.membership.current.removed.includes(removalTargetId) &&
+        !status.membership.current.learners.includes(removalTargetId)
       )
     })
-
     await assert.rejects(
       restartedRemovedNode.put("hash:removed-restart-write", { value: "still-forbidden" }),
       (error) =>
@@ -1905,6 +1914,15 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       return replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
     })
 
+    await waitFor(async () => {
+      const leaderStatus = await leader.getReplicationStatus()
+      const replacementStatus = await replacement.getReplicationStatus()
+      return (
+        leaderStatus.membership.matchingNodeIds.includes(replacementIdentity.publicKeyId) &&
+        replacementStatus.membership.matchingNodeIds.includes(leader.options.identity.publicKeyId)
+      )
+    })
+
     await retainedFollower.close()
     nodes.splice(nodes.indexOf(retainedFollower), 1)
 
@@ -1914,7 +1932,36 @@ test("a replacement learner can join after removal, be promoted, and restore dur
       return status.connections === 2 && replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
     })
 
-    await leader.put("hash:replacement-membership-after", { value: "after-replacement" })
+    let postReplacementWriteError = null
+    await waitFor(async () => {
+      try {
+        await leader.put("hash:replacement-membership-after", { value: "after-replacement" })
+        postReplacementWriteError = null
+        return true
+      } catch (error) {
+        postReplacementWriteError = error
+        if (
+          /Timed out waiting for follower acknowledgement/.test(error?.message ?? "") ||
+          /Durability requirement not met/.test(error?.message ?? "")
+        ) {
+          return false
+        }
+        throw error
+      }
+    }, {
+      description: "replacement voter satisfies durability after retained follower stops",
+      onTimeout: async () => ({
+        lastError: postReplacementWriteError
+          ? {
+              message: postReplacementWriteError.message,
+              stack: postReplacementWriteError.stack
+            }
+          : null,
+        leader: await leader.getReplicationStatus(),
+        replacement: await replacement.getReplicationStatus(),
+        retired: await retiredTarget.getReplicationStatus()
+      })
+    })
     await waitFor(async () => {
       const value = await replacement.get("hash:replacement-membership-after")
       return value?.value?.value === "after-replacement"
@@ -2410,6 +2457,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
     assert.equal(offlineStatus.readStatus.staleReadsPossible, true)
 
     const afterSnapshot = await currentLeaderNode.put("hash:degraded-after", { phase: "after-snapshot" })
+    await waitFor(async () => (await observer.get("hash:degraded-after"))?.value?.phase === "after-snapshot")
     await currentLeaderNode.delete("hash:degraded-delete")
     await waitFor(async () => (await follower.get("hash:degraded-after"))?.value?.phase === "after-snapshot")
     await waitFor(async () => (await follower.get("hash:degraded-delete"))?.deleted === true)

@@ -91,6 +91,18 @@ export class MaterializedView {
       committedLastOpId: operation.opId
     }))
     if (operation.kind === "kv") {
+      const keyspace = /** @type {string} */ (operation.keyspace)
+      const key = /** @type {string} */ (operation.key)
+      const currentKey = `kv/current/${keyspace}/${key}`
+      const valueKey = `kv/value/${keyspace}/${key}`
+      const historyKey = this.#historyKey(keyspace, key, operation)
+      const currentEntry = await this.bee.get(currentKey)
+
+      await batch.del(historyKey)
+      if (currentEntry?.value?.opId === operation.opId) {
+        await batch.del(currentKey)
+        await batch.del(valueKey)
+      }
       await batch.del(this.#stagedEntryKey(feedKey, operation.seq))
     }
     await batch.flush()
@@ -352,6 +364,43 @@ export class MaterializedView {
    */
   async deleteStagedEntry(feedKey, seq) {
     await this.bee.del(this.#stagedEntryKey(feedKey, seq))
+  }
+
+  /**
+   * Discard derived state for an authoritative suffix that was truncated
+   * before commit. Committed progress and user-visible K/V state are preserved.
+   *
+   * @param {string} feedKey
+   * @param {number} keepLength
+   */
+  async discardUncommittedSuffix(feedKey, keepLength) {
+    const current = await this.getFeedProgress(feedKey)
+    const nextRawApplied = Math.max(
+      current.committedApplied,
+      Math.min(current.rawApplied, keepLength)
+    )
+    const batch = this.bee.batch()
+    await batch.put(this.#progressKey(feedKey), this.#nextProgressRecord({
+      feedKey,
+      rawApplied: nextRawApplied,
+      rawLastOpId: nextRawApplied === current.committedApplied ? current.committedLastOpId : current.rawLastOpId,
+      committedApplied: current.committedApplied,
+      committedLastOpId: current.committedLastOpId
+    }))
+
+    for await (const entry of this.bee.createReadStream({
+      gte: `feeds/${feedKey}/staged/${String(keepLength).padStart(12, "0")}`,
+      lt: `feeds/${feedKey}/staged/~`
+    })) {
+      await batch.del(entry.key)
+    }
+    for await (const entry of this.bee.createReadStream({
+      gte: `feeds/${feedKey}/skipped/${String(keepLength).padStart(12, "0")}`,
+      lt: `feeds/${feedKey}/skipped/~`
+    })) {
+      await batch.del(entry.key)
+    }
+    await batch.flush()
   }
 
   /**

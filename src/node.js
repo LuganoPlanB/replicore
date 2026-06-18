@@ -5,8 +5,10 @@ import { join } from "node:path"
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
 import Hypercore from "hypercore"
+import crypto from "hypercore-crypto"
 
 import { canonicalize } from "./canonical.js"
+import { deriveClusterLogSeed } from "./cluster-secret.js"
 import { ConsensusStateStore } from "./consensus-state.js"
 import { keyIdFromPublicKey, signPayload, verifyPayload } from "./crypto.js"
 import { DurabilityWaiter } from "./durability-waiter.js"
@@ -104,11 +106,16 @@ export class HolepunchSwarmNode {
     this.transportIdentity = null
     this.viewBee = null
     this.view = null
+    this.authoritativeLogIdentity = null
+    this.authoritativeLogCore = null
     this.feedCores = new Map()
     this.heartbeatTimer = null
     this.heartbeatPromise = null
+    this.authoritativeSyncTimer = null
     this.electionTimer = null
     this.syncPromises = new Map()
+    this.authoritativeSyncPromise = null
+    this.authoritativeSyncPending = false
     this.pendingSync = new Set()
     this.localAppendLock = Promise.resolve()
     this.durabilityWaiter = new DurabilityWaiter({
@@ -147,6 +154,7 @@ export class HolepunchSwarmNode {
 
     this.store = new Corestore(join(this.options.dataDir, "corestore"))
     await this.store.ready()
+    this.authoritativeLogIdentity = await this.#resolveAuthoritativeLogIdentity()
 
     const viewCore = this.store.get({ name: "derived-view" })
     this.viewBee = new Hyperbee(viewCore, { keyEncoding: "utf-8", valueEncoding: "json" })
@@ -173,6 +181,9 @@ export class HolepunchSwarmNode {
         if (this.currentLeader() !== this.options.identity.publicKeyId) {
           throw new Error("This node is not the current leader")
         }
+        if (this.#membershipRole(message.from) !== "voter") {
+          throw this.#createLearnerWriteError()
+        }
 
         return message.request.action === "put"
           ? this.#appendKvOperation("put", message.request.key, message.request.value, message.request.options ?? {})
@@ -181,6 +192,7 @@ export class HolepunchSwarmNode {
       onVoteRequest: async (message) => this.#handleVoteRequest(message),
       onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
     })
+    this.authoritativeLogCore = await this.#ensureAuthoritativeLogCore()
     await this.#ensureFeedCore(this.#localNodeRecord())
 
     for (const node of this.options.authorizedNodes) {
@@ -202,6 +214,10 @@ export class HolepunchSwarmNode {
           throw error
         }
       })
+    }
+    if (this.#usesSharedAuthoritativeLog()) {
+      await this.syncAuthoritativeLog()
+      this.#scheduleAuthoritativeSyncTimer()
     }
 
     if (!this.#isLearner()) {
@@ -275,11 +291,15 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async put(key, value, options = {}) {
+    await this.#refreshAuthoritativeMembership()
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
     if (this.#isSplitFenced()) {
       throw this.#createSplitFencedError()
+    }
+    if (await this.#shouldBlockForMembershipMismatch()) {
+      throw new Error("Durability requirement not met: membership mismatch blocks degraded writes")
     }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "put", key, value, options })
@@ -293,11 +313,15 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async delete(key, options = {}) {
+    await this.#refreshAuthoritativeMembership()
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
     if (this.#isSplitFenced()) {
       throw this.#createSplitFencedError()
+    }
+    if (await this.#shouldBlockForMembershipMismatch()) {
+      throw new Error("Durability requirement not met: membership mismatch blocks degraded writes")
     }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "delete", key, options })
@@ -341,6 +365,7 @@ export class HolepunchSwarmNode {
     const now = Date.now()
 
     for (const node of this.options.authorizedNodes) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       const status = await this.#feedReplicationStatus(node.nodeId, heartbeats, now)
       if (!status) continue
       feeds[node.nodeId] = status
@@ -348,7 +373,8 @@ export class HolepunchSwarmNode {
 
     const authoritativeLogNodeId = this.#authoritativeLogNodeId()
     const authoritativeLog = await this.getAuthoritativeLogStatus()
-    const authoritativeReplication =
+    const authoritativeReplication = await this.#authoritativeReplicationStatus()
+    const leaderFeedStatus =
       feeds[authoritativeLogNodeId] ??
       (await this.#feedReplicationStatus(authoritativeLogNodeId, heartbeats, now))
 
@@ -364,19 +390,14 @@ export class HolepunchSwarmNode {
       },
       authoritativeLog: {
         ...authoritativeLog,
-        applied: authoritativeReplication?.applied ?? 0,
-        lag: authoritativeReplication?.lag ?? authoritativeLog.length,
-        staged: authoritativeReplication?.staged ?? {
-          count: 0,
-          firstSeq: null,
-          lastSeq: null,
-          latestOpId: null,
-          latestKey: null
-        },
-        connectedPeers: authoritativeReplication?.connectedPeers ?? 0,
-        alive: authoritativeReplication?.alive ?? false,
-        heartbeatAgeMs: authoritativeReplication?.heartbeatAgeMs ?? null
+        applied: authoritativeReplication.applied,
+        lag: authoritativeReplication.lag,
+        staged: authoritativeReplication.staged,
+        connectedPeers: leaderFeedStatus?.connectedPeers ?? 0,
+        alive: leaderFeedStatus?.alive ?? false,
+        heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? null
       },
+      peerReplication: feeds,
       splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
@@ -428,14 +449,25 @@ export class HolepunchSwarmNode {
   /**
    * Return the single authoritative Raft log descriptor that this node is
    * currently following.
-   *
-   * While the physical storage migration is still in progress, the
-   * authoritative cluster log is the current leader feed, or the last known
-   * leader feed while this node is fenced and reconnecting.
    */
   async getAuthoritativeLogStatus() {
     const node = this.#authoritativeLogRecord()
     const core = this.#authoritativeLogCore()
+    const tail = []
+    const start = Math.max(0, (core?.length ?? 0) - 3)
+    for (let index = start; index < (core?.length ?? 0); index += 1) {
+      const operation = await core.get(index)
+      tail.push({
+        seq: operation.seq,
+        kind: operation.kind,
+        type: operation.type,
+        actor: operation.actor,
+        term: operation.term,
+        membershipPhase: operation.membership?.phase ?? null,
+        membershipChangeType: operation.membership?.changeType ?? null,
+        membershipTargetNodeId: operation.membership?.targetNodeId ?? null
+      })
+    }
 
     return {
       nodeId: node.nodeId,
@@ -443,7 +475,8 @@ export class HolepunchSwarmNode {
       length: core?.length ?? 0,
       term: this.consensusState.currentTerm,
       commitIndex: this.consensusState.commitIndex,
-      lastApplied: this.consensusState.lastApplied
+      lastApplied: this.consensusState.lastApplied,
+      tail
     }
   }
 
@@ -485,11 +518,16 @@ export class HolepunchSwarmNode {
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       throw new Error("Only the current leader may commit membership promotions")
     }
-    if (this.#jointMembership()) {
-      throw new Error("Another membership change is already in progress")
-    }
 
     const learnerNodeId = credential?.payload?.learnerNodeId
+    const joint = this.#jointMembership()
+    if (joint) {
+      if (joint.changeType !== "promotion" || joint.targetNodeId !== learnerNodeId) {
+        throw new Error("Another membership change is already in progress")
+      }
+      return this.#completeJointPromotion(credential, joint)
+    }
+
     const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
     if (!learnerRecord) {
       throw new Error("Promotion target must be a known learner")
@@ -514,7 +552,7 @@ export class HolepunchSwarmNode {
       })),
       seenCredentialHashes: await this.#seenPromotionCredentialHashes(),
       seenNonces: await this.#seenPromotionNonces(),
-      isCaughtUp: await this.#isLearnerPromotionReady(learnerRecord.feedKey)
+      isCaughtUp: await this.#isLearnerPromotionReady()
     })
 
     const oldVoters = this.membershipState.current.voters
@@ -543,15 +581,82 @@ export class HolepunchSwarmNode {
     return await this.#membershipStatusSnapshot()
   }
 
+  async #completeJointPromotion(credential, joint) {
+    const learnerNodeId = credential?.payload?.learnerNodeId
+    const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
+    if (!learnerRecord) {
+      throw new Error("Promotion target must be a known learner")
+    }
+
+    const learnerNoisePublicKey = this.network?.peerPublicKeyForNodeId(learnerNodeId)
+    if (!learnerNoisePublicKey) {
+      throw new Error("Promotion target must be connected before promotion")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.membershipState.current.version,
+      learnerNodeId,
+      learnerNoisePublicKey,
+      authorizedNodes: this.#voterNodes().map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: node.publicKey
+      })),
+      seenCredentialHashes: new Set(),
+      seenNonces: new Set(),
+      isCaughtUp: await this.#isLearnerPromotionReady()
+    })
+    const learners = this.membershipState.current.learners.filter((nodeId) => nodeId !== learnerNodeId).sort()
+    const removed = this.membershipState.current.removed.filter((nodeId) => nodeId !== learnerNodeId).sort()
+
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType: "promotion",
+      targetNodeId: learnerNodeId,
+      targetPublicKey: learnerRecord.publicKey?.toString("hex") ?? null,
+      targetFeedKey: learnerRecord.feedKey,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners,
+      removed,
+      quorumGroups: this.#jointQuorumGroups(joint)
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
+    await this.consensusBee.put("promotion/current", {
+      credentialHash: summary.credentialHash,
+      targetRole: summary.targetRole,
+      signerNodeId: summary.signerNodeId,
+      learnerNodeId: summary.learnerNodeId,
+      learnerNoisePublicKey: summary.learnerNoisePublicKey,
+      expiresAt: summary.expiresAt,
+      eligible: true,
+      accepted: true
+    })
+    await this.#runHeartbeat({ fresh: true })
+    return await this.#membershipStatusSnapshot()
+  }
+
   async removeVoter(nodeId) {
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       throw new Error("Only the current leader may remove voters")
     }
-    if (this.#jointMembership()) {
-      throw new Error("Another membership change is already in progress")
+    const joint = this.#jointMembership()
+    if (joint) {
+      if (joint.changeType !== "removal" || joint.targetNodeId !== nodeId) {
+        throw new Error("Another membership change is already in progress")
+      }
+      return this.#completeJointRemoval(nodeId, joint)
     }
     if (nodeId === this.options.identity.publicKeyId) {
       throw new Error("Self-removal is not supported in this implementation")
+    }
+    if (this.#currentMembershipRole(nodeId) === "removed") {
+      return await this.#membershipStatusSnapshot()
     }
     if (this.#currentMembershipRole(nodeId) !== "voter") {
       throw new Error("Removal target is not currently a voter")
@@ -569,6 +674,41 @@ export class HolepunchSwarmNode {
       removed
     })
 
+    return await this.#membershipStatusSnapshot()
+  }
+
+  async #completeJointRemoval(nodeId, joint) {
+    if (nodeId === this.options.identity.publicKeyId) {
+      throw new Error("Self-removal is not supported in this implementation")
+    }
+
+    const targetRecord = this.options.authorizedNodes.find((node) => node.nodeId === nodeId)
+    if (!targetRecord) {
+      throw new Error("Removal target must be a known voter")
+    }
+
+    const learners = this.membershipState.current.learners.filter((entry) => entry !== nodeId).sort()
+    const removed = [...new Set([...this.membershipState.current.removed, nodeId])].sort()
+
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType: "removal",
+      targetNodeId: nodeId,
+      targetPublicKey: targetRecord.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetRecord.feedKey,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners,
+      removed,
+      quorumGroups: this.#jointQuorumGroups(joint)
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
+    await this.#runHeartbeat({ fresh: true })
     return await this.#membershipStatusSnapshot()
   }
 
@@ -609,14 +749,18 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    if (this.authoritativeSyncTimer) clearInterval(this.authoritativeSyncTimer)
     if (this.electionTimer) clearTimeout(this.electionTimer)
     await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
+    this.authoritativeSyncPending = false
     await this.suspendNetworking()
     this.joinControl?.close()
     this.rpc?.close(new Error("Node is closing"))
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
+    await Promise.allSettled(this.authoritativeSyncPromise ? [this.authoritativeSyncPromise] : [])
+    if (this.#usesSharedAuthoritativeLog() && this.authoritativeLogCore) await this.authoritativeLogCore.close()
     await Promise.allSettled(this.syncPromises.values())
     this.network?.clear()
     if (this.consensusBee) await this.consensusBee.close()
@@ -643,7 +787,7 @@ export class HolepunchSwarmNode {
     try {
       await promise
     } catch (error) {
-      if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+      if (!this.closing && !this.#isIgnoredSyncError(error)) {
         throw error
       }
     } finally {
@@ -653,6 +797,48 @@ export class HolepunchSwarmNode {
         await this.syncFeed(nodeId)
       }
     }
+  }
+
+  async syncAuthoritativeLog() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.closing && !this.authoritativeSyncPromise) {
+      return
+    }
+
+    if (this.authoritativeSyncPromise) {
+      this.authoritativeSyncPending = true
+      return this.authoritativeSyncPromise
+    }
+
+    const promise = this.#syncAuthoritativeLogLoop()
+    this.authoritativeSyncPromise = promise
+
+    try {
+      await promise
+    } catch (error) {
+      if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+        throw error
+      }
+    } finally {
+      this.authoritativeSyncPromise = null
+      if (!this.closing && this.authoritativeSyncPending) {
+        this.authoritativeSyncPending = false
+        await this.syncAuthoritativeLog()
+      }
+    }
+  }
+
+  #scheduleAuthoritativeSyncTimer() {
+    if (this.closing || !this.#usesSharedAuthoritativeLog() || this.authoritativeSyncTimer) return
+
+    this.authoritativeSyncTimer = setInterval(() => {
+      void this.syncAuthoritativeLog().catch((error) => {
+        if (!this.closing && !this.#isIgnoredSyncError(error)) {
+          throw error
+        }
+      })
+    }, this.options.heartbeatIntervalMs)
+    this.authoritativeSyncTimer.unref?.()
   }
 
   /**
@@ -683,6 +869,7 @@ export class HolepunchSwarmNode {
           lastOpId: operation.opId
         })
         await this.#applyRejectedFeedEntries(nodeId, operation.heartbeat?.rejectedFeeds?.[node.feedKey] ?? [])
+        await this.#reconcileAuthoritativeTailFromHeartbeat(nodeId, operation)
         this.lastHeartbeatByNode.set(operation.actor, {
           ts: operation.ts,
           feed: node.feedKey,
@@ -691,12 +878,17 @@ export class HolepunchSwarmNode {
           rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
-        const watermark = operation.heartbeat?.appliedFeeds?.[node.feedKey]
-        if (Number.isInteger(watermark) && watermark > 0) {
-          await this.#advanceCommittedFeed(nodeId, watermark)
+        const watermark = this.#usesSharedAuthoritativeLog()
+          ? operation.heartbeat?.leaderCommitIndex
+          : operation.heartbeat?.appliedFeeds?.[node.feedKey]
+        if (Number.isInteger(watermark) && watermark >= (this.#usesSharedAuthoritativeLog() ? 0 : 1)) {
+          await this.#advanceCommittedFeed(
+            this.#usesSharedAuthoritativeLog() ? watermark + 1 : nodeId,
+            this.#usesSharedAuthoritativeLog() ? undefined : watermark
+          )
         }
         await this.#observeRemoteOperation(nodeId, operation)
-      } else if (operation.kind === "kv") {
+      } else if (!this.#usesSharedAuthoritativeLog() && operation.kind === "kv") {
         await this.view.stageEntry(node.feedKey, {
           nodeId,
           source: nodeId === this.options.identity.publicKeyId ? "local" : "remote",
@@ -711,7 +903,7 @@ export class HolepunchSwarmNode {
           void this.#sendAck(nodeId, operation.seq)
         }
         await this.#observeRemoteOperation(nodeId, operation)
-      } else if (operation.kind === "membership") {
+      } else if (!this.#usesSharedAuthoritativeLog() && operation.kind === "membership") {
         await this.view.setRawProgress(node.feedKey, {
           applied: operation.seq + 1,
           lastOpId: operation.opId
@@ -720,6 +912,61 @@ export class HolepunchSwarmNode {
           void this.#sendAck(nodeId, operation.seq)
         }
         await this.#observeRemoteOperation(nodeId, operation)
+      } else {
+        throw new Error(`Non-authoritative feed ${nodeId} may not carry ${operation.kind} entries`)
+      }
+      rawApplied += 1
+    }
+  }
+
+  async #syncAuthoritativeLogLoop() {
+    const core = this.#authoritativeLogCore()
+    const feedKey = this.#authoritativeLogFeedKey()
+    let rawApplied = await this.view.getRawApplied(feedKey)
+
+    while (rawApplied < core.length) {
+      if (this.closing) return
+
+      const operation = await core.get(rawApplied)
+      if (operation.seq !== rawApplied) {
+        throw new Error(`Authoritative log sequence mismatch at slot ${rawApplied}`)
+      }
+      if (!this.#isKnownAuthoritativeActor(operation.actor)) {
+        return
+      }
+      this.#validateAuthoritativeOperation(operation)
+      if (!verifySignedOperation(operation, this.authoritativeLogIdentity.publicKey)) {
+        throw new Error(`Invalid authoritative operation at sequence ${rawApplied}`)
+      }
+      if (operation.actor !== this.options.identity.publicKeyId && !this.#canAcceptAuthoritativeActor(operation.actor)) {
+        return
+      }
+      const previousOperation = rawApplied === 0 ? null : await core.get(rawApplied - 1)
+      validateLogLink(operation, previousOperation, rawApplied)
+      if (operation.kind === "heartbeat") {
+        throw new Error("Heartbeat entries are not allowed in the authoritative log")
+      }
+      if (operation.kind === "kv") {
+        await this.view.stageEntry(feedKey, {
+          nodeId: operation.actor,
+          source: operation.actor === this.options.identity.publicKeyId ? "local" : "remote",
+          validation: "valid",
+          operation
+        })
+      }
+      await this.view.setRawProgress(feedKey, {
+        applied: operation.seq + 1,
+        lastOpId: operation.opId
+      })
+      if (operation.actor !== this.options.identity.publicKeyId) {
+        void this.#sendAck(operation.actor, operation.seq)
+      }
+      if (
+        operation.kind === "membership" &&
+        operation.membership?.phase === "final" &&
+        operation.membership?.removed?.includes(this.options.identity.publicKeyId)
+      ) {
+        await this.#advanceCommittedFeed(operation.seq + 1)
       }
       rawApplied += 1
     }
@@ -728,13 +975,20 @@ export class HolepunchSwarmNode {
   async #appendHeartbeat() {
     if (this.closing) return
     if (this.#isLearner()) return
+    if (this.#usesSharedAuthoritativeLog()) {
+      await this.syncAuthoritativeLog()
+    }
 
     const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     if (this.closing) return
 
     try {
       await this.#withLocalAppendLock(async () => {
-        const previousOperation = await this.#previousLocalOperation()
+        const previousOperation = this.#usesSharedAuthoritativeLog()
+          ? await this.#previousAuthoritativeOperation()
+          : await this.#previousLocalOperation()
+        const previousHeartbeat = await this.#previousHeartbeatOperation()
+        const heartbeatCore = this.#localCore()
         const heartbeat = {
           leaderId: leader,
           leaderCommitIndex: this.consensusState.commitIndex,
@@ -753,11 +1007,11 @@ export class HolepunchSwarmNode {
           type: "put",
           key: `heartbeat:${this.options.identity.publicKeyId}`,
           keyspace: "system",
-          seq: this.#localCore().length,
-          term: this.consensusState.currentTerm,
-          index: this.#localCore().length,
-          prevIndex: previousOperation?.index ?? -1,
-          prevHash: previousOperation?.entryHash ?? null,
+          seq: heartbeatCore.length,
+          term: Math.max(this.consensusState.currentTerm, previousHeartbeat?.term ?? -1),
+          index: heartbeatCore.length,
+          prevIndex: heartbeatCore.length === 0 ? -1 : heartbeatCore.length - 1,
+          prevHash: previousHeartbeat?.entryHash ?? null,
           feed: this.options.identity.feedKey,
           actor: this.options.identity.publicKeyId,
           secretKey: this.options.identity.secretKey,
@@ -765,7 +1019,7 @@ export class HolepunchSwarmNode {
           encryptionKeyId: this.encryption.currentKeyId,
           heartbeat
         })
-        await this.#localCore().append(operation)
+        await heartbeatCore.append(operation)
       })
       await this.syncFeed(this.options.identity.publicKeyId)
     } catch (error) {
@@ -773,7 +1027,10 @@ export class HolepunchSwarmNode {
     }
   }
 
-  async #runHeartbeat() {
+  async #runHeartbeat(options = {}) {
+    if (options.fresh && this.heartbeatPromise) {
+      await this.heartbeatPromise
+    }
     if (this.heartbeatPromise) return this.heartbeatPromise
 
     const heartbeatPromise = this.#appendHeartbeat().finally(() => {
@@ -783,6 +1040,11 @@ export class HolepunchSwarmNode {
     })
     this.heartbeatPromise = heartbeatPromise
     return heartbeatPromise
+  }
+
+  async #refreshAuthoritativeMembership() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    await this.syncAuthoritativeLog()
   }
 
   #scheduleElectionTimer() {
@@ -817,6 +1079,12 @@ export class HolepunchSwarmNode {
       if (!this.#isSplitFenced()) {
         this.#enterSplitFence("leader-heartbeat-expired", lastKnownLeader)
         await this.#persistSplitState()
+        this.#scheduleElectionTimer()
+        return
+      }
+
+      const membership = await this.#membershipStatusSnapshot()
+      if (membership.mismatchedNodeIds.length > 0) {
         this.#scheduleElectionTimer()
         return
       }
@@ -938,9 +1206,11 @@ export class HolepunchSwarmNode {
   }
 
   async #observeRemoteOperation(nodeId, operation) {
-    const previousOperation = operation?.seq > 0
-      ? await this.feedCores.get(nodeId)?.get(operation.seq - 1)
-      : null
+    const previousOperation = operation?.kind === "heartbeat" && this.#usesSharedAuthoritativeLog()
+      ? await this.#previousAuthoritativeOperation()
+      : operation?.seq > 0
+        ? await this.feedCores.get(nodeId)?.get(operation.seq - 1)
+        : null
     const observation = this.consensusEngine.observeRemoteOperation({
       nodeId,
       voterNodeIds: this.membershipState.current.voters,
@@ -978,10 +1248,12 @@ export class HolepunchSwarmNode {
   }
 
   async #localLastLogInfo() {
-    const core = this.#localCore()
+    const core = this.#usesSharedAuthoritativeLog()
+      ? this.#authoritativeLogCore()
+      : this.#localCore()
     for (let index = core.length - 1; index >= 0; index -= 1) {
       const operation = await core.get(index)
-      if (this.#countsForElectionLog(operation)) {
+      if (this.#usesSharedAuthoritativeLog() || this.#countsForElectionLog(operation)) {
         return {
           index: operation.index ?? index,
           term: operation.term ?? -1
@@ -1043,6 +1315,61 @@ export class HolepunchSwarmNode {
       throw new Error("Durability requirement not met: no reachable quorum available")
     }
 
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#appendLegacyKvOperation(type, key, value, options, quorumGroups)
+    }
+
+    try {
+      const operation = await this.#withLocalAppendLock(async () => {
+        const previousOperation = await this.#previousAuthoritativeOperation()
+        const authoritativeCore = this.#authoritativeLogCore()
+        const operation = createSignedOperation({
+          kind: "kv",
+          type,
+          key,
+          keyspace: options.keyspace,
+          value,
+          seq: authoritativeCore.length,
+          term: this.consensusState.currentTerm,
+          index: authoritativeCore.length,
+          prevIndex: previousOperation?.index ?? -1,
+          prevHash: previousOperation?.entryHash ?? null,
+          feed: this.#authoritativeLogFeedKey(),
+          actor: this.options.identity.publicKeyId,
+          secretKey: this.authoritativeLogIdentity.secretKey,
+          encryptionKey: this.#currentEncryptionKey(),
+          encryptionKeyId: this.encryption.currentKeyId,
+          ttlMs: options.ttlMs
+        })
+        const ackPromise = this.durabilityWaiter.waitForGroups(
+          operation.seq,
+          quorumGroups,
+          [this.options.identity.publicKeyId]
+        )
+        ackPromise.catch(() => {})
+        await authoritativeCore.append(operation)
+        await this.syncAuthoritativeLog()
+        try {
+          await ackPromise
+        } catch (error) {
+          if (this.closing) {
+            throw new Error("Node is closing")
+          }
+          await this.#truncateUncommittedAuthoritativeTail()
+          throw error
+        }
+        await this.#advanceCommittedFeed(operation.seq + 1)
+        return operation
+      })
+      await this.#runHeartbeat()
+      return operation
+    } catch (error) {
+      await this.#runHeartbeat()
+      throw error
+    }
+  }
+
+  async #appendLegacyKvOperation(type, key, value, options, quorumGroups) {
     let operation = null
     let ackPromise = null
     await this.#withLocalAppendLock(async () => {
@@ -1138,12 +1465,22 @@ export class HolepunchSwarmNode {
    */
   #recordAck(nodeId, seq) {
     if (nodeId === this.options.identity.publicKeyId) return
-    if (this.#membershipRole(nodeId) !== "voter") return
     this.durabilityWaiter.record(nodeId, seq)
   }
 
   #localCore() {
     return this.feedCores.get(this.options.identity.publicKeyId)
+  }
+
+  #usesSharedAuthoritativeLog() {
+    return Boolean(this.options.clusterSecret)
+  }
+
+  #authoritativeLogFeedKey() {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#getAuthorizedNode(this.#authoritativeLogNodeId()).feedKey
+    }
+    return this.authoritativeLogIdentity.feedKey
   }
 
   /**
@@ -1180,11 +1517,19 @@ export class HolepunchSwarmNode {
   }
 
   #authoritativeLogRecord() {
-    return this.#getAuthorizedNode(this.#authoritativeLogNodeId())
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#getAuthorizedNode(this.#authoritativeLogNodeId())
+    }
+    return {
+      nodeId: this.#authoritativeLogNodeId(),
+      feedKey: this.#authoritativeLogFeedKey()
+    }
   }
 
   #authoritativeLogCore() {
-    return this.#nodeCore(this.#authoritativeLogNodeId())
+    return this.#usesSharedAuthoritativeLog()
+      ? this.authoritativeLogCore
+      : this.#nodeCore(this.#authoritativeLogNodeId())
   }
 
   /**
@@ -1215,12 +1560,124 @@ export class HolepunchSwarmNode {
     }
   }
 
+  async #authoritativeReplicationStatus() {
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const applied = await this.view.getApplied(feedKey)
+    const staged = await this.view.getStagedSummary(feedKey)
+
+    return {
+      feedKey,
+      length: core.length,
+      applied,
+      lag: core.length - applied,
+      staged
+    }
+  }
+
   #localNodeRecord() {
     return {
       nodeId: this.options.identity.publicKeyId,
       publicKey: this.options.identity.publicKey,
       feedKey: this.options.identity.feedKey
     }
+  }
+
+  async #resolveAuthoritativeLogIdentity() {
+    if (!this.options.clusterSecret) {
+      return {
+        publicKey: this.options.identity.publicKey,
+        secretKey: this.options.identity.secretKey,
+        feedKey: this.options.identity.feedKey
+      }
+    }
+
+    const seed = await deriveClusterLogSeed({
+      clusterSecret: this.options.clusterSecret,
+      clusterId: this.options.clusterId
+    })
+    const keyPair = crypto.keyPair(seed)
+
+    return {
+      publicKey: keyPair.publicKey,
+      secretKey: keyPair.secretKey,
+      feedKey: Hypercore.key(keyPair.publicKey).toString("hex")
+    }
+  }
+
+  async #ensureAuthoritativeLogCore() {
+    if (this.authoritativeLogCore) {
+      return this.authoritativeLogCore
+    }
+
+    const core = this.store.get({
+      keyPair: {
+        publicKey: this.authoritativeLogIdentity.publicKey,
+        secretKey: this.authoritativeLogIdentity.secretKey
+      },
+      valueEncoding: "json"
+    })
+    await core.ready()
+    core.on("append", () => {
+      void this.syncAuthoritativeLog().catch((error) => {
+        if (!this.closing && !this.#isIgnoredSyncError(error)) {
+          throw error
+        }
+      })
+    })
+    this.authoritativeLogCore = core
+    return core
+  }
+
+  async #truncateUncommittedAuthoritativeTail() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const core = this.#authoritativeLogCore()
+    const feedKey = this.#authoritativeLogFeedKey()
+    const keepLength = await this.view.getApplied(feedKey)
+    if (core.length > keepLength) {
+      await core.truncate(keepLength)
+    }
+    await this.view.discardUncommittedSuffix(feedKey, keepLength)
+    if (this.consensusState.commitIndex >= keepLength || this.consensusState.lastApplied >= keepLength) {
+      this.consensusState = await this.consensusStateStore.save({
+        commitIndex: keepLength - 1,
+        lastApplied: keepLength - 1
+      })
+    }
+  }
+
+  /**
+   * Follow the leader's advertised authoritative log boundary by discarding
+   * only local uncommitted suffix entries beyond that boundary.
+   *
+   * @param {string} nodeId
+   * @param {Record<string, unknown>} operation
+   */
+  async #reconcileAuthoritativeTailFromHeartbeat(nodeId, operation) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (operation.kind !== "heartbeat") return
+    if (operation.heartbeat?.leaderId !== nodeId) return
+    if (operation.heartbeat?.observedLeader !== nodeId) return
+
+    const leaderLength = (operation.heartbeat?.prevLogIndex ?? -1) + 1
+    if (!Number.isInteger(leaderLength) || leaderLength < 0) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const keepLength = Math.max(committedApplied, this.consensusState.commitIndex + 1, leaderLength)
+    const core = this.#authoritativeLogCore()
+    if (core.length <= keepLength) return
+
+    const firstSuffixOperation = await core.get(keepLength)
+    const heartbeatTime = Date.parse(operation.ts)
+    const suffixTime = Date.parse(firstSuffixOperation?.ts)
+    if (Number.isFinite(heartbeatTime) && Number.isFinite(suffixTime) && heartbeatTime <= suffixTime) {
+      return
+    }
+
+    await core.truncate(keepLength)
+    await this.view.discardUncommittedSuffix(feedKey, keepLength)
   }
 
   /**
@@ -1246,8 +1703,20 @@ export class HolepunchSwarmNode {
     }
   }
 
-  async #previousLocalOperation() {
+  async #previousHeartbeatOperation() {
     const core = this.#localCore()
+    if (core.length === 0) return null
+    return core.get(core.length - 1)
+  }
+
+  async #previousLocalOperation() {
+    return this.#previousHeartbeatOperation()
+  }
+
+  async #previousAuthoritativeOperation() {
+    const core = this.#usesSharedAuthoritativeLog()
+      ? this.#authoritativeLogCore()
+      : this.#localCore()
     if (core.length === 0) return null
     return core.get(core.length - 1)
   }
@@ -1451,6 +1920,18 @@ export class HolepunchSwarmNode {
     return entry?.value ?? null
   }
 
+  async #shouldBlockForMembershipMismatch() {
+    const heartbeats = await this.view.getHeartbeats()
+    const membership = this.#membershipStatus(heartbeats)
+    const reachableVotingNodeIds = this.#reachableVotingNodeIds()
+    const effectiveVoters = new Set(this.#effectiveVoterNodeIds())
+    const reachableMismatches = membership.mismatchedNodeIds.filter((nodeId) =>
+      effectiveVoters.has(nodeId) && this.#isLeaderReachable(nodeId)
+    )
+    if (reachableMismatches.length === 0) return false
+    return reachableVotingNodeIds.length < this.membershipState.current.voters.length
+  }
+
   async #seenPromotionCredentialHashes() {
     const seen = new Set()
     for await (const entry of this.consensusBee.createReadStream({
@@ -1478,7 +1959,11 @@ export class HolepunchSwarmNode {
     return this.currentLeader() !== null
   }
 
-  async #isLearnerPromotionReady(feedKey) {
+  async #isLearnerPromotionReady(feedKey = this.#authoritativeLogFeedKey()) {
+    if (this.#usesSharedAuthoritativeLog()) {
+      return (await this.view.getApplied(this.#authoritativeLogFeedKey())) === this.#authoritativeLogCore().length
+    }
+
     const learnerNode = this.options.authorizedNodes.find((node) => node.feedKey === feedKey)
     if (!learnerNode) return false
     return (await this.view.getApplied(feedKey)) === this.feedCores.get(learnerNode.nodeId)?.length
@@ -1491,32 +1976,51 @@ export class HolepunchSwarmNode {
   }
 
   async #appliedFeeds() {
-    const applied = {}
-    for (const node of this.#voterNodes()) {
-      if (node.nodeId === this.options.identity.publicKeyId) {
-        const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
-        applied[node.feedKey] = Math.max(await this.view.getApplied(node.feedKey), durableApplied)
-        continue
-      }
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const applied = {}
+      for (const node of this.#voterNodes()) {
+        if (node.nodeId === this.options.identity.publicKeyId) {
+          const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
+          applied[node.feedKey] = Math.max(await this.view.getApplied(node.feedKey), durableApplied)
+          continue
+        }
 
-      applied[node.feedKey] = await this.view.getApplied(node.feedKey)
+        applied[node.feedKey] = await this.view.getApplied(node.feedKey)
+      }
+      return applied
     }
+
+    const applied = {}
+    const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
+    applied[this.#authoritativeLogFeedKey()] = Math.max(
+      await this.view.getApplied(this.#authoritativeLogFeedKey()),
+      durableApplied
+    )
     return applied
   }
 
   async #rejectedFeeds() {
-    const rejected = {}
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const rejected = {}
 
-    for (const node of this.#voterNodes()) {
-      if (node.nodeId !== this.options.identity.publicKeyId) continue
+      for (const node of this.#voterNodes()) {
+        if (node.nodeId !== this.options.identity.publicKeyId) continue
 
-      const rejectedSeqs = await this.view.getSkippedEntries(node.feedKey)
+        const rejectedSeqs = await this.view.getSkippedEntries(node.feedKey)
 
-      if (rejectedSeqs.length > 0) {
-        rejected[node.feedKey] = rejectedSeqs
+        if (rejectedSeqs.length > 0) {
+          rejected[node.feedKey] = rejectedSeqs
+        }
       }
+
+      return rejected
     }
 
+    const rejected = {}
+    const rejectedSeqs = await this.view.getSkippedEntries(this.#authoritativeLogFeedKey())
+    if (rejectedSeqs.length > 0) {
+      rejected[this.#authoritativeLogFeedKey()] = rejectedSeqs
+    }
     return rejected
   }
 
@@ -1525,10 +2029,19 @@ export class HolepunchSwarmNode {
    * @param {number[]} rejectedSeqs
    */
   async #applyRejectedFeedEntries(nodeId, rejectedSeqs) {
-    const node = this.#getAuthorizedNode(nodeId)
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const node = this.#getAuthorizedNode(nodeId)
+      for (const seq of rejectedSeqs) {
+        await this.view.markSkippedEntry(node.feedKey, seq)
+        await this.view.setStagedEntryResolution(node.feedKey, seq, "rejected")
+      }
+      return
+    }
+
+    const feedKey = this.#authoritativeLogFeedKey()
     for (const seq of rejectedSeqs) {
-      await this.view.markSkippedEntry(node.feedKey, seq)
-      await this.view.setStagedEntryResolution(node.feedKey, seq, "rejected")
+      await this.view.markSkippedEntry(feedKey, seq)
+      await this.view.setStagedEntryResolution(feedKey, seq, "rejected")
     }
   }
 
@@ -1536,44 +2049,112 @@ export class HolepunchSwarmNode {
    * Advance the committed prefix for a feed without exposing entries that only
    * exist in the raw replicated suffix.
    *
-   * @param {string} nodeId
    * @param {number} targetApplied
    */
-  async #advanceCommittedFeed(nodeId, targetApplied) {
-    const node = this.#getAuthorizedNode(nodeId)
-    const core = this.feedCores.get(nodeId)
-    const rawApplied = await this.view.getRawApplied(node.feedKey)
-    let committedApplied = await this.view.getApplied(node.feedKey)
+  async #advanceCommittedFeed(targetOrNodeId, maybeTargetApplied = undefined) {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const nodeId = targetOrNodeId
+      const targetApplied = maybeTargetApplied
+      const node = this.#getAuthorizedNode(nodeId)
+      const core = this.feedCores.get(nodeId)
+      const rawApplied = await this.view.getRawApplied(node.feedKey)
+      let committedApplied = await this.view.getApplied(node.feedKey)
+      const cappedTarget = Math.min(targetApplied, rawApplied, core.length)
+
+      while (committedApplied < cappedTarget) {
+        const operation = await core.get(committedApplied)
+        if (operation.seq !== committedApplied) {
+          throw new Error(`Committed operation sequence mismatch at feed slot ${committedApplied} for ${nodeId}`)
+        }
+        validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
+        if (!verifySignedOperation(operation, node.publicKey)) {
+          throw new Error(`Invalid committed operation at sequence ${committedApplied} for ${nodeId}`)
+        }
+
+        const shouldSkip = operation.kind === "kv" && (
+          await this.view.isSkippedEntry(node.feedKey, operation.seq) ||
+          (await this.view.getStagedEntry(node.feedKey, operation.seq))?.resolution === "rejected"
+        )
+
+        if (shouldSkip) {
+          await this.view.skipCommitted(operation, node.feedKey)
+        } else {
+          await this.view.applyCommitted(operation, node.feedKey)
+          if (operation.kind === "membership") {
+            await this.#applyCommittedMembershipOperation(operation)
+          }
+        }
+        if (nodeId === this.options.identity.publicKeyId) {
+          this.consensusState = await this.consensusStateStore.save({
+            commitIndex: operation.seq,
+            lastApplied: operation.seq
+          })
+        }
+        committedApplied += 1
+      }
+      return
+    }
+
+    const targetApplied = targetOrNodeId
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const rawApplied = await this.view.getRawApplied(feedKey)
+    let committedApplied = await this.view.getApplied(feedKey)
     const cappedTarget = Math.min(targetApplied, rawApplied, core.length)
 
     while (committedApplied < cappedTarget) {
       const operation = await core.get(committedApplied)
       if (operation.seq !== committedApplied) {
-        throw new Error(`Committed operation sequence mismatch at feed slot ${committedApplied} for ${nodeId}`)
+        throw new Error(`Committed authoritative operation sequence mismatch at slot ${committedApplied}`)
       }
-      validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
-      if (!verifySignedOperation(operation, node.publicKey)) {
-        throw new Error(`Invalid committed operation at sequence ${committedApplied} for ${nodeId}`)
+      this.#validateAuthoritativeOperation(operation)
+      if (!verifySignedOperation(operation, this.authoritativeLogIdentity.publicKey)) {
+        throw new Error(`Invalid committed authoritative operation at sequence ${committedApplied}`)
       }
 
-      const shouldSkip = operation.kind === "kv" && await this.view.isSkippedEntry(node.feedKey, operation.seq)
+      const shouldSkip = operation.kind === "kv" && (
+        await this.view.isSkippedEntry(feedKey, operation.seq) ||
+        (await this.view.getStagedEntry(feedKey, operation.seq))?.resolution === "rejected"
+      )
 
       if (shouldSkip) {
-        await this.view.skipCommitted(operation, node.feedKey)
+        await this.view.skipCommitted(operation, feedKey)
       } else {
-        await this.view.applyCommitted(operation, node.feedKey)
+        await this.view.applyCommitted(operation, feedKey)
         if (operation.kind === "membership") {
           await this.#applyCommittedMembershipOperation(operation)
         }
       }
-      if (nodeId === this.options.identity.publicKeyId) {
-        this.consensusState = await this.consensusStateStore.save({
-          commitIndex: operation.seq,
-          lastApplied: operation.seq
-        })
-      }
+      this.consensusState = await this.consensusStateStore.save({
+        commitIndex: operation.seq,
+        lastApplied: operation.seq
+      })
       committedApplied += 1
     }
+  }
+
+  #validateAuthoritativeOperation(operation) {
+    const actorNode = this.#getAuthorizedNode(operation.actor)
+    validateOperation(operation, {
+      nodeId: actorNode.nodeId,
+      feedKey: this.#authoritativeLogFeedKey()
+    }, { revokedNodeIds: this.revokedNodeIds })
+  }
+
+  #isKnownAuthoritativeActor(nodeId) {
+    if (nodeId === this.options.identity.publicKeyId) return true
+    return this.options.authorizedNodes.some((node) => node.nodeId === nodeId)
+  }
+
+  #canAcceptAuthoritativeActor(nodeId) {
+    return this.#membershipRole(nodeId) === "voter"
+  }
+
+  #isIgnoredSyncError(error) {
+    if (error?.code === "REQUEST_CANCELLED" || error?.code === "SESSION_CLOSED") {
+      return true
+    }
+    return typeof error?.message === "string" && error.message.startsWith("Unknown authorized node ")
   }
 
   #membershipFingerprint() {
@@ -1584,7 +2165,7 @@ export class HolepunchSwarmNode {
         nodeId: node.nodeId,
         feedKey: node.feedKey,
         role: this.#membershipRole(node.nodeId)
-      }))
+      })).sort((left, right) => left.nodeId.localeCompare(right.nodeId))
     }
     return createHash("sha256").update(canonicalize(membership)).digest("hex")
   }
@@ -1597,6 +2178,7 @@ export class HolepunchSwarmNode {
     const matchingNodeIds = []
 
     for (const node of this.#voterNodes()) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       if (node.nodeId === this.options.identity.publicKeyId) continue
 
       const fingerprint = heartbeats[node.nodeId]?.membershipFingerprint ?? null
@@ -1605,10 +2187,20 @@ export class HolepunchSwarmNode {
       if (fingerprint === localFingerprint) matchingNodeIds.push(node.nodeId)
       else mismatchedNodeIds.push(node.nodeId)
     }
+    for (const [nodeId, heartbeat] of Object.entries(heartbeats)) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      if (this.#isRevokedNode(nodeId)) continue
+      const fingerprint = heartbeat.membershipFingerprint ?? null
+      if (fingerprint === null || peerFingerprints[nodeId] !== undefined) continue
+      peerFingerprints[nodeId] = fingerprint
+      if (fingerprint === localFingerprint) matchingNodeIds.push(nodeId)
+      else mismatchedNodeIds.push(nodeId)
+    }
 
     return {
       localFingerprint,
       localRole: this.#role(),
+      current: this.membershipState.current,
       version: this.membershipState.current.version,
       joint: this.membershipState.joint,
       voters: entries.filter((entry) => entry.role === "voter"),
@@ -1672,6 +2264,9 @@ export class HolepunchSwarmNode {
   }
 
   #membershipRole(nodeId) {
+    if (this.#isRevokedNode(nodeId) || this.#currentMembershipRole(nodeId) === "removed") {
+      return "removed"
+    }
     if (this.#effectiveVoterNodeIds().includes(nodeId)) {
       return "voter"
     }
@@ -1833,6 +2428,7 @@ export class HolepunchSwarmNode {
           noisePublicKey: summary.noisePublicKey
         },
         membership: {
+          current: this.membershipState.current,
           version: this.membershipState.current.version,
           voters: this.#voterNodes().map((node) => ({
             nodeId: node.nodeId,
@@ -1867,8 +2463,9 @@ export class HolepunchSwarmNode {
         errorCode,
         error: error instanceof Error ? error.message : String(error),
         ...(errorCode === "REMOVED_IDENTITY"
-          ? {
+            ? {
               membership: {
+                current: this.membershipState.current,
                 version: this.membershipState.current.version,
                 voters: this.#voterNodes().map((node) => ({
                   nodeId: node.nodeId,
@@ -2041,8 +2638,9 @@ export class HolepunchSwarmNode {
 
   async #adoptJoinMembershipSnapshot(message) {
     const previousRole = this.#role()
+    const snapshot = message.membership?.current
     this.membershipState = {
-      current: this.#normalizeMembershipConfig({
+      current: this.#normalizeMembershipConfig(snapshot ?? {
         version: message.membership?.version ?? this.membershipState.current.version,
         voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
         learners: (message.membership?.learners ?? []).map((node) => node.nodeId),
@@ -2087,12 +2685,12 @@ export class HolepunchSwarmNode {
         .filter((nodeId) => !this.#isRevokedNode(nodeId))
     }
     if (!this.membershipState.joint) {
-      return [...this.membershipState.current.voters]
+      return this.membershipState.current.voters.filter((nodeId) => !this.#isRevokedNode(nodeId))
     }
     return [...new Set([
       ...this.membershipState.joint.oldVoters,
       ...this.membershipState.joint.newVoters
-    ])].sort()
+    ])].filter((nodeId) => !this.#isRevokedNode(nodeId)).sort()
   }
 
   #jointMembership() {
@@ -2189,11 +2787,14 @@ export class HolepunchSwarmNode {
       removed
     })
     const quorumGroups = this.#jointQuorumGroups(joint)
+    const targetNode = this.options.authorizedNodes.find((node) => node.nodeId === targetNodeId) ?? null
 
     const jointOperation = await this.#appendMembershipOperation({
       phase: "joint",
       changeType,
       targetNodeId,
+      targetPublicKey: targetNode?.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetNode?.feedKey ?? null,
       fromVersion: current.version,
       toVersion: nextVersion,
       oldVoters: joint.oldVoters,
@@ -2202,28 +2803,45 @@ export class HolepunchSwarmNode {
       removed: finalConfig.removed,
       quorumGroups
     })
-    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, jointOperation.seq + 1)
-    await this.#runHeartbeat()
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? jointOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : jointOperation.seq + 1
+    )
+    await this.#runHeartbeat({ fresh: true })
 
+    const finalQuorumGroups = changeType === "removal" && this.#isLeaderReachable(targetNodeId)
+      ? [
+          ...quorumGroups,
+          {
+            eligibleNodeIds: [targetNodeId],
+            requiredCount: 1
+          }
+        ]
+      : quorumGroups
     const finalOperation = await this.#appendMembershipOperation({
       phase: "final",
       changeType,
       targetNodeId,
+      targetPublicKey: targetNode?.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetNode?.feedKey ?? null,
       fromVersion: current.version,
       toVersion: nextVersion,
       oldVoters: joint.oldVoters,
       newVoters: joint.newVoters,
       learners: finalConfig.learners,
       removed: finalConfig.removed,
-      quorumGroups
+      quorumGroups: finalQuorumGroups
     })
-    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, finalOperation.seq + 1)
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
 
     if (promotion) {
       await this.consensusBee.put("promotion/current", promotion)
     }
 
-    await this.#runHeartbeat()
+    await this.#runHeartbeat({ fresh: true })
   }
 
   #jointQuorumGroups(joint) {
@@ -2243,6 +2861,8 @@ export class HolepunchSwarmNode {
     phase,
     changeType,
     targetNodeId,
+    targetPublicKey,
+    targetFeedKey,
     fromVersion,
     toVersion,
     oldVoters,
@@ -2255,10 +2875,67 @@ export class HolepunchSwarmNode {
       throw new Error("Durability requirement not met: no reachable quorum available")
     }
 
+    if (this.#usesSharedAuthoritativeLog()) {
+      try {
+        return await this.#withLocalAppendLock(async () => {
+          const previousOperation = await this.#previousAuthoritativeOperation()
+          const authoritativeCore = this.#authoritativeLogCore()
+          const operation = createSignedOperation({
+            kind: "membership",
+            type: "put",
+            key: `membership:${toVersion}:${phase}`,
+            keyspace: "system",
+            membership: {
+              phase,
+              changeType,
+              targetNodeId,
+              targetPublicKey,
+              targetFeedKey,
+              fromVersion,
+              toVersion,
+              oldVoters,
+              newVoters,
+              learners,
+              removed
+            },
+            seq: authoritativeCore.length,
+            term: this.consensusState.currentTerm,
+            index: authoritativeCore.length,
+            prevIndex: previousOperation?.index ?? -1,
+            prevHash: previousOperation?.entryHash ?? null,
+            feed: this.#authoritativeLogFeedKey(),
+            actor: this.options.identity.publicKeyId,
+            secretKey: this.authoritativeLogIdentity.secretKey,
+            encryptionKey: this.#currentEncryptionKey(),
+            encryptionKeyId: this.encryption.currentKeyId
+          })
+          const ackPromise = this.durabilityWaiter.waitForGroups(
+            operation.seq,
+            quorumGroups,
+            [this.options.identity.publicKeyId]
+          )
+          ackPromise.catch(() => {})
+          await authoritativeCore.append(operation)
+          await this.syncAuthoritativeLog()
+          try {
+            await ackPromise
+          } catch (error) {
+            await this.#truncateUncommittedAuthoritativeTail()
+            throw error
+          }
+          return operation
+        })
+      } catch (error) {
+        await this.#runHeartbeat()
+        throw error
+      }
+    }
+
     let operation = null
     let ackPromise = null
     await this.#withLocalAppendLock(async () => {
       const previousOperation = await this.#previousLocalOperation()
+      const authoritativeCore = this.#localCore()
       operation = createSignedOperation({
         kind: "membership",
         type: "put",
@@ -2268,6 +2945,8 @@ export class HolepunchSwarmNode {
           phase,
           changeType,
           targetNodeId,
+          targetPublicKey,
+          targetFeedKey,
           fromVersion,
           toVersion,
           oldVoters,
@@ -2275,9 +2954,9 @@ export class HolepunchSwarmNode {
           learners,
           removed
         },
-        seq: this.#localCore().length,
+        seq: authoritativeCore.length,
         term: this.consensusState.currentTerm,
-        index: this.#localCore().length,
+        index: authoritativeCore.length,
         prevIndex: previousOperation?.index ?? -1,
         prevHash: previousOperation?.entryHash ?? null,
         feed: this.options.identity.feedKey,
@@ -2292,7 +2971,7 @@ export class HolepunchSwarmNode {
         [this.options.identity.publicKeyId]
       )
       ackPromise.catch(() => {})
-      await this.#localCore().append(operation)
+      await authoritativeCore.append(operation)
     })
 
     await this.syncFeed(this.options.identity.publicKeyId)
@@ -2311,6 +2990,13 @@ export class HolepunchSwarmNode {
     const membership = operation.membership
     if (!membership || typeof membership !== "object") {
       throw new Error("Committed membership operation is missing membership metadata")
+    }
+    if (membership.targetNodeId && membership.targetPublicKey && membership.targetFeedKey) {
+      this.#ensureAuthorizedNodeRecord({
+        nodeId: membership.targetNodeId,
+        publicKey: membership.targetPublicKey,
+        feedKey: membership.targetFeedKey
+      })
     }
 
     if (membership.phase === "joint") {
