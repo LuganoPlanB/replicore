@@ -19,7 +19,10 @@ test("consensus state persists a recorded vote across restart", { concurrency: f
       votedFor: "node-b",
       commitIndex: -1,
       lastApplied: -1,
-      membershipVersion: 0
+      membershipVersion: 0,
+      splitFenced: false,
+      splitLeaderNodeId: null,
+      splitReason: null
     })
   })
 })
@@ -36,7 +39,10 @@ test("consensus state persists commit progress across restart", { concurrency: f
       votedFor: null,
       commitIndex: 12,
       lastApplied: -1,
-      membershipVersion: 0
+      membershipVersion: 0,
+      splitFenced: false,
+      splitLeaderNodeId: null,
+      splitReason: null
     })
   })
 })
@@ -55,7 +61,31 @@ test("consensus state persists apply progress and membership version across rest
       votedFor: null,
       commitIndex: 19,
       lastApplied: 19,
-      membershipVersion: 2
+      membershipVersion: 2,
+      splitFenced: false,
+      splitLeaderNodeId: null,
+      splitReason: null
+    })
+  })
+})
+
+test("consensus state persists split-fenced leader hints across restart", { concurrency: false }, async () => {
+  await withNodeRestart(async ({ node }) => {
+    await node.setConsensusState({
+      splitFenced: true,
+      splitLeaderNodeId: "leader-a",
+      splitReason: "leader-heartbeat-expired"
+    })
+  }, async ({ restarted }) => {
+    assert.deepEqual(await restarted.getConsensusState(), {
+      currentTerm: 0,
+      votedFor: null,
+      commitIndex: -1,
+      lastApplied: -1,
+      membershipVersion: 0,
+      splitFenced: true,
+      splitLeaderNodeId: "leader-a",
+      splitReason: "leader-heartbeat-expired"
     })
   })
 })

@@ -196,7 +196,20 @@ test("five-node cluster stays durable when two non-leader followers go offline",
       }
     )
 
-    await cluster.record(leaderId).node.delete("hash:degraded-five")
+    await waitFor(
+      async () => {
+        try {
+          await currentLeaderNode(cluster).delete("hash:degraded-five")
+          return true
+        } catch {
+          return false
+        }
+      },
+      {
+        description: "five-node durable delete after follower restart",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
 
     await waitFor(
       async () => {
@@ -253,7 +266,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
       async () => {
         const status = await leader.getReplicationStatus()
         return (
-          leader.currentLeader() === leaderId &&
+          [leaderId, null].includes(leader.currentLeader()) &&
           offlineFollowers.every((nodeId) => status.feeds[nodeId]?.alive === false)
         )
       },
@@ -285,8 +298,13 @@ test("single surviving node serves reads but blocks writes until a follower retu
       }
     )
 
-    const recoveryOperation = await leader.put("hash:recovered-write", { recovered: true })
-    assert.equal(recoveryOperation.actor, leaderId)
+    const recoveryOperation = await waitForDurableWriteFrom(
+      currentLeaderNode(cluster),
+      "hash:recovered-write",
+      { recovered: true },
+      "recovered write after follower returns"
+    )
+    assert.equal(recoveryOperation.actor, currentLeaderNode(cluster).options.identity.publicKeyId)
 
     await waitFor(
       async () => {
@@ -584,7 +602,7 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
       }
     )
 
-    const committed = await leader.commitPromotionCredential(credential)
+    const committed = await currentLeaderNode(cluster).commitPromotionCredential(credential)
     assert.equal(committed.version, 1)
     assert.equal(committed.joint, null)
     assert.equal(committed.voters.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
@@ -682,7 +700,7 @@ test("joint-consensus voter removal blocks when only one side of the joint quoru
       }
     )
 
-    const committed = await leader.removeVoter(removalTargetId)
+    const committed = await currentLeaderNode(cluster).removeVoter(removalTargetId)
     assert.equal(committed.version, 1)
     assert.equal(committed.joint, null)
     assert.equal(committed.removed.some((entry) => entry.nodeId === removalTargetId), true)
@@ -956,7 +974,6 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     feedKey: identity.feedKey
   }))
   const sortedNodeIds = identities.map((identity) => identity.publicKeyId).sort()
-  const leaderId = sortedNodeIds[0]
   const staleFollowerId = sortedNodeIds[1]
   const fullyConfiguredFollowerId = sortedNodeIds[2]
 
@@ -977,17 +994,17 @@ test("mismatched membership config blocks degraded writes conservatively", { con
   try {
     await cluster.startAll()
 
-    const leader = cluster.record(leaderId).node
-    const staleFollower = cluster.record(staleFollowerId).node
-    const fullyConfiguredFollower = cluster.record(fullyConfiguredFollowerId).node
-
     await waitFor(
-      async () => leader.currentLeader() === leaderId,
+      async () => currentLeaderNode(cluster) !== null,
       {
         description: "baseline leader before mismatched rollout outage",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
+    const leaderId = currentLeaderId(cluster)
+    const leader = cluster.record(leaderId).node
+    const staleFollower = cluster.record(staleFollowerId).node
+    const fullyConfiguredFollower = cluster.record(fullyConfiguredFollowerId).node
 
     const staleWriters = staleFollower.getWritersStatus()
     assert.equal(staleWriters.authorizedNodes.length, 2)
@@ -1030,24 +1047,24 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     await cluster.stopNode(leaderId)
 
     await waitFor(
-      async () => staleFollower.currentLeader() === staleFollowerId,
+      async () => staleFollower.currentLeader() !== leaderId,
       {
-        description: "stale-config follower promotes itself after leader loss",
+        description: "stale-config follower leaves the old leader after leader loss",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
     await assert.rejects(
       staleFollower.put("hash:mismatch-blocked", { blocked: true }),
-      /(Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
+      /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
     )
 
     assert.equal(await staleFollower.get("hash:mismatch-blocked"), null)
 
     await waitFor(
-      async () => fullyConfiguredFollower.currentLeader() === staleFollowerId,
+      async () => fullyConfiguredFollower.currentLeader() !== leaderId,
       {
-        description: "fully configured follower still routes to stale-config leader",
+        description: "fully configured follower stops routing to the old leader",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -1057,7 +1074,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
 
     await assert.rejects(
       fullyConfiguredFollower.put("hash:mismatch-blocked-forwarded", { blocked: true }),
-      /(Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
+      /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request)/
     )
     assert.equal(await fullyConfiguredFollower.get("hash:mismatch-blocked-forwarded"), null)
 
@@ -1389,7 +1406,7 @@ test("subgroup partition exposes active policy and blocks cross-group links", { 
   }
 })
 
-test("isolated leader blocks minority writes while connected followers continue and heal cleanly", { concurrency: false }, async () => {
+test("isolated leader blocks writes on both sides until heal and followers become split-fenced", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 5,
     heartbeatIntervalMs: 100,
@@ -1434,7 +1451,7 @@ test("isolated leader blocks minority writes while connected followers continue 
     await waitFor(
       async () => {
         const status = await originalLeader.getReplicationStatus()
-        return status.connections === 0 && originalLeader.currentLeader() === originalLeaderId
+        return status.connections === 0 && [originalLeaderId, null].includes(originalLeader.currentLeader())
       },
       {
         description: "isolated leader loses all live peers",
@@ -1445,30 +1462,18 @@ test("isolated leader blocks minority writes while connected followers continue 
     const connectedFollowers = cluster.nodes.filter(
       (node) => node.options.identity.publicKeyId !== originalLeaderId
     )
-    const expectedConnectedLeaderId = connectedFollowers
-      .map((node) => node.options.identity.publicKeyId)
-      .sort()[0]
-
-    await waitFor(
-      async () => connectedFollowers.every((node) => node.currentLeader() === expectedConnectedLeaderId),
-      {
-        description: "connected side elects next live leader during isolation",
-        onTimeout: () => collectClusterDiagnostics(cluster, connectedFollowers)
-      }
-    )
-
-    const connectedLeader = cluster.record(expectedConnectedLeaderId).node
     await waitFor(
       async () => {
-        const status = await connectedLeader.getReplicationStatus()
-        return connectedFollowers
-          .map((node) => node.options.identity.publicKeyId)
-          .filter((nodeId) => nodeId !== expectedConnectedLeaderId)
-          .some((nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0)
+        const statuses = await Promise.all(connectedFollowers.map((node) => node.getReplicationStatus()))
+        return statuses.every((status) =>
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === originalLeaderId &&
+          status.readStatus.reason === "split-fenced"
+        )
       },
       {
-        description: "connected side keeps a reachable follower during leader isolation",
-        onTimeout: () => connectedLeader.getReplicationStatus()
+        description: "connected followers become split-fenced during leader isolation",
+        onTimeout: () => collectClusterDiagnostics(cluster, connectedFollowers)
       }
     )
 
@@ -1479,40 +1484,26 @@ test("isolated leader blocks minority writes while connected followers continue 
     assert.equal(await originalLeader.get("hash:partition-blocked"), null)
     assert.deepEqual(await originalLeader.getHistory("hash:partition-blocked"), [])
 
-    const duringIsolation = await connectedLeader.put("hash:partition-during", { phase: "during" })
-    assert.equal(duringIsolation.actor, expectedConnectedLeaderId)
-
-    await waitFor(
-      async () => hasClusterValue(connectedFollowers, "hash:partition-during", { phase: "during" }),
-      {
-        description: "connected side continues durable writes during isolation",
-        onTimeout: () => collectClusterDiagnostics(cluster, connectedFollowers)
-      }
+    const fencedFollower = connectedFollowers[0]
+    await assert.rejects(
+      fencedFollower.put("hash:partition-during", { phase: "during" }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
     )
 
     await cluster.healNode(originalLeaderId)
     await waitForClusterConvergence(cluster)
-    assert.ok(cluster.nodes.every((node) => node.currentLeader() === originalLeaderId))
-
-    await waitFor(
-      async () => {
-        const current = await originalLeader.get("hash:partition-during")
-        return current?.value?.phase === "during"
-      },
-      {
-        description: "healed leader catches up to connected-side write",
-        onTimeout: () => originalLeader.getReplicationStatus()
-      }
-    )
+    const healedLeaderId = currentLeaderId(cluster)
+    const healedLeader = currentLeaderNode(cluster)
 
     for (const node of cluster.nodes) {
       assert.equal(await node.get("hash:partition-blocked"), null)
+      assert.equal(await node.get("hash:partition-during"), null)
     }
 
     await waitFor(
       async () => {
         const status = await originalLeader.getReplicationStatus()
-        return liveFollowerIds(cluster, originalLeaderId).some(
+        return liveFollowerIds(cluster, healedLeaderId).some(
           (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
         )
       },
@@ -1522,7 +1513,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       }
     )
 
-    const afterHeal = await originalLeader.put("hash:partition-after", { phase: "after" })
+    const afterHeal = await healedLeader.put("hash:partition-after", { phase: "after" })
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:partition-after", { phase: "after" }),
       {
@@ -1531,11 +1522,7 @@ test("isolated leader blocks minority writes while connected followers continue 
       }
     )
 
-    const isolatedHistory = await originalLeader.getHistory("hash:partition-during")
-    assert.equal(isolatedHistory.length, 1)
-    assert.equal(isolatedHistory[0].opId, duringIsolation.opId)
-    await assertFeedChainValid(originalLeader, expectedConnectedLeaderId)
-    assert.equal(afterHeal.actor, originalLeaderId)
+    assert.equal(afterHeal.actor, healedLeaderId)
     assert.ok(afterHeal.opId)
 
     await assertClusterInvariants(cluster)
@@ -1545,7 +1532,7 @@ test("isolated leader blocks minority writes while connected followers continue 
 })
 
 test(
-  "subgroup partition blocks minority durability while majority continues and old leader heals cleanly",
+  "subgroup partition blocks writes on both sides until heal when the leader side is lost",
   { concurrency: false },
   async () => {
     const cluster = await createSwarmCluster({
@@ -1588,7 +1575,7 @@ test(
 
       await waitFor(
         async () =>
-          minorityNodeIds.every((nodeId) => cluster.record(nodeId).node.currentLeader() === originalLeaderId),
+          minorityNodeIds.every((nodeId) => [originalLeaderId, null].includes(cluster.record(nodeId).node.currentLeader())),
         {
           description: "minority subgroup keeps the original leader",
           onTimeout: () =>
@@ -1596,26 +1583,18 @@ test(
         }
       )
 
-      const majorityLeaderId = [...majorityNodeIds].sort()[0]
-      await waitFor(
-        async () => majorityNodes.every((node) => node.currentLeader() === majorityLeaderId),
-        {
-          description: "majority subgroup elects its local leader",
-          onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
-        }
-      )
-
-      const majorityLeader = cluster.record(majorityLeaderId).node
       await waitFor(
         async () => {
-          const status = await majorityLeader.getReplicationStatus()
-          return majorityNodeIds
-            .filter((nodeId) => nodeId !== majorityLeaderId)
-            .some((nodeId) => status.network.peers[nodeId]?.connected === true)
+          const statuses = await Promise.all(majorityNodes.map((node) => node.getReplicationStatus()))
+          return statuses.every((status) =>
+            status.splitStatus?.fenced === true &&
+            status.splitStatus?.leaderNodeId === originalLeaderId &&
+            status.readStatus.reason === "split-fenced"
+          )
         },
         {
-          description: "majority subgroup keeps a reachable follower",
-          onTimeout: () => majorityLeader.getReplicationStatus()
+          description: "majority subgroup becomes split-fenced without the leader",
+          onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
         }
       )
 
@@ -1624,38 +1603,22 @@ test(
         /(Durability requirement not met|Timed out waiting for follower acknowledgement)/
       )
 
-      const duringPartition = await majorityLeader.put("hash:subgroup-during", { phase: "during" })
-      assert.equal(duringPartition.actor, majorityLeaderId)
-
-      await waitFor(
-        async () => hasClusterValue(majorityNodes, "hash:subgroup-during", { phase: "during" }),
-        {
-          description: "majority subgroup continues durable writes during partition",
-          onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
-        }
+      await assert.rejects(
+        majorityNodes[0].put("hash:subgroup-during", { phase: "during" }),
+        /split-fenced|Current leader .* is not reachable|No current leader is available/
       )
 
       assert.equal(await originalLeader.get("hash:subgroup-during"), null)
 
       await cluster.healPartition()
       await waitForClusterConvergence(cluster)
-      assert.ok(cluster.nodes.every((node) => node.currentLeader() === originalLeaderId))
-
-      await waitFor(
-        async () => {
-          const current = await originalLeader.get("hash:subgroup-during")
-          return current?.value?.phase === "during"
-        },
-        {
-          description: "old leader catches up after partition heal",
-          onTimeout: () => originalLeader.getReplicationStatus()
-        }
-      )
+      const healedLeaderId = currentLeaderId(cluster)
+      const healedLeader = currentLeaderNode(cluster)
 
       await waitFor(
         async () => {
           const status = await originalLeader.getReplicationStatus()
-          return liveFollowerIds(cluster, originalLeaderId).some(
+          return liveFollowerIds(cluster, healedLeaderId).some(
             (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
           )
         },
@@ -1666,12 +1629,12 @@ test(
       )
 
       const afterHeal = await waitForDurableWriteFrom(
-        originalLeader,
+        healedLeader,
         "hash:subgroup-after",
         { phase: "after" },
-        "post-heal durable write from the original leader"
+        "post-heal durable write from the healed leader"
       )
-      assert.equal(afterHeal.actor, originalLeaderId)
+      assert.equal(afterHeal.actor, healedLeaderId)
 
       await waitFor(
         async () => hasClusterValue(cluster.nodes, "hash:subgroup-after", { phase: "after" }),
@@ -1683,12 +1646,8 @@ test(
 
       for (const node of cluster.nodes) {
         assert.equal(await node.get("hash:subgroup-blocked"), null)
+        assert.equal(await node.get("hash:subgroup-during"), null)
       }
-
-      const history = await originalLeader.getHistory("hash:subgroup-during")
-      assert.equal(history.length, 1)
-      assert.equal(history[0].opId, duringPartition.opId)
-      await assertFeedChainValid(originalLeader, majorityLeaderId)
 
       await assertClusterInvariants(cluster)
     } finally {
@@ -1873,14 +1832,22 @@ test("isolated follower serves stale reads until heal and status shows stale con
         return (
           status.feeds[leaderId]?.alive === false &&
           status.readStatus.staleReadsPossible === true &&
-          status.readStatus.reason === "no-live-peer-connections"
+          status.readStatus.reason === "split-fenced" &&
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === leaderId
         )
       },
       {
-        description: "isolated follower marks leader heartbeat stale after TTL",
+        description: "isolated follower becomes split-fenced after leader heartbeat TTL",
         onTimeout: () => isolatedFollower.getReplicationStatus()
       }
     )
+
+    await assert.rejects(
+      isolatedFollower.put("hash:stale-blocked", { blocked: true }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
+    )
+    assert.equal(await isolatedFollower.get("hash:stale-blocked"), null)
 
     await cluster.healNode(isolatedFollowerId)
     await waitForClusterConvergence(cluster)
@@ -2041,7 +2008,7 @@ test("restarted follower stays disconnected while bootstrap remains unavailable"
           status.feeds[survivingFollowerId]?.connectedPeers === 0 &&
           status.readStatus.staleReadsPossible === true &&
           status.readStatus.reason === "no-live-peer-connections" &&
-          restartedFollower.currentLeader() === restartingFollowerId
+          [restartingFollowerId, null].includes(restartedFollower.currentLeader())
         )
       },
       {
@@ -2174,7 +2141,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
   }
 })
 
-test("follower write forwarding fails transiently near failover and recovers after leader TTL shifts", { concurrency: false }, async () => {
+test("follower write forwarding becomes split-fenced after leader loss and recovers when the leader returns", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
     heartbeatIntervalMs: 100,
@@ -2209,9 +2176,17 @@ test("follower write forwarding fails transiently near failover and recovers aft
     )
 
     await waitFor(
-      async () => follower.currentLeader() !== leaderId && follower.currentLeader() !== null,
+      async () => {
+        const status = await follower.getReplicationStatus()
+        return (
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === leaderId &&
+          status.readStatus.reason === "split-fenced" &&
+          status.connections === 0
+        )
+      },
       {
-        description: "failover after leader loss",
+        description: "follower becomes split-fenced after leader loss",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -2221,13 +2196,16 @@ test("follower write forwarding fails transiently near failover and recovers aft
       assert.deepEqual(await node.getHistory(targetKey), [])
     }
 
+    await cluster.restartNode(leaderId)
+    await waitForClusterConvergence(cluster)
+
     const recovered = await follower.put(targetKey, { recovered: true })
-    assert.equal(recovered.actor, follower.currentLeader())
+    assert.equal(recovered.actor, leaderId)
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, targetKey, { recovered: true }),
       {
-        description: "post-failover forwarded write converges",
+        description: "forwarded write converges after leader return",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -2242,7 +2220,101 @@ test("follower write forwarding fails transiently near failover and recovers aft
   }
 })
 
-test("concurrent writes across failover do not create duplicate accepted operations", { concurrency: false }, async () => {
+test("split-fenced follower restart preserves write refusal until the leader returns", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 900,
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 750
+    }
+  })
+
+  try {
+    await cluster.startAll()
+
+    const leaderId = currentLeaderId(cluster)
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
+      {
+        description: "initial leader convergence before split-fenced restart",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const followerId = liveFollowerIds(cluster, leaderId)[0]
+    const targetFollower = cluster.record(followerId).node
+
+    await cluster.stopNode(leaderId)
+
+    await waitFor(
+      async () => {
+        const status = await targetFollower.getReplicationStatus()
+        return (
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === leaderId &&
+          status.readStatus.reason === "split-fenced"
+        )
+      },
+      {
+        description: "follower enters split-fenced mode before restart",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const restartedFollower = await cluster.restartNode(followerId)
+
+    await waitFor(
+      async () => {
+        const status = await restartedFollower.getReplicationStatus()
+        return (
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === leaderId &&
+          status.readStatus.reason === "split-fenced"
+        )
+      },
+      {
+        description: "split-fenced state survives follower restart",
+        onTimeout: () => restartedFollower.getReplicationStatus()
+      }
+    )
+
+    await assert.rejects(
+      restartedFollower.put("hash:restart-split-fenced", { blocked: true }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
+    )
+
+    await cluster.restartNode(leaderId)
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const status = await restartedFollower.getReplicationStatus()
+        return status.splitStatus?.fenced === false && status.readStatus.reason === null
+      },
+      {
+        description: "split-fenced state clears after leader return",
+        onTimeout: () => restartedFollower.getReplicationStatus()
+      }
+    )
+
+    const recovered = await restartedFollower.put("hash:restart-split-fenced", { blocked: false })
+    assert.equal(recovered.actor, leaderId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:restart-split-fenced", { blocked: false }),
+      {
+        description: "recovered write converges after leader return",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
+test("concurrent writes during split fencing do not create accepted operations before the leader returns", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
     heartbeatIntervalMs: 100,
@@ -2288,9 +2360,15 @@ test("concurrent writes across failover do not create duplicate accepted operati
     )
 
     await waitFor(
-      async () => follower.currentLeader() !== leaderId && follower.currentLeader() !== null,
+      async () => {
+        const status = await follower.getReplicationStatus()
+        return (
+          status.splitStatus?.fenced === true &&
+          status.splitStatus?.leaderNodeId === leaderId
+        )
+      },
       {
-        description: "failover completes during concurrent write test",
+        description: "split fencing completes during concurrent write test",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -2302,34 +2380,25 @@ test("concurrent writes across failover do not create duplicate accepted operati
       result.status === "rejected" ? [attempts[index].key] : []
     )
 
-    assert.ok(failedKeys.length > 0)
+    assert.equal(succeeded.length, 0)
+    assert.equal(failedKeys.length, attempts.length)
+
+    await cluster.restartNode(leaderId)
+    await waitForClusterConvergence(cluster)
 
     const recovered = await follower.put("hash:concurrent-recovered", { recovered: true })
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:concurrent-recovered", { recovered: true }),
       {
-        description: "confirmed post-failover write after concurrent batch",
+        description: "confirmed post-recovery write after concurrent batch",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
     assert.ok(recovered.opId)
 
-    for (const { key, operation } of succeeded) {
-      await waitFor(
-        async () => hasClusterValue(cluster.nodes, key, { key }),
-        {
-          description: `successful failover write converges for ${key}`,
-          onTimeout: () => collectClusterDiagnostics(cluster)
-        }
-      )
-
-      const history = await follower.getHistory(key)
-      assert.equal(history.length, 1)
-      assert.equal(history[0].opId, operation.opId)
-    }
-
     for (const key of failedKeys) {
       assert.equal(await follower.get(key), null)
+      assert.deepEqual(await follower.getHistory(key), [])
     }
   } finally {
     await cluster.closeAll()
@@ -2704,6 +2773,18 @@ test("full-cluster cold restart from persisted data directories rebuilds state a
 })
 
 function currentLeaderId(cluster) {
+  if (cluster.nodes?.length) {
+    const leaders = cluster.nodes.map((node) => node.currentLeader()).filter(Boolean)
+    if (leaders.length === cluster.nodes.length && new Set(leaders).size === 1) {
+      return leaders[0]
+    }
+
+    const elected = cluster.nodes.find((node) => node.currentLeader() === node.options.identity.publicKeyId)
+    if (elected) {
+      return elected.options.identity.publicKeyId
+    }
+  }
+
   return cluster.identities.map((identity) => identity.publicKeyId).sort()[0]
 }
 

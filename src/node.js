@@ -118,6 +118,12 @@ export class HolepunchSwarmNode {
     this.sentJoinRequestKeys = new Set()
     this.seenJoinRequestNonces = new Set()
     this.lastHeartbeatByNode = new Map()
+    this.splitState = {
+      fenced: false,
+      reason: null,
+      leaderNodeId: null,
+      since: null
+    }
     this.consensusEngine = new ConsensusEngine({
       localNodeId: this.options.identity.publicKeyId
     })
@@ -146,6 +152,12 @@ export class HolepunchSwarmNode {
     await this.consensusBee.ready()
     this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
     this.consensusState = await this.consensusStateStore.load()
+    this.splitState = {
+      fenced: this.consensusState.splitFenced === true,
+      reason: this.consensusState.splitReason ?? null,
+      leaderNodeId: this.consensusState.splitLeaderNodeId ?? null,
+      since: null
+    }
     this.membershipState = await this.#loadMembershipState()
     this.rpc = new NodeRpcRouter({
       localNodeId: this.options.identity.publicKeyId,
@@ -261,6 +273,9 @@ export class HolepunchSwarmNode {
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
+    }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "put", key, value, options })
     }
@@ -275,6 +290,9 @@ export class HolepunchSwarmNode {
   async delete(key, options = {}) {
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
+    }
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
     }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "delete", key, options })
@@ -339,6 +357,7 @@ export class HolepunchSwarmNode {
       nodeId: this.options.identity.publicKeyId,
       role: this.#role(),
       leader: this.currentLeader(),
+      splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
       encryptionKeyId: this.encryption.currentKeyId,
@@ -370,7 +389,7 @@ export class HolepunchSwarmNode {
   }
 
   async getLeaderStatus() {
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     const heartbeats = await this.view.getHeartbeats()
 
     return buildLeaderStatus({
@@ -745,7 +764,15 @@ export class HolepunchSwarmNode {
 
   async #handleElectionTimeout() {
     if (this.closing || this.#isLearner() || this.consensusEngine.role === "leader") return
-    if (this.currentLeader()) {
+    const currentLeader = this.currentLeader()
+    if (currentLeader && (currentLeader === this.options.identity.publicKeyId || this.#isLeaderReachable(currentLeader))) {
+      this.#scheduleElectionTimer()
+      return
+    }
+
+    if (currentLeader || this.#lastKnownLeaderId()) {
+      this.#enterSplitFence("leader-heartbeat-expired", currentLeader ?? this.#lastKnownLeaderId())
+      await this.#persistSplitState()
       this.#scheduleElectionTimer()
       return
     }
@@ -838,6 +865,8 @@ export class HolepunchSwarmNode {
       this.electionTimer = null
     }
     this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    this.#clearSplitFence()
+    await this.#persistSplitState()
     await this.#runHeartbeat()
   }
 
@@ -848,6 +877,11 @@ export class HolepunchSwarmNode {
       leaderNodeId
     })
     this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    this.#rejectPendingWrites(new Error("Leadership changed while write was in flight"))
+    if (leaderNodeId && leaderNodeId !== this.options.identity.publicKeyId) {
+      this.#clearSplitFence()
+      await this.#persistSplitState()
+    }
     this.#scheduleElectionTimer()
   }
 
@@ -866,6 +900,10 @@ export class HolepunchSwarmNode {
     })
     if (observation.persistPatch) {
       this.consensusState = await this.consensusStateStore.save(observation.persistPatch)
+    }
+    if (observation.acceptedLeader) {
+      this.#clearSplitFence()
+      await this.#persistSplitState()
     }
     if (observation.acceptedLeader || observation.persistPatch) {
       this.#scheduleElectionTimer()
@@ -922,6 +960,7 @@ export class HolepunchSwarmNode {
       localNodeId: this.options.identity.publicKeyId,
       authorizedNodes: this.options.authorizedNodes,
       isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),
+      isConnectionAccepted: (nodeId) => this.#acceptsPeerConnection(nodeId),
       replicateConnection: (conn) => {
         this.joinControl?.attachConnection(conn)
         this.store.replicate(conn)
@@ -988,11 +1027,14 @@ export class HolepunchSwarmNode {
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
+    }
     if (!this.options.forwarding) {
       throw new Error("Write forwarding is disabled on this node")
     }
 
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     if (!leader) throw new Error("No current leader is available")
 
     const leaderCore = this.feedCores.get(leader)
@@ -1125,11 +1167,69 @@ export class HolepunchSwarmNode {
     return this.#role() !== "voter"
   }
 
+  #isSplitFenced() {
+    return this.splitState.fenced
+  }
+
+  #lastKnownLeaderId() {
+    return this.splitState.leaderNodeId ?? this.consensusEngine.state.leaderNodeId ?? null
+  }
+
+  #enterSplitFence(reason, leaderNodeId = this.#lastKnownLeaderId()) {
+    if (this.consensusEngine.role === "leader") return
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return
+    if (this.splitState.fenced && this.splitState.leaderNodeId === leaderNodeId && this.splitState.reason === reason) {
+      return
+    }
+
+    this.splitState = {
+      fenced: true,
+      reason,
+      leaderNodeId,
+      since: new Date().toISOString()
+    }
+    this.network?.refreshConnectionPermissions()
+    this.#rejectPendingWrites(new Error("Leader is unreachable while node is split-fenced"))
+  }
+
+  #clearSplitFence() {
+    if (!this.splitState.fenced) return
+    this.splitState = {
+      fenced: false,
+      reason: null,
+      leaderNodeId: null,
+      since: null
+    }
+    this.network?.refreshConnectionPermissions()
+  }
+
+  #acceptsPeerConnection(nodeId) {
+    if (!this.#isSplitFenced()) return true
+    return nodeId === this.#lastKnownLeaderId()
+  }
+
+  async #persistSplitState() {
+    this.consensusState = await this.consensusStateStore.save({
+      splitFenced: this.splitState.fenced,
+      splitLeaderNodeId: this.splitState.leaderNodeId,
+      splitReason: this.splitState.reason
+    })
+  }
+
   #createLearnerWriteError() {
     const error = new Error("This node is a read-only learner and cannot accept or proxy writes")
     error.code = "READ_ONLY_LEARNER"
     error.statusCode = 403
-    error.leader = this.currentLeader()
+    error.leader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    return error
+  }
+
+  #createSplitFencedError() {
+    const error = new Error("This node is split-fenced and is waiting to reconnect to the current leader")
+    error.code = "SPLIT_FENCED"
+    error.statusCode = 503
+    error.leader = this.#lastKnownLeaderId()
+    error.splitStatus = { ...this.splitState }
     return error
   }
 
@@ -1308,7 +1408,15 @@ export class HolepunchSwarmNode {
   }
 
   #readStatus() {
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    if (this.#isSplitFenced()) {
+      return {
+        staleReadsPossible: true,
+        reason: "split-fenced",
+        leader
+      }
+    }
+
     if (leader && leader !== this.options.identity.publicKeyId && !this.#isLeaderReachable(leader)) {
       return {
         staleReadsPossible: true,
@@ -1474,14 +1582,15 @@ export class HolepunchSwarmNode {
 
     const currentLeader = this.currentLeader()
     if (currentLeader !== this.options.identity.publicKeyId) {
+      const leaderHint = currentLeader ?? this.#lastKnownLeaderId()
       session.sendResponse({
         v: 1,
         type: "replicore.join-response",
         ok: false,
         redirect: true,
-        leaderNodeId: currentLeader,
+        leaderNodeId: leaderHint,
         errorCode: currentLeader ? "NOT_LEADER" : "LEADER_UNAVAILABLE",
-        error: currentLeader
+        error: leaderHint
           ? "Join requests must be handled by the current leader"
           : "No current leader is available"
       })

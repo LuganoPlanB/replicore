@@ -9,12 +9,13 @@ export class SwarmNetwork {
    *   bootstrap?: Array<string | { host: string, port: number }>,
    *   topic: Buffer,
    *   keyPair?: { publicKey: Buffer, secretKey: Buffer },
-   *   localNodeId: string,
-   *   authorizedNodes: Array<{ nodeId: string }>,
-   *   isRevokedNode: (nodeId: string) => boolean,
-   *   replicateConnection: (conn: any) => void,
-   *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean } | null
-   * }} options
+ *   localNodeId: string,
+ *   authorizedNodes: Array<{ nodeId: string }>,
+ *   isRevokedNode: (nodeId: string) => boolean,
+ *   isConnectionAccepted?: (nodeId: string | null) => boolean,
+ *   replicateConnection: (conn: any) => void,
+ *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean } | null
+ * }} options
    */
   constructor(options) {
     this.options = options
@@ -71,6 +72,10 @@ export class SwarmNetwork {
 
   setPolicy(networkPolicy = null) {
     this.networkPolicy = networkPolicy
+    this.#enforceConnectionPolicy()
+  }
+
+  refreshConnectionPermissions() {
     this.#enforceConnectionPolicy()
   }
 
@@ -186,6 +191,7 @@ export class SwarmNetwork {
    */
   #isConnectionAllowed(nodeId) {
     if (!nodeId) return true
+    if (this.options.isConnectionAccepted?.(nodeId) === false) return false
     if (!this.networkPolicy?.allowConnection) return true
     return this.networkPolicy.allowConnection(this.options.localNodeId, nodeId) !== false
   }

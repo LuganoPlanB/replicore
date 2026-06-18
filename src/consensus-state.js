@@ -3,7 +3,10 @@ const DEFAULT_CONSENSUS_STATE = Object.freeze({
   votedFor: null,
   commitIndex: -1,
   lastApplied: -1,
-  membershipVersion: 0
+  membershipVersion: 0,
+  splitFenced: false,
+  splitLeaderNodeId: null,
+  splitReason: null
 })
 
 /**

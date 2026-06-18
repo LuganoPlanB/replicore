@@ -116,7 +116,7 @@ test("leader operations replicate to followers and rebuild after restart", { con
 })
 
 test(
-  "followers forward writes to the computed leader and the next alive node becomes leader",
+  "followers forward writes to the computed leader and become split-fenced when that leader disappears",
   { concurrency: false },
   async () => {
   const testnet = await createTestnet(3)
@@ -182,37 +182,24 @@ test(
     nodes.splice(nodes.indexOf(currentLeaderNode), 1)
     const survivingObserver = nodes[0]
 
-    let electedLeaderId = null
     await waitFor(async () => {
-      const leaders = nodes.map((node) => node.currentLeader())
-      if (leaders.some((value) => value === null || value === leaderId)) return false
-      const uniqueLeaders = [...new Set(leaders)]
-      if (uniqueLeaders.length !== 1) return false
-      electedLeaderId = uniqueLeaders[0]
-      return true
+      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
+      return statuses.every((status) =>
+        status.splitStatus?.fenced === true &&
+        status.splitStatus?.leaderNodeId === leaderId &&
+        status.readStatus.reason === "split-fenced"
+      )
     }, {
-      description: "surviving nodes converge on one new leader",
+      description: "surviving followers become split-fenced",
       onTimeout: () => survivingObserver.getReplicationStatus()
     })
 
-    const forwardingNode = nodes.find((node) => node.options.identity.publicKeyId !== electedLeaderId)
-    let result = null
-    await waitFor(
-      async () => {
-        try {
-          result = await forwardingNode.put("hash:gamma", { failover: true })
-          return result.actor === electedLeaderId
-        } catch {
-          return false
-        }
-      },
-      {
-        description: "failover write through the next leader",
-        onTimeout: () => survivingObserver.getReplicationStatus()
-      }
+    const forwardingNode = nodes[0]
+    await assert.rejects(
+      forwardingNode.put("hash:gamma", { failover: true }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
     )
-
-    assert.equal(result.actor, electedLeaderId)
+    assert.equal(await forwardingNode.get("hash:gamma"), null)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -221,7 +208,7 @@ test(
   }
 )
 
-test("history keeps actor audit data and logical index order across leader failover", { concurrency: false }, async () => {
+test("history keeps actor audit data and blocks new committed entries while followers are split-fenced", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -283,29 +270,23 @@ test("history keeps actor audit data and logical index order across leader failo
     nodes.splice(nodes.indexOf(firstLeaderNode), 1)
 
     await waitFor(async () => {
-      const leaderIds = nodes.map((node) => node.currentLeader())
-      return (
-        leaderIds[0] !== null &&
-        leaderIds[0] !== firstLeaderId &&
-        leaderIds.every((leaderId) => leaderId === leaderIds[0])
+      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
+      return statuses.every((status) =>
+        status.splitStatus?.fenced === true &&
+        status.splitStatus?.leaderNodeId === firstLeaderId
       )
     })
-    const secondLeaderId = nodes[0].currentLeader()
-    const secondLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === secondLeaderId)
 
-    const secondWrite = await secondLeaderNode.put("hash:history-order", { phase: "after" })
-    await waitFor(async () => {
-      const values = await Promise.all(nodes.map((node) => node.get("hash:history-order")))
-      return values.every((value) => value?.value?.phase === "after")
-    })
+    await assert.rejects(
+      follower1.put("hash:history-order", { phase: "after" }),
+      /split-fenced|Current leader .* is not reachable|No current leader is available/
+    )
 
     const history = await nodes[0].getHistory("hash:history-order")
-    assert.equal(history.length, 2)
+    assert.equal(history.length, 1)
     assert.equal(history[0].actor, firstWrite.actor)
     assert.equal(history[0].opId, firstWrite.opId)
-    assert.equal(history[1].actor, secondWrite.actor)
-    assert.equal(history[1].opId, secondWrite.opId)
-    assert.ok(history[0].index < history[1].index)
+    assert.equal((await nodes[0].get("hash:history-order"))?.value?.phase, "before")
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -358,7 +339,7 @@ test("startup election converges on a single leader with a persisted term", { co
   }
 })
 
-test("leader failover elects one replacement and increments the term", { concurrency: false }, async () => {
+test("leader loss split-fences survivors and preserves the current term until recovery", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
   const nodes = []
@@ -399,17 +380,15 @@ test("leader failover elects one replacement and increments the term", { concurr
     nodes.splice(nodes.indexOf(firstLeaderNode), 1)
 
     await waitFor(async () => {
-      const leaderIds = nodes.map((node) => node.currentLeader())
-      return (
-        leaderIds[0] !== null &&
-        leaderIds[0] !== firstLeaderId &&
-        leaderIds.every((leaderId) => leaderId === leaderIds[0])
+      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
+      return statuses.every((status) =>
+        status.splitStatus?.fenced === true &&
+        status.splitStatus?.leaderNodeId === firstLeaderId
       )
     })
-    const replacementLeaderId = nodes[0].currentLeader()
 
     const replacementStates = await Promise.all(nodes.map((node) => node.getConsensusState()))
-    assert.ok(replacementStates.every((state) => state.currentTerm > initialTerm))
+    assert.ok(replacementStates.every((state) => state.currentTerm === initialTerm))
     assert.ok(replacementStates.every((state) => state.currentTerm === replacementStates[0].currentTerm))
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
