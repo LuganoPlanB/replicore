@@ -119,14 +119,28 @@ export class ConsensusEngine {
       return this.#voteRefusal(consensusState.currentTerm, "learner-node")
     }
 
-    const candidateNodeId = message?.candidateNodeId
-    if (typeof candidateNodeId !== "string" || !voterNodeIds.includes(candidateNodeId)) {
-      return this.#voteRefusal(consensusState.currentTerm, "candidate-not-voter")
-    }
-
     const term = Number.isInteger(message?.term) ? message.term : -1
     if (term < consensusState.currentTerm) {
       return this.#voteRefusal(consensusState.currentTerm, "stale-term")
+    }
+
+    let persistPatch = null
+    let votedFor = consensusState.votedFor
+    if (term > consensusState.currentTerm) {
+      persistPatch = {
+        currentTerm: term,
+        votedFor: null
+      }
+      votedFor = null
+      this.state.role = "follower"
+      this.state.leaderNodeId = null
+      this.state.leaderHeartbeatAt = 0
+      this.state.electionDeadlineAt = 0
+    }
+
+    const candidateNodeId = message?.candidateNodeId
+    if (typeof candidateNodeId !== "string" || !voterNodeIds.includes(candidateNodeId)) {
+      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "candidate-not-voter", persistPatch)
     }
 
     if (
@@ -134,11 +148,11 @@ export class ConsensusEngine {
       Number.isInteger(localMembershipVersion) &&
       message.membershipVersion !== localMembershipVersion
     ) {
-      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "membership-version-mismatch")
+      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "membership-version-mismatch", persistPatch)
     }
 
-    if (consensusState.votedFor && consensusState.votedFor !== candidateNodeId && term === consensusState.currentTerm) {
-      return this.#voteRefusal(consensusState.currentTerm, "already-voted")
+    if (votedFor && votedFor !== candidateNodeId) {
+      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "already-voted", persistPatch)
     }
 
     const candidateLog = {
@@ -149,7 +163,7 @@ export class ConsensusEngine {
       candidateLog.term < localLog.term ||
       (candidateLog.term === localLog.term && candidateLog.index < localLog.index)
     ) {
-      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "stale-log")
+      return this.#voteRefusal(Math.max(term, consensusState.currentTerm), "stale-log", persistPatch)
     }
 
     this.state.role = "follower"
@@ -158,6 +172,7 @@ export class ConsensusEngine {
 
     return {
       persistPatch: {
+        ...(persistPatch ?? {}),
         currentTerm: Math.max(term, consensusState.currentTerm),
         votedFor: candidateNodeId
       },
@@ -272,9 +287,9 @@ export class ConsensusEngine {
     return this.state.role === "candidate" && Number.isInteger(term)
   }
 
-  #voteRefusal(term, refusalReason) {
+  #voteRefusal(term, refusalReason, persistPatch = null) {
     return {
-      persistPatch: null,
+      persistPatch,
       response: {
         term,
         voteGranted: false,

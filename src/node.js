@@ -52,6 +52,9 @@ export class HolepunchSwarmNode {
    *   heartbeatTtlMs?: number,
    *   electionTimeoutMinMs?: number,
    *   electionTimeoutMaxMs?: number,
+   *   requestTimeoutMs?: number,
+   *   maxInflightReplication?: number,
+   *   electionTimeoutSeed?: string | null,
    *   forwarding?: boolean,
    *   ackDelayMs?: number,
    *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
@@ -64,6 +67,9 @@ export class HolepunchSwarmNode {
       heartbeatTtlMs: 3000,
       electionTimeoutMinMs: 900,
       electionTimeoutMaxMs: 1500,
+      requestTimeoutMs: options.durability?.timeoutMs ?? 5000,
+      maxInflightReplication: 16,
+      electionTimeoutSeed: null,
       forwarding: true,
       durability: {
         requiredFollowerAcks: 1,
@@ -143,7 +149,7 @@ export class HolepunchSwarmNode {
     this.membershipState = await this.#loadMembershipState()
     this.rpc = new NodeRpcRouter({
       localNodeId: this.options.identity.publicKeyId,
-      timeoutMs: this.options.durability.timeoutMs,
+      timeoutMs: this.options.requestTimeoutMs,
       ackDelayMs: this.options.ackDelayMs,
       onPeerIdentity: (nodeId, peer) => this.network?.observePeerIdentity(nodeId, peer),
       onWriteRequest: async (message) => {

@@ -37,6 +37,10 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
     assert.equal(config.http.port, 3001)
     assert.equal(config.authorizedNodes.length, 3)
     assert.equal(config.dataDir, path.join(dir, "data"))
+    assert.equal(config.electionTimeoutMinMs, 900)
+    assert.equal(config.electionTimeoutMaxMs, 1500)
+    assert.equal(config.requestTimeoutMs, 5000)
+    assert.equal(config.maxInflightReplication, 16)
     assert.equal(
       config.authorizedNodes.some((node) => node.nodeId === config.identity.publicKeyId),
       true
@@ -149,6 +153,42 @@ test("loadRuntimeConfig accepts an explicit machine identity source override", a
 
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.machineId, "override-machine")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig validates raft timing bounds", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-raft-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    raw.electionTimeoutMinMs = 50
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(loadRuntimeConfig(configPath), /electionTimeoutMinMs must be between/)
+
+    raw.electionTimeoutMinMs = 900
+    raw.electionTimeoutMaxMs = 900
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /electionTimeoutMaxMs must be greater than electionTimeoutMinMs/
+    )
+
+    raw.electionTimeoutMaxMs = 1500
+    raw.requestTimeoutMs = 1000
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(loadRuntimeConfig(configPath), /requestTimeoutMs must be between/)
+
+    raw.requestTimeoutMs = 5000
+    raw.maxInflightReplication = 0
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await assert.rejects(loadRuntimeConfig(configPath), /maxInflightReplication must be between/)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

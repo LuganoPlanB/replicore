@@ -38,6 +38,7 @@ export async function loadRuntimeConfig(configPath) {
     throw new Error("Local identity is revoked in config")
   }
   const encryption = normalizeEncryption(raw)
+  const raft = normalizeRaftTimings(raw)
 
   return {
     configPath: absolutePath,
@@ -48,8 +49,13 @@ export async function loadRuntimeConfig(configPath) {
     role,
     machineId: raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId"),
     bootstrap: normalizeBootstrap(raw.bootstrap ?? []),
-    heartbeatIntervalMs: raw.heartbeatIntervalMs ?? 500,
-    heartbeatTtlMs: raw.heartbeatTtlMs ?? 3000,
+    heartbeatIntervalMs: raft.heartbeatIntervalMs,
+    heartbeatTtlMs: raft.heartbeatTtlMs,
+    electionTimeoutMinMs: raft.electionTimeoutMinMs,
+    electionTimeoutMaxMs: raft.electionTimeoutMaxMs,
+    requestTimeoutMs: raft.requestTimeoutMs,
+    maxInflightReplication: raft.maxInflightReplication,
+    electionTimeoutSeed: raft.electionTimeoutSeed,
     forwarding: raw.forwarding ?? true,
     durability: {
       requiredFollowerAcks: raw.durability?.requiredFollowerAcks ?? 1,
@@ -170,6 +176,57 @@ function normalizeBootstrap(raw) {
   })
 }
 
+function normalizeRaftTimings(raw) {
+  const heartbeatIntervalMs = requireBoundedInteger(
+    raw.heartbeatIntervalMs ?? raw.raft?.heartbeatIntervalMs ?? 500,
+    "heartbeatIntervalMs",
+    { min: 25, max: 60_000 }
+  )
+  const heartbeatTtlMs = requireBoundedInteger(
+    raw.heartbeatTtlMs ?? raw.raft?.leaderLeaseMs ?? 3000,
+    "heartbeatTtlMs",
+    { min: heartbeatIntervalMs * 2, max: 300_000 }
+  )
+  const electionTimeoutMinMs = requireBoundedInteger(
+    raw.electionTimeoutMinMs ?? raw.raft?.electionTimeoutMinMs ?? 900,
+    "electionTimeoutMinMs",
+    { min: heartbeatIntervalMs + 100, max: 300_000 }
+  )
+  const electionTimeoutMaxMs = requireBoundedInteger(
+    raw.electionTimeoutMaxMs ?? raw.raft?.electionTimeoutMaxMs ?? 1500,
+    "electionTimeoutMaxMs",
+    { min: electionTimeoutMinMs, max: 300_000 }
+  )
+  if (electionTimeoutMaxMs === electionTimeoutMinMs) {
+    throw new Error("electionTimeoutMaxMs must be greater than electionTimeoutMinMs")
+  }
+
+  const requestTimeoutMs = requireBoundedInteger(
+    raw.requestTimeoutMs ?? raw.raft?.requestTimeoutMs ?? 5000,
+    "requestTimeoutMs",
+    { min: electionTimeoutMaxMs, max: 300_000 }
+  )
+  const maxInflightReplication = requireBoundedInteger(
+    raw.maxInflightReplication ?? raw.raft?.maxInflightReplication ?? 16,
+    "maxInflightReplication",
+    { min: 1, max: 1024 }
+  )
+  const electionTimeoutSeed = raw.electionTimeoutSeed ?? raw.raft?.electionTimeoutSeed ?? null
+  if (electionTimeoutSeed !== null && typeof electionTimeoutSeed !== "string") {
+    throw new Error("electionTimeoutSeed must be a string when provided")
+  }
+
+  return {
+    heartbeatIntervalMs,
+    heartbeatTtlMs,
+    electionTimeoutMinMs,
+    electionTimeoutMaxMs,
+    requestTimeoutMs,
+    maxInflightReplication,
+    electionTimeoutSeed
+  }
+}
+
 function requireString(value, field) {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${field} must be a non-empty string`)
@@ -180,6 +237,16 @@ function requireString(value, field) {
 function requireNumber(value, field) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error(`${field} must be a finite number`)
+  }
+  return value
+}
+
+function requireBoundedInteger(value, field, { min, max }) {
+  if (!Number.isInteger(value)) {
+    throw new Error(`${field} must be an integer`)
+  }
+  if (value < min || value > max) {
+    throw new Error(`${field} must be between ${min} and ${max}`)
   }
   return value
 }

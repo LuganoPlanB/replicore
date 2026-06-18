@@ -123,6 +123,10 @@ test("vote request rejects a stale candidate log", () => {
 
   assert.equal(denied.response.voteGranted, false)
   assert.equal(denied.response.refusalReason, "stale-log")
+  assert.deepEqual(denied.persistPatch, {
+    currentTerm: 5,
+    votedFor: null
+  })
 })
 
 test("accepted heartbeat resets leader lease and exposes the current leader", () => {
@@ -150,6 +154,103 @@ test("accepted heartbeat resets leader lease and exposes the current leader", ()
   assert.equal(engine.currentLeader({ isLearner: false, heartbeatTtlMs: 100 }), "node-a")
   now += 901
   assert.equal(engine.currentLeader({ isLearner: false, heartbeatTtlMs: 100 }), null)
+})
+
+test("higher-term vote request steps down and grants an up-to-date voter", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const becameLeader = engine.becomeLeader({
+    term: 4,
+    currentTerm: 4,
+    electionTimeoutMaxMs: 500
+  })
+  assert.equal(becameLeader.becameLeader, true)
+
+  const granted = engine.evaluateVoteRequest({
+    consensusState: { currentTerm: 4, votedFor: "node-b" },
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    isLearner: false,
+    localLog: { index: 12, term: 4 },
+    localMembershipVersion: 2,
+    message: {
+      term: 5,
+      candidateNodeId: "node-a",
+      lastLogIndex: 12,
+      lastLogTerm: 4,
+      membershipVersion: 2
+    }
+  })
+
+  assert.equal(engine.role, "follower")
+  assert.equal(granted.response.voteGranted, true)
+  assert.deepEqual(granted.persistPatch, {
+    currentTerm: 5,
+    votedFor: "node-a"
+  })
+})
+
+test("learner nodes and non-voters cannot receive votes", () => {
+  const learnerEngine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const learnerDecision = learnerEngine.evaluateVoteRequest({
+    consensusState: { currentTerm: 3, votedFor: null },
+    voterNodeIds: ["node-a", "node-c"],
+    isLearner: true,
+    localLog: { index: 0, term: 0 },
+    localMembershipVersion: 1,
+    message: {
+      term: 4,
+      candidateNodeId: "node-a",
+      lastLogIndex: 0,
+      lastLogTerm: 0,
+      membershipVersion: 1
+    }
+  })
+  assert.equal(learnerDecision.response.refusalReason, "learner-node")
+
+  const voterEngine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const removedDecision = voterEngine.evaluateVoteRequest({
+    consensusState: { currentTerm: 3, votedFor: null },
+    voterNodeIds: ["node-a", "node-b"],
+    isLearner: false,
+    localLog: { index: 0, term: 0 },
+    localMembershipVersion: 1,
+    message: {
+      term: 4,
+      candidateNodeId: "node-z",
+      lastLogIndex: 0,
+      lastLogTerm: 0,
+      membershipVersion: 1
+    }
+  })
+  assert.equal(removedDecision.response.refusalReason, "candidate-not-voter")
+  assert.deepEqual(removedDecision.persistPatch, {
+    currentTerm: 4,
+    votedFor: null
+  })
+})
+
+test("membership version mismatch rejects the vote but still records a higher term", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const denied = engine.evaluateVoteRequest({
+    consensusState: { currentTerm: 6, votedFor: null },
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    isLearner: false,
+    localLog: { index: 9, term: 6 },
+    localMembershipVersion: 3,
+    message: {
+      term: 7,
+      candidateNodeId: "node-a",
+      lastLogIndex: 9,
+      lastLogTerm: 6,
+      membershipVersion: 2
+    }
+  })
+
+  assert.equal(denied.response.voteGranted, false)
+  assert.equal(denied.response.refusalReason, "membership-version-mismatch")
+  assert.deepEqual(denied.persistPatch, {
+    currentTerm: 7,
+    votedFor: null
+  })
 })
 
 test("wrapper-style write authority follows consensus output instead of heartbeat maps", () => {
