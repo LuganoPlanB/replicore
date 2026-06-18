@@ -22,6 +22,7 @@ const RESOURCE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_RESOURCE_TIMEOUT_M
  *   authorizedNodesByNodeId?: Record<string, Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>>,
  *   dataDirs?: string[],
  *   clusterId?: string,
+ *   clusterSecret?: Buffer,
  *   topicSalt?: string,
  *   encryptionKey?: Buffer,
  *   heartbeatIntervalMs?: number,
@@ -71,6 +72,12 @@ export async function createSwarmCluster(options = {}) {
     trace,
     options: {
       clusterId: options.clusterId ?? "test-cluster",
+      clusterSecret:
+        options.clusterSecret ??
+        Buffer.from(
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "hex"
+        ),
       topicSalt: options.topicSalt ?? "test-salt",
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? 500,
       heartbeatTtlMs: options.heartbeatTtlMs ?? 3000,
@@ -166,6 +173,8 @@ export async function createSwarmCluster(options = {}) {
       const nodeOptions = {
         dataDir: record.dataDir,
         clusterId: this.options.clusterId,
+        clusterSecret: this.options.clusterSecret,
+        machineId: `test-machine:${record.label}`,
         topicSalt: this.options.topicSalt,
         identity: record.identity,
         authorizedNodes: options.authorizedNodesByNodeId?.[record.identity.publicKeyId] ?? this.authorizedNodes,

@@ -28,3 +28,4 @@ export {
 } from "./operation.js"
 export { readSnapshotFile, writeSnapshotFile } from "./snapshot-file.js"
 export { HolepunchSwarmNode } from "./node.js"
+export { resolveTransportIdentity } from "./transport-identity.js"

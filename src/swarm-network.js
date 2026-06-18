@@ -8,6 +8,7 @@ export class SwarmNetwork {
    * @param {{
    *   bootstrap?: Array<string | { host: string, port: number }>,
    *   topic: Buffer,
+   *   keyPair?: { publicKey: Buffer, secretKey: Buffer },
    *   localNodeId: string,
    *   authorizedNodes: Array<{ nodeId: string }>,
    *   isRevokedNode: (nodeId: string) => boolean,
@@ -27,7 +28,10 @@ export class SwarmNetwork {
   async start() {
     if (this.swarm) return
 
-    this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
+    this.swarm = new Hyperswarm({
+      ...(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {}),
+      ...(this.options.keyPair ? { keyPair: this.options.keyPair } : {})
+    })
     this.swarm.on("connection", (conn) => {
       this.connections.add(conn)
       conn.once("close", () => {

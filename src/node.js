@@ -20,6 +20,7 @@ import { NodeRpcRouter } from "./node-rpc.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
+import { resolveTransportIdentity } from "./transport-identity.js"
 
 /**
  * Minimal multi-node swarm with one feed per node and leader-only writes.
@@ -30,6 +31,8 @@ export class HolepunchSwarmNode {
    *   dataDir: string,
    *   clusterId: string,
    *   clusterSecret?: Buffer,
+   *   machineId?: string,
+   *   nodeIdentitySeed?: Buffer,
    *   topicSalt?: string,
    *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
    *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
@@ -68,6 +71,7 @@ export class HolepunchSwarmNode {
     this.consensusState = null
     this.network = null
     this.rpc = null
+    this.transportIdentity = null
     this.viewBee = null
     this.view = null
     this.feedCores = new Map()
@@ -88,6 +92,12 @@ export class HolepunchSwarmNode {
   async start() {
     await mkdir(this.options.dataDir, { recursive: true })
     await mkdir(join(this.options.dataDir, "corestore"), { recursive: true })
+    this.transportIdentity = await resolveTransportIdentity({
+      dataDir: this.options.dataDir,
+      clusterSecret: this.options.clusterSecret,
+      machineId: this.options.machineId,
+      nodeIdentitySeed: this.options.nodeIdentitySeed
+    })
 
     this.store = new Corestore(join(this.options.dataDir, "corestore"))
     await this.store.ready()
@@ -549,6 +559,7 @@ export class HolepunchSwarmNode {
     this.network ??= new SwarmNetwork({
       bootstrap: this.options.bootstrap,
       topic,
+      keyPair: this.transportIdentity?.keyPair,
       localNodeId: this.options.identity.publicKeyId,
       authorizedNodes: this.options.authorizedNodes,
       isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),
