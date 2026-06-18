@@ -851,8 +851,7 @@ export class HolepunchSwarmNode {
     const peers = voterNodeIds
       .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
       .map((nodeId) => {
-        const core = this.feedCores.get(nodeId)
-        const peer = core?.peers?.[0] ?? null
+        const peer = this.#peerForNodeId(nodeId)
         return peer ? { nodeId, peer } : null
       })
       .filter(Boolean)
@@ -1105,8 +1104,7 @@ export class HolepunchSwarmNode {
     const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     if (!leader) throw new Error("No current leader is available")
 
-    const leaderCore = this.feedCores.get(leader)
-    const peer = leaderCore.peers[0]
+    const peer = this.#peerForNodeId(leader)
     if (!peer) {
       throw new Error(`Current leader ${leader} is not reachable`)
     }
@@ -1128,8 +1126,7 @@ export class HolepunchSwarmNode {
    * @param {number} seq
    */
   async #sendAck(nodeId, seq) {
-    const core = this.feedCores.get(nodeId)
-    const peer = core.peers[0]
+    const peer = this.#peerForNodeId(nodeId)
     if (!peer) return
 
     await this.rpc.sendAck({ targetNodeId: nodeId, peer, seq })
@@ -1156,6 +1153,19 @@ export class HolepunchSwarmNode {
    */
   #nodeCore(nodeId) {
     return this.feedCores.get(nodeId) ?? null
+  }
+
+  /**
+   * Return the first live replication peer currently backing one node feed.
+   *
+   * This remains transport scaffolding only; leader-log authority is decided by
+   * consensus and the authoritative log helpers, not by the presence of a feed
+   * peer in a particular slot.
+   *
+   * @param {string} nodeId
+   */
+  #peerForNodeId(nodeId) {
+    return this.#nodeCore(nodeId)?.peers?.[0] ?? null
   }
 
   /**
