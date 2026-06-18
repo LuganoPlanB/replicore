@@ -998,6 +998,309 @@ test("a learner can store a valid promotion credential without becoming a voter 
   }
 })
 
+test("a removed voter cannot regain write authority or satisfy durability after restart", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "5555555555555555555555555555555555555555555555555555555555555555",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("removed-restart-leader"))
+    const followerIdentity = generateIdentity(seed("removed-restart-follower"))
+    const removedIdentity = generateIdentity(seed("removed-restart-target"))
+    const authorizedNodes = [leaderIdentity, followerIdentity, removedIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leaderNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "removed-restart-cluster",
+      clusterSecret,
+      machineId: "removed-restart-leader",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const followerNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "removed-restart-cluster",
+      clusterSecret,
+      machineId: "removed-restart-follower",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const removedNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "removed-restart-cluster",
+      clusterSecret,
+      machineId: "removed-restart-target",
+      identity: removedIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leaderNode, followerNode, removedNode)
+    await leaderNode.start()
+    await followerNode.start()
+    await removedNode.start()
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId, removedIdentity.publicKeyId]
+      .sort()[0]
+    const leader = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
+    const nonLeaderNodes = nodes
+      .filter((node) => node.options.identity.publicKeyId !== leaderId)
+      .sort((left, right) =>
+        left.options.identity.publicKeyId.localeCompare(right.options.identity.publicKeyId)
+      )
+    const retainedFollower = nonLeaderNodes[0]
+    const removalTarget = nonLeaderNodes[1]
+    const removalTargetId = removalTarget.options.identity.publicKeyId
+
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === leaderId))
+    await leader.put("hash:removed-before", { value: "before-removal" })
+
+    const removedMembership = await leader.removeVoter(removalTargetId)
+    assert.equal(removedMembership.removed.some((entry) => entry.nodeId === removalTargetId), true)
+
+    await waitFor(async () => {
+      const status = await removalTarget.getReplicationStatus()
+      return status.membership.localRole === "removed"
+    })
+
+    await assert.rejects(
+      removalTarget.put("hash:removed-write", { value: "forbidden" }),
+      (error) => error?.code === "READ_ONLY_LEARNER"
+    )
+
+    await retainedFollower.close()
+    nodes.splice(nodes.indexOf(retainedFollower), 1)
+
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      return status.connections === 1
+    })
+
+    await assert.rejects(
+      leader.put("hash:removed-durability", { value: "blocked" }),
+      /Durability requirement not met/
+    )
+
+    const removedDataDir = removalTarget.options.dataDir
+    const removedMachineId = removalTarget.options.machineId
+    await removalTarget.close()
+    nodes.splice(nodes.indexOf(removalTarget), 1)
+
+    const restartedRemovedNode = new HolepunchSwarmNode({
+      dataDir: removedDataDir,
+      clusterId: "removed-restart-cluster",
+      clusterSecret,
+      machineId: removedMachineId,
+      identity: removedIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await restartedRemovedNode.start()
+    nodes.push(restartedRemovedNode)
+
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      return (
+        status.membership.removed.some((entry) => entry.nodeId === removalTargetId) &&
+        !status.membership.learners.some((entry) => entry.nodeId === removalTargetId)
+      )
+    })
+
+    await assert.rejects(
+      restartedRemovedNode.put("hash:removed-restart-write", { value: "still-forbidden" }),
+      (error) =>
+        error?.code === "READ_ONLY_LEARNER" ||
+        /Durability requirement not met/.test(error?.message ?? "")
+    )
+
+    const leaderStatus = await leader.getReplicationStatus()
+    assert.equal(
+      leaderStatus.membership.removed.some((entry) => entry.nodeId === removalTargetId),
+      true
+    )
+    assert.equal(
+      leaderStatus.membership.learners.some((entry) => entry.nodeId === removalTargetId),
+      false
+    )
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("a replacement learner can join after removal, be promoted, and restore durable writes", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "6666666666666666666666666666666666666666666666666666666666666666",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("replacement-membership-leader"))
+    const followerIdentity = generateIdentity(seed("replacement-membership-follower"))
+    const retiredIdentity = generateIdentity(seed("replacement-membership-retired"))
+    const replacementIdentity = generateIdentity(seed("replacement-membership-new"))
+    const initialAuthorizedNodes = [leaderIdentity, followerIdentity, retiredIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leaderNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "replacement-membership-cluster",
+      clusterSecret,
+      machineId: "replacement-membership-leader",
+      identity: leaderIdentity,
+      authorizedNodes: initialAuthorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const followerNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "replacement-membership-cluster",
+      clusterSecret,
+      machineId: "replacement-membership-follower",
+      identity: followerIdentity,
+      authorizedNodes: initialAuthorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const retiredNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "replacement-membership-cluster",
+      clusterSecret,
+      machineId: "replacement-membership-retired",
+      identity: retiredIdentity,
+      authorizedNodes: initialAuthorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leaderNode, followerNode, retiredNode)
+    await leaderNode.start()
+    await followerNode.start()
+    await retiredNode.start()
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId, retiredIdentity.publicKeyId]
+      .sort()[0]
+    const leader = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
+    const nonLeaderNodes = nodes
+      .filter((node) => node.options.identity.publicKeyId !== leaderId)
+      .sort((left, right) =>
+        left.options.identity.publicKeyId.localeCompare(right.options.identity.publicKeyId)
+      )
+    const retainedFollower = nonLeaderNodes[0]
+    const retiredTarget = nonLeaderNodes[1]
+    const retiredTargetId = retiredTarget.options.identity.publicKeyId
+
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === leaderId))
+    await leader.put("hash:replacement-membership-before", { value: "before-replacement" })
+
+    const removal = await leader.removeVoter(retiredTargetId)
+    assert.equal(removal.removed.some((entry) => entry.nodeId === retiredTargetId), true)
+
+    await waitFor(async () => {
+      const status = await retiredTarget.getReplicationStatus()
+      return status.membership.localRole === "removed"
+    })
+
+    const replacement = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "replacement-membership-cluster",
+      clusterSecret,
+      role: "learner",
+      machineId: "replacement-membership-new",
+      identity: replacementIdentity,
+      authorizedNodes: [],
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await replacement.start()
+    nodes.push(replacement)
+
+    await waitFor(async () => {
+      const value = await replacement.get("hash:replacement-membership-before")
+      return value?.value?.value === "before-replacement"
+    })
+
+    const credential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: "replacement-membership-cluster",
+        membershipVersion: 1,
+        learnerNodeId: replacementIdentity.publicKeyId,
+        learnerNoisePublicKey: replacement.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: "2026-06-18T16:00:00.000Z",
+        expiresAt: "2026-06-18T17:00:00.000Z",
+        nonce: "replacement-membership-promotion",
+        signerNodeId: leaderIdentity.publicKeyId
+      },
+      signerSecretKey: leaderIdentity.secretKey
+    })
+
+    await replacement.submitPromotionCredential(credential)
+    const committed = await leader.commitPromotionCredential(credential)
+    assert.equal(committed.voters.some((entry) => entry.nodeId === replacementIdentity.publicKeyId), true)
+
+    await waitFor(async () => {
+      const status = await replacement.getReplicationStatus()
+      return status.membership.localRole === "voter"
+    })
+
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      const replacementFeed = status.feeds[replacementIdentity.publicKeyId]
+      return replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
+    })
+
+    await retainedFollower.close()
+    nodes.splice(nodes.indexOf(retainedFollower), 1)
+
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      const replacementFeed = status.feeds[replacementIdentity.publicKeyId]
+      return status.connections === 2 && replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
+    })
+
+    await leader.put("hash:replacement-membership-after", { value: "after-replacement" })
+    await waitFor(async () => {
+      const value = await replacement.get("hash:replacement-membership-after")
+      return value?.value?.value === "after-replacement"
+    })
+
+    await assert.rejects(
+      retiredTarget.put("hash:replacement-membership-retired", { value: "forbidden" }),
+      (error) => error?.code === "READ_ONLY_LEARNER"
+    )
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
 test("operation validation rejects mismatched feed metadata", () => {
   const identity = generateIdentity(seed("validation"))
   const operation = {

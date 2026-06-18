@@ -419,7 +419,7 @@ export class HolepunchSwarmNode {
     const learnerNodeId = credential?.payload?.learnerNodeId
     const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
     if (!learnerRecord) {
-      throw new Error("Promotion target must be a pre-authorized learner in this implementation")
+      throw new Error("Promotion target must be a known learner")
     }
     if (this.#membershipRole(learnerNodeId) !== "learner") {
       throw new Error("Promotion target is not currently a learner")
@@ -1315,14 +1315,41 @@ export class HolepunchSwarmNode {
         readOnly: true
       })
     } catch (error) {
+      const errorCode = error?.code === "REMOVED_IDENTITY" ? "REMOVED_IDENTITY" : "JOIN_REJECTED"
       session.sendResponse({
         v: 1,
         type: "replicore.join-response",
         ok: false,
         redirect: false,
         leaderNodeId: this.options.identity.publicKeyId,
-        errorCode: "JOIN_REJECTED",
-        error: error instanceof Error ? error.message : String(error)
+        errorCode,
+        error: error instanceof Error ? error.message : String(error),
+        ...(errorCode === "REMOVED_IDENTITY"
+          ? {
+              membership: {
+                version: this.membershipState.current.version,
+                voters: this.#voterNodes().map((node) => ({
+                  nodeId: node.nodeId,
+                  publicKey: node.publicKey.toString("hex"),
+                  feedKey: node.feedKey
+                })),
+                learners: this.#membershipEntries()
+                  .filter((entry) => entry.role === "learner")
+                  .map((entry) => ({
+                    nodeId: entry.nodeId,
+                    feedKey: entry.feedKey
+                  })),
+                removed: this.#membershipEntries()
+                  .filter((entry) => entry.role === "removed")
+                  .map((entry) => entry.nodeId)
+              },
+              consensus: {
+                currentTerm: this.consensusState.currentTerm,
+                commitIndex: this.consensusState.commitIndex,
+                lastApplied: this.consensusState.lastApplied
+              }
+            }
+          : {})
       })
     }
   }
@@ -1330,6 +1357,9 @@ export class HolepunchSwarmNode {
   async #handleJoinResponse(_session, message) {
     if (!message || message.type !== "replicore.join-response") return
     if (!message.ok) {
+      if (message.membership) {
+        await this.#adoptJoinMembershipSnapshot(message)
+      }
       if (message.redirect && message.leaderNodeId) {
         this.joinState.leaderNodeId = message.leaderNodeId
       }
@@ -1347,24 +1377,7 @@ export class HolepunchSwarmNode {
       await this.#ensureJoinedNode(voter)
     }
 
-    const previousRole = this.#role()
-    this.membershipState = {
-      current: this.#normalizeMembershipConfig({
-        version: message.membership?.version ?? this.membershipState.current.version,
-        voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
-        learners: (message.membership?.learners ?? []).map((node) => node.nodeId),
-        removed: message.membership?.removed ?? []
-      }),
-      joint: null
-    }
-    await this.#persistMembershipState(this.membershipState)
-    this.consensusState = await this.consensusStateStore.save({
-      currentTerm: message.consensus?.currentTerm ?? this.consensusState.currentTerm,
-      commitIndex: message.consensus?.commitIndex ?? this.consensusState.commitIndex,
-      lastApplied: message.consensus?.lastApplied ?? this.consensusState.lastApplied,
-      membershipVersion: this.membershipState.current.version
-    })
-    await this.#refreshHeartbeatRole(previousRole)
+    await this.#adoptJoinMembershipSnapshot(message)
 
     this.joinState = {
       accepted: true,
@@ -1457,14 +1470,42 @@ export class HolepunchSwarmNode {
       throw new Error("Join request noisePublicKey does not match the live connection")
     }
 
+    const nodeId = keyIdFromPublicKey(identityPublicKey)
+    if (this.#currentMembershipRole(nodeId) === "removed" || this.#isRevokedNode(nodeId)) {
+      const error = new Error("Removed node identities cannot rejoin through learner admission")
+      error.code = "REMOVED_IDENTITY"
+      throw error
+    }
+
     this.seenJoinRequestNonces.add(replayKey)
     return {
       machineId: message.machineId,
       noisePublicKey: message.noisePublicKey,
       identityPublicKey,
       feedKey,
-      nodeId: keyIdFromPublicKey(identityPublicKey)
+      nodeId
     }
+  }
+
+  async #adoptJoinMembershipSnapshot(message) {
+    const previousRole = this.#role()
+    this.membershipState = {
+      current: this.#normalizeMembershipConfig({
+        version: message.membership?.version ?? this.membershipState.current.version,
+        voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
+        learners: (message.membership?.learners ?? []).map((node) => node.nodeId),
+        removed: message.membership?.removed ?? []
+      }),
+      joint: null
+    }
+    await this.#persistMembershipState(this.membershipState)
+    this.consensusState = await this.consensusStateStore.save({
+      currentTerm: message.consensus?.currentTerm ?? this.consensusState.currentTerm,
+      commitIndex: message.consensus?.commitIndex ?? this.consensusState.commitIndex,
+      lastApplied: message.consensus?.lastApplied ?? this.consensusState.lastApplied,
+      membershipVersion: this.membershipState.current.version
+    })
+    await this.#refreshHeartbeatRole(previousRole)
   }
 
   #membershipEntries() {
