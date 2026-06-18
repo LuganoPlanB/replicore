@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 
-const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "180000")
+const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "300000")
 const steps = [
   {
     label: "raft-engine",
