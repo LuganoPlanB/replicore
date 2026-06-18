@@ -530,6 +530,131 @@ test("same-secret unknown peers are surfaced as learner candidates without joini
   }
 })
 
+test("a learner can join through the leader control channel, catch up, and later become a live voter", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "4444444444444444444444444444444444444444444444444444444444444444",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("join-flow-leader"))
+    const followerIdentity = generateIdentity(seed("join-flow-follower"))
+    const learnerIdentity = generateIdentity(seed("join-flow-learner"))
+    const voters = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const firstVoter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "join-flow-cluster",
+      clusterSecret,
+      machineId: "join-flow-voter-1",
+      identity: leaderIdentity,
+      authorizedNodes: voters,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await firstVoter.start()
+    nodes.push(firstVoter)
+
+    const secondVoter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "join-flow-cluster",
+      clusterSecret,
+      machineId: "join-flow-voter-2",
+      identity: followerIdentity,
+      authorizedNodes: voters,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await secondVoter.start()
+    nodes.push(secondVoter)
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    const leader = leaderId === leaderIdentity.publicKeyId ? firstVoter : secondVoter
+    const follower = leader === firstVoter ? secondVoter : firstVoter
+    await waitFor(async () => firstVoter.currentLeader() === leaderId && secondVoter.currentLeader() === leaderId)
+    await leader.put("hash:join-before", { value: "before-join" })
+
+    const learner = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "join-flow-cluster",
+      clusterSecret,
+      role: "learner",
+      machineId: "join-flow-learner",
+      identity: learnerIdentity,
+      authorizedNodes: [],
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learner.start()
+    nodes.push(learner)
+
+    await waitFor(async () => {
+      const value = await learner.get("hash:join-before")
+      return value?.value?.value === "before-join"
+    })
+
+    const learnerStatus = await learner.getReplicationStatus()
+    assert.equal(learnerStatus.membership.localRole, "learner")
+    assert.deepEqual(
+      learnerStatus.membership.voters.map((entry) => entry.nodeId).sort(),
+      voters.map((entry) => entry.nodeId).sort()
+    )
+    assert.equal(leader.getWritersStatus().authorizedNodes.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
+
+    const credential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: "join-flow-cluster",
+        membershipVersion: 0,
+        learnerNodeId: learnerIdentity.publicKeyId,
+        learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: "2026-06-18T14:00:00.000Z",
+        expiresAt: "2026-06-18T15:00:00.000Z",
+        nonce: "join-flow-promotion",
+        signerNodeId: leaderIdentity.publicKeyId
+      },
+      signerSecretKey: leaderIdentity.secretKey
+    })
+
+    const accepted = await learner.submitPromotionCredential(credential)
+    assert.equal(accepted.eligible, true)
+
+    await leader.commitPromotionCredential(credential)
+    await waitFor(async () => {
+      const status = await learner.getReplicationStatus()
+      return status.membership.localRole === "voter"
+    })
+
+    await follower.close()
+    nodes.splice(nodes.indexOf(follower), 1)
+
+    await waitFor(async () => {
+      const status = await leader.getReplicationStatus()
+      return status.connections === 1
+    })
+
+    await leader.put("hash:join-after", { value: "after-promotion" })
+    await waitFor(async () => {
+      const value = await learner.get("hash:join-after")
+      return value?.value?.value === "after-promotion"
+    })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
 test("a learner catches up for reads, stays out of quorum, and rejects writes", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
@@ -612,7 +737,10 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
     ])
     assert.equal(learner.getWritersStatus().role, "learner")
     assert.equal((await learner.getLeaderStatus()).role, "learner")
-    assert.equal(leader.getWritersStatus().authorizedNodes.length, 2)
+    assert.equal(
+      leader.getWritersStatus().authorizedNodes.some((entry) => entry.nodeId === learnerIdentity.publicKeyId),
+      true
+    )
 
     await assert.rejects(
       learner.put("hash:learner-write", { value: "forbidden" }),

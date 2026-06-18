@@ -1,13 +1,16 @@
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
+import Hypercore from "hypercore"
 
 import { canonicalize } from "./canonical.js"
 import { ConsensusStateStore } from "./consensus-state.js"
+import { keyIdFromPublicKey, signPayload, verifyPayload } from "./crypto.js"
 import { DurabilityWaiter } from "./durability-waiter.js"
+import { JoinControl } from "./join-control.js"
 import {
   createSignedOperation,
   decryptOperationValue,
@@ -21,7 +24,9 @@ import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWriter
 import { validatePromotionCredential } from "./promotion-credential.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
-import { resolveTransportIdentity } from "./transport-identity.js"
+import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
+
+const JOIN_REQUEST_MAX_SKEW_MS = 5 * 60 * 1000
 
 /**
  * Minimal multi-node swarm with one feed per node and leader-only writes.
@@ -60,7 +65,12 @@ export class HolepunchSwarmNode {
         timeoutMs: 5000,
         ...options.durability
       },
-      ...options
+      ...options,
+      authorizedNodes: (options.authorizedNodes ?? []).map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: Buffer.from(node.publicKey),
+        feedKey: node.feedKey
+      }))
     }
     this.revokedNodeIds = new Set(this.options.revokedNodeIds ?? [])
     this.encryption = this.options.encryption ?? {
@@ -74,6 +84,7 @@ export class HolepunchSwarmNode {
     this.membershipState = null
     this.network = null
     this.rpc = null
+    this.joinControl = null
     this.transportIdentity = null
     this.viewBee = null
     this.view = null
@@ -88,6 +99,12 @@ export class HolepunchSwarmNode {
       timeoutMs: this.options.durability.timeoutMs,
       requiredFollowerAcks: this.options.durability.requiredFollowerAcks
     })
+    this.joinState = {
+      accepted: false,
+      leaderNodeId: null
+    }
+    this.sentJoinRequestKeys = new Set()
+    this.seenJoinRequestNonces = new Set()
     this.lastHeartbeatByNode = new Map()
     this.closing = false
   }
@@ -130,37 +147,11 @@ export class HolepunchSwarmNode {
       },
       onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
     })
+    await this.#ensureFeedCore(this.#localNodeRecord())
 
     for (const node of this.options.authorizedNodes) {
-      if (this.#isRevokedNode(node.nodeId)) continue
-      const isLocal = node.nodeId === this.options.identity.publicKeyId
-      const core = isLocal
-        ? this.store.get({
-            keyPair: {
-              publicKey: this.options.identity.publicKey,
-              secretKey: this.options.identity.secretKey
-            },
-            valueEncoding: "json"
-          })
-        : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
-
-      await core.ready()
-      if (!isLocal) {
-        core.on("peer-add", (peer) => {
-          this.network?.trackPeer(true, node.nodeId, peer)
-          this.rpc?.sendHello({ targetNodeId: node.nodeId, peer })
-        })
-        core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
-        core.on("append", () => {
-          void this.syncFeed(node.nodeId).catch((error) => {
-            if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
-              throw error
-            }
-          })
-        })
-      }
-      this.feedCores.set(node.nodeId, core)
-      this.rpc.register(node.nodeId, core)
+      if (this.#isRevokedNode(node.nodeId) || node.nodeId === this.options.identity.publicKeyId) continue
+      await this.#ensureFeedCore(node)
     }
 
     await this.#startNetworking()
@@ -430,7 +421,7 @@ export class HolepunchSwarmNode {
     if (!learnerRecord) {
       throw new Error("Promotion target must be a pre-authorized learner in this implementation")
     }
-    if (this.#currentMembershipRole(learnerNodeId) !== "learner") {
+    if (this.#membershipRole(learnerNodeId) !== "learner") {
       throw new Error("Promotion target is not currently a learner")
     }
 
@@ -549,6 +540,7 @@ export class HolepunchSwarmNode {
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
     await this.suspendNetworking()
+    this.joinControl?.close()
     this.rpc?.close(new Error("Node is closing"))
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
     await Promise.allSettled(this.syncPromises.values())
@@ -713,6 +705,23 @@ export class HolepunchSwarmNode {
 
   async #startNetworking() {
     const topic = await deriveTopic(this.options)
+    this.joinControl ??= new JoinControl({
+      onChannelOpen: (session) => this.#maybeSendJoinRequest(session),
+      onJoinRequest: (session, message) => {
+        void this.#handleJoinRequest(session, message).catch((error) => {
+          if (!this.closing) {
+            throw error
+          }
+        })
+      },
+      onJoinResponse: (session, message) => {
+        void this.#handleJoinResponse(session, message).catch((error) => {
+          if (!this.closing) {
+            throw error
+          }
+        })
+      }
+    })
     this.network ??= new SwarmNetwork({
       bootstrap: this.options.bootstrap,
       topic,
@@ -720,7 +729,10 @@ export class HolepunchSwarmNode {
       localNodeId: this.options.identity.publicKeyId,
       authorizedNodes: this.options.authorizedNodes,
       isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),
-      replicateConnection: (conn) => this.store.replicate(conn),
+      replicateConnection: (conn) => {
+        this.joinControl?.attachConnection(conn)
+        this.store.replicate(conn)
+      },
       networkPolicy: this.options.networkPolicy ?? null
     })
     await this.network.start()
@@ -830,6 +842,14 @@ export class HolepunchSwarmNode {
     return this.feedCores.get(this.options.identity.publicKeyId)
   }
 
+  #localNodeRecord() {
+    return {
+      nodeId: this.options.identity.publicKeyId,
+      publicKey: this.options.identity.publicKey,
+      feedKey: this.options.identity.feedKey
+    }
+  }
+
   /**
    * Serialize local Hypercore appends so the signed operation sequence always
    * matches the physical feed slot.
@@ -860,6 +880,9 @@ export class HolepunchSwarmNode {
   }
 
   #getAuthorizedNode(nodeId) {
+    if (nodeId === this.options.identity.publicKeyId) {
+      return this.#localNodeRecord()
+    }
     const node = this.options.authorizedNodes.find((entry) => entry.nodeId === nodeId)
     if (!node) throw new Error(`Unknown authorized node ${nodeId}`)
     if (this.#isRevokedNode(nodeId)) {
@@ -1117,6 +1140,331 @@ export class HolepunchSwarmNode {
       return nodeId === this.options.identity.publicKeyId ? "learner" : null
     }
     return this.#isRevokedNode(nodeId) ? "removed" : "learner"
+  }
+
+  #ensureAuthorizedNodeRecord(node) {
+    const normalized = {
+      nodeId: node.nodeId,
+      publicKey: Buffer.isBuffer(node.publicKey) ? node.publicKey : Buffer.from(node.publicKey, "hex"),
+      feedKey: node.feedKey
+    }
+    const existing = this.options.authorizedNodes.find((entry) => entry.nodeId === normalized.nodeId)
+    if (!existing) {
+      this.options.authorizedNodes.push(normalized)
+      return normalized
+    }
+    if (
+      existing.feedKey !== normalized.feedKey ||
+      !existing.publicKey.equals(normalized.publicKey)
+    ) {
+      throw new Error(`Authorized node ${normalized.nodeId} does not match the existing record`)
+    }
+    return existing
+  }
+
+  async #ensureFeedCore(node) {
+    if (this.feedCores.has(node.nodeId)) {
+      return this.feedCores.get(node.nodeId)
+    }
+
+    const isLocal = node.nodeId === this.options.identity.publicKeyId
+    const core = isLocal
+      ? this.store.get({
+          keyPair: {
+            publicKey: this.options.identity.publicKey,
+            secretKey: this.options.identity.secretKey
+          },
+          valueEncoding: "json"
+        })
+      : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
+
+    await core.ready()
+    if (!isLocal) {
+      core.on("peer-add", (peer) => {
+        this.network?.trackPeer(true, node.nodeId, peer)
+        this.rpc?.sendHello({ targetNodeId: node.nodeId, peer })
+      })
+      core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
+      core.on("append", () => {
+        void this.syncFeed(node.nodeId).catch((error) => {
+          if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+            throw error
+          }
+        })
+      })
+    }
+    this.feedCores.set(node.nodeId, core)
+    this.rpc.register(node.nodeId, core)
+    return core
+  }
+
+  async #ensureJoinedNode(node) {
+    const record = this.#ensureAuthorizedNodeRecord(node)
+    await this.#ensureFeedCore(record)
+    if (record.nodeId !== this.options.identity.publicKeyId) {
+      void this.syncFeed(record.nodeId).catch((error) => {
+        if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }
+    return record
+  }
+
+  #maybeSendJoinRequest(session) {
+    if (
+      this.closing ||
+      !this.#isLearner() ||
+      !this.transportIdentity ||
+      this.joinState.accepted ||
+      this.sentJoinRequestKeys.has(session.remotePublicKeyHex)
+    ) {
+      return
+    }
+
+    this.sentJoinRequestKeys.add(session.remotePublicKeyHex)
+    session.sendRequest(this.#createJoinRequest())
+  }
+
+  #createJoinRequest() {
+    const payload = {
+      v: 1,
+      type: "replicore.join-request",
+      clusterId: this.options.clusterId,
+      machineId: this.transportIdentity.machineId,
+      identityPublicKey: this.options.identity.publicKey.toString("hex"),
+      feedKey: this.options.identity.feedKey,
+      noisePublicKey: this.transportIdentity.publicKeyHex,
+      role: "learner",
+      issuedAt: new Date().toISOString(),
+      nonce: randomBytes(16).toString("base64url")
+    }
+
+    return {
+      ...payload,
+      signature: signPayload(
+        this.transportIdentity.joinKeyPair.secretKey,
+        Buffer.from(canonicalize(payload))
+      )
+    }
+  }
+
+  async #handleJoinRequest(session, message) {
+    if (!message || message.type !== "replicore.join-request") return
+
+    const currentLeader = this.currentLeader()
+    if (currentLeader !== this.options.identity.publicKeyId) {
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: false,
+        redirect: true,
+        leaderNodeId: currentLeader,
+        errorCode: currentLeader ? "NOT_LEADER" : "LEADER_UNAVAILABLE",
+        error: currentLeader
+          ? "Join requests must be handled by the current leader"
+          : "No current leader is available"
+      })
+      return
+    }
+
+    try {
+      const summary = await this.#validateJoinRequest(session, message)
+      this.network?.observePeerIdentity(summary.nodeId, {
+        remotePublicKey: session.conn.remotePublicKey
+      })
+      await this.#ensureJoinedNode({
+        nodeId: summary.nodeId,
+        publicKey: summary.identityPublicKey,
+        feedKey: summary.feedKey
+      })
+
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: true,
+        redirect: false,
+        leaderNodeId: this.options.identity.publicKeyId,
+        acceptedLearner: {
+          nodeId: summary.nodeId,
+          machineId: summary.machineId,
+          noisePublicKey: summary.noisePublicKey
+        },
+        membership: {
+          version: this.membershipState.current.version,
+          voters: this.#voterNodes().map((node) => ({
+            nodeId: node.nodeId,
+            publicKey: node.publicKey.toString("hex"),
+            feedKey: node.feedKey
+          })),
+          learners: this.#membershipEntries()
+            .filter((entry) => entry.role === "learner")
+            .map((entry) => ({
+              nodeId: entry.nodeId,
+              feedKey: entry.feedKey
+            })),
+          removed: this.#membershipEntries()
+            .filter((entry) => entry.role === "removed")
+            .map((entry) => entry.nodeId)
+        },
+        consensus: {
+          currentTerm: this.consensusState.currentTerm,
+          commitIndex: this.consensusState.commitIndex,
+          lastApplied: this.consensusState.lastApplied
+        },
+        readOnly: true
+      })
+    } catch (error) {
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: false,
+        redirect: false,
+        leaderNodeId: this.options.identity.publicKeyId,
+        errorCode: "JOIN_REJECTED",
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
+  async #handleJoinResponse(_session, message) {
+    if (!message || message.type !== "replicore.join-response") return
+    if (!message.ok) {
+      if (message.redirect && message.leaderNodeId) {
+        this.joinState.leaderNodeId = message.leaderNodeId
+      }
+      return
+    }
+
+    if (!message.acceptedLearner || message.acceptedLearner.nodeId !== this.options.identity.publicKeyId) {
+      throw new Error("Join response accepted a different learner identity")
+    }
+    if (message.acceptedLearner.machineId !== this.transportIdentity?.machineId) {
+      throw new Error("Join response machineId does not match the local machine identity")
+    }
+
+    for (const voter of message.membership?.voters ?? []) {
+      await this.#ensureJoinedNode(voter)
+    }
+
+    const previousRole = this.#role()
+    this.membershipState = {
+      current: this.#normalizeMembershipConfig({
+        version: message.membership?.version ?? this.membershipState.current.version,
+        voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
+        learners: (message.membership?.learners ?? []).map((node) => node.nodeId),
+        removed: message.membership?.removed ?? []
+      }),
+      joint: null
+    }
+    await this.#persistMembershipState(this.membershipState)
+    this.consensusState = await this.consensusStateStore.save({
+      currentTerm: message.consensus?.currentTerm ?? this.consensusState.currentTerm,
+      commitIndex: message.consensus?.commitIndex ?? this.consensusState.commitIndex,
+      lastApplied: message.consensus?.lastApplied ?? this.consensusState.lastApplied,
+      membershipVersion: this.membershipState.current.version
+    })
+    await this.#refreshHeartbeatRole(previousRole)
+
+    this.joinState = {
+      accepted: true,
+      leaderNodeId: message.leaderNodeId ?? null
+    }
+  }
+
+  async #validateJoinRequest(session, message) {
+    if (message.v !== 1) {
+      throw new Error("Join request version must be 1")
+    }
+    if (message.type !== "replicore.join-request") {
+      throw new Error("Join request type must be replicore.join-request")
+    }
+    if (message.clusterId !== this.options.clusterId) {
+      throw new Error("Join request clusterId does not match this cluster")
+    }
+    if (message.role !== "learner") {
+      throw new Error("Join request role must be learner")
+    }
+    if (typeof message.machineId !== "string" || !/^[0-9a-f]{64}$/i.test(message.machineId)) {
+      throw new Error("Join request machineId must be a 32-byte hex string")
+    }
+    if (typeof message.identityPublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.identityPublicKey)) {
+      throw new Error("Join request identityPublicKey must be a 32-byte hex string")
+    }
+    if (typeof message.feedKey !== "string" || !/^[0-9a-f]+$/i.test(message.feedKey)) {
+      throw new Error("Join request feedKey must be a hex string")
+    }
+    if (typeof message.noisePublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.noisePublicKey)) {
+      throw new Error("Join request noisePublicKey must be a 32-byte hex string")
+    }
+    if (typeof message.nonce !== "string" || message.nonce.length === 0) {
+      throw new Error("Join request nonce is required")
+    }
+    if (typeof message.issuedAt !== "string") {
+      throw new Error("Join request issuedAt must be an ISO-8601 string")
+    }
+    if (typeof message.signature !== "string" || message.signature.length === 0) {
+      throw new Error("Join request signature is required")
+    }
+
+    const issuedAt = new Date(message.issuedAt)
+    if (Number.isNaN(issuedAt.getTime())) {
+      throw new Error("Join request issuedAt must be a valid ISO-8601 string")
+    }
+    if (Math.abs(Date.now() - issuedAt.getTime()) > JOIN_REQUEST_MAX_SKEW_MS) {
+      throw new Error("Join request issuedAt is outside the allowed freshness window")
+    }
+
+    const replayKey = `${message.machineId}:${message.nonce}`
+    if (this.seenJoinRequestNonces.has(replayKey)) {
+      throw new Error("Join request nonce was already used")
+    }
+
+    const identityPublicKey = Buffer.from(message.identityPublicKey, "hex")
+    const feedKey = Hypercore.key(identityPublicKey).toString("hex")
+    if (feedKey !== message.feedKey) {
+      throw new Error("Join request feedKey does not match the supplied identity public key")
+    }
+
+    const derivedJoinIdentity = await deriveJoinKeyPair({
+      clusterSecret: this.options.clusterSecret,
+      machineId: message.machineId
+    })
+    const payload = {
+      v: message.v,
+      type: message.type,
+      clusterId: message.clusterId,
+      machineId: message.machineId,
+      identityPublicKey: message.identityPublicKey,
+      feedKey: message.feedKey,
+      noisePublicKey: message.noisePublicKey,
+      role: message.role,
+      issuedAt: message.issuedAt,
+      nonce: message.nonce
+    }
+    if (
+      !verifyPayload(
+        derivedJoinIdentity.publicKey,
+        Buffer.from(canonicalize(payload)),
+        message.signature
+      )
+    ) {
+      throw new Error("Join request signature is invalid")
+    }
+
+    const liveNoisePublicKey = session.conn.remotePublicKey.toString("hex")
+    if (liveNoisePublicKey !== message.noisePublicKey) {
+      throw new Error("Join request noisePublicKey does not match the live connection")
+    }
+
+    this.seenJoinRequestNonces.add(replayKey)
+    return {
+      machineId: message.machineId,
+      noisePublicKey: message.noisePublicKey,
+      identityPublicKey,
+      feedKey,
+      nodeId: keyIdFromPublicKey(identityPublicKey)
+    }
   }
 
   #membershipEntries() {
