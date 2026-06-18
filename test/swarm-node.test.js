@@ -450,6 +450,30 @@ test("two-node leader loss stays split-fenced and does not autonomously reelect"
         status.readStatus.reason === "split-fenced"
     })
 
+    await survivor.viewBee.put(`system/heartbeats/${firstLeaderId}`, {
+      actor: firstLeaderId,
+      feed: authorizedNodes.find((node) => node.nodeId === firstLeaderId)?.feedKey ?? null,
+      term: initialTerm,
+      ts: new Date().toISOString(),
+      seq: 999,
+      leaderId: firstLeaderId,
+      leaderCommitIndex: 0,
+      membershipVersion: 0,
+      prevLogIndex: -1,
+      prevLogTerm: -1,
+      prevLogHash: null,
+      observedLeader: firstLeaderId,
+      reachableLeader: true,
+      appliedFeeds: {},
+      rejectedFeeds: {},
+      membershipFingerprint: "forged-diagnostic-only"
+    })
+
+    const forgedStatus = await survivor.getReplicationStatus()
+    assert.equal(forgedStatus.heartbeats[firstLeaderId]?.reachableLeader, true)
+    assert.equal(forgedStatus.splitStatus?.fenced, true)
+    assert.equal(forgedStatus.readStatus.reason, "split-fenced")
+
     await assert.rejects(
       survivor.put("hash:two-node-leader-loss", { blocked: true }),
       /split-fenced|Current leader .* is not reachable|No current leader is available/
@@ -664,13 +688,13 @@ test("follower heartbeat diagnostics do not grant leader authority", { concurren
       secretKey: followerIdentity.secretKey,
       encryptionKey,
       heartbeat: {
-        leaderId,
+        leaderId: followerIdentity.publicKeyId,
         leaderCommitIndex: (await followerNode.getConsensusState()).commitIndex,
         membershipVersion: 0,
         prevLogIndex: previous?.index ?? -1,
         prevLogTerm: previous?.term ?? -1,
         prevLogHash: previous?.entryHash ?? null,
-        observedLeader: leaderId,
+        observedLeader: followerIdentity.publicKeyId,
         reachableLeader: true,
         appliedFeeds: {},
         rejectedFeeds: {},
@@ -681,8 +705,15 @@ test("follower heartbeat diagnostics do not grant leader authority", { concurren
     await leaderNode.syncFeed(followerIdentity.publicKeyId)
 
     const status = await leaderNode.getReplicationStatus()
+    assert.equal(leaderNode.currentLeader(), leaderId)
+    assert.deepEqual(status.consensus, {
+      currentTerm: (await leaderNode.getConsensusState()).currentTerm,
+      commitIndex: (await leaderNode.getConsensusState()).commitIndex,
+      lastApplied: (await leaderNode.getConsensusState()).lastApplied,
+      knownLeader: leaderId
+    })
     assert.ok(status.heartbeats[followerIdentity.publicKeyId])
-    assert.equal(status.heartbeats[followerIdentity.publicKeyId].observedLeader, leaderId)
+    assert.equal(status.heartbeats[followerIdentity.publicKeyId].actor, followerIdentity.publicKeyId)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()

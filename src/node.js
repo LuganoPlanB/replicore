@@ -357,6 +357,12 @@ export class HolepunchSwarmNode {
       nodeId: this.options.identity.publicKeyId,
       role: this.#role(),
       leader: this.currentLeader(),
+      consensus: {
+        currentTerm: this.consensusState.currentTerm,
+        commitIndex: this.consensusState.commitIndex,
+        lastApplied: this.consensusState.lastApplied,
+        knownLeader: this.currentLeader() ?? this.#lastKnownLeaderId()
+      },
       splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
@@ -903,12 +909,27 @@ export class HolepunchSwarmNode {
     const observation = this.consensusEngine.observeRemoteOperation({
       nodeId,
       voterNodeIds: this.membershipState.current.voters,
-      currentTerm: this.consensusState.currentTerm,
+      consensusState: this.consensusState,
       localMembershipVersion: this.membershipState.current.version,
       operation,
       previousOperation,
       electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
     })
+    if (
+      !observation.acceptedLeader &&
+      observation.refusalReason === "not-elected-leader" &&
+      operation?.kind === "heartbeat" &&
+      operation.heartbeat?.leaderId === nodeId &&
+      operation.heartbeat?.observedLeader === nodeId &&
+      await this.#hasWitnessLeaderMajority(nodeId, operation.term)
+    ) {
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId: nodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+      observation.acceptedLeader = true
+      observation.refusalReason = null
+    }
     if (observation.persistPatch) {
       this.consensusState = await this.consensusStateStore.save(observation.persistPatch)
     }
@@ -1270,6 +1291,32 @@ export class HolepunchSwarmNode {
     }
 
     return true
+  }
+
+  /**
+   * Late joiners may not have cast a vote in the leader's current term. In
+   * that case, allow leader adoption only after a fresh majority of voter
+   * heartbeats already agrees on the same reachable leader.
+   *
+   * @param {string} leaderNodeId
+   * @param {number} term
+   */
+  async #hasWitnessLeaderMajority(leaderNodeId, term) {
+    const heartbeats = await this.view.getHeartbeats()
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    let matchingCount = 0
+
+    for (const nodeId of this.membershipState.current.voters) {
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) continue
+      if (new Date(heartbeat.ts).getTime() < freshnessCutoff) continue
+      if (heartbeat.observedLeader !== leaderNodeId) continue
+      if (heartbeat.reachableLeader !== true) continue
+      if (Number.isInteger(heartbeat.term) && heartbeat.term !== term) continue
+      matchingCount += 1
+    }
+
+    return matchingCount >= this.#majoritySize(this.membershipState.current.voters.length)
   }
 
   async #persistSplitState() {

@@ -139,7 +139,7 @@ test("accepted heartbeat resets leader lease and exposes the current leader", ()
   const observation = engine.observeRemoteOperation({
     nodeId: "node-a",
     voterNodeIds: ["node-a", "node-b", "node-c"],
-    currentTerm: 6,
+    consensusState: { currentTerm: 6, votedFor: "node-a" },
     localMembershipVersion: 2,
     electionTimeoutMaxMs: 900,
     previousOperation: {
@@ -173,7 +173,7 @@ test("stale-term heartbeat is rejected for authority", () => {
   const observation = engine.observeRemoteOperation({
     nodeId: "node-a",
     voterNodeIds: ["node-a", "node-b", "node-c"],
-    currentTerm: 6,
+    consensusState: { currentTerm: 6, votedFor: "node-a" },
     localMembershipVersion: 2,
     electionTimeoutMaxMs: 900,
     previousOperation: {
@@ -200,12 +200,50 @@ test("stale-term heartbeat is rejected for authority", () => {
   assert.equal(observation.refusalReason, "stale-term")
 })
 
+test("heartbeat from a voter that was not elected stays diagnostic only", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  engine.noteKnownLeader({
+    leaderNodeId: "node-a",
+    electionTimeoutMs: 900
+  })
+
+  const observation = engine.observeRemoteOperation({
+    nodeId: "node-c",
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    consensusState: { currentTerm: 6, votedFor: "node-a" },
+    localMembershipVersion: 2,
+    electionTimeoutMaxMs: 900,
+    previousOperation: {
+      index: 11,
+      term: 6,
+      entryHash: "prev-hash"
+    },
+    operation: {
+      kind: "heartbeat",
+      term: 6,
+      heartbeat: {
+        leaderId: "node-c",
+        leaderCommitIndex: 11,
+        membershipVersion: 2,
+        prevLogIndex: 11,
+        prevLogTerm: 6,
+        prevLogHash: "prev-hash",
+        observedLeader: "node-c"
+      }
+    }
+  })
+
+  assert.equal(observation.acceptedLeader, false)
+  assert.equal(observation.refusalReason, "not-elected-leader")
+  assert.equal(engine.currentLeader({ isLearner: false, heartbeatTtlMs: 100 }), "node-a")
+})
+
 test("heartbeat authority rejects log mismatch", () => {
   const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
   const observation = engine.observeRemoteOperation({
     nodeId: "node-a",
     voterNodeIds: ["node-a", "node-b", "node-c"],
-    currentTerm: 6,
+    consensusState: { currentTerm: 6, votedFor: "node-a" },
     localMembershipVersion: 2,
     electionTimeoutMaxMs: 900,
     previousOperation: {
@@ -341,7 +379,7 @@ test("higher-term heartbeat causes step-down before accepting leader authority",
   const observation = engine.observeRemoteOperation({
     nodeId: "node-a",
     voterNodeIds: ["node-a", "node-b", "node-c"],
-    currentTerm: 4,
+    consensusState: { currentTerm: 4, votedFor: "node-a" },
     localMembershipVersion: 2,
     electionTimeoutMaxMs: 900,
     previousOperation: {

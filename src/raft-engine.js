@@ -230,7 +230,7 @@ export class ConsensusEngine {
    * @param {{
    *   nodeId: string,
    *   voterNodeIds: string[],
-   *   currentTerm: number,
+   *   consensusState: { currentTerm: number, votedFor: string | null },
    *   localMembershipVersion?: number,
    *   operation: any,
    *   previousOperation?: any,
@@ -240,7 +240,7 @@ export class ConsensusEngine {
   observeRemoteOperation({
     nodeId,
     voterNodeIds,
-    currentTerm,
+    consensusState,
     localMembershipVersion,
     operation,
     previousOperation,
@@ -250,6 +250,8 @@ export class ConsensusEngine {
     if (!voterNodeIds.includes(nodeId)) return { persistPatch: null, acceptedLeader: false }
     if (!operation || !Number.isInteger(operation.term)) return { persistPatch: null, acceptedLeader: false }
 
+    let currentTerm = consensusState.currentTerm
+    let votedFor = consensusState.votedFor
     let persistPatch = null
     if (operation.term > currentTerm) {
       const leaderHint = operation.kind === "heartbeat" && operation.heartbeat?.observedLeader === nodeId
@@ -261,12 +263,14 @@ export class ConsensusEngine {
         leaderNodeId: leaderHint
       }).persistPatch
       currentTerm = persistPatch.currentTerm
+      votedFor = persistPatch.votedFor
     }
 
     let acceptedLeader = false
     const authority = this.#evaluateHeartbeatAuthority({
       nodeId,
       currentTerm,
+      votedFor,
       localMembershipVersion,
       operation,
       previousOperation
@@ -292,6 +296,7 @@ export class ConsensusEngine {
    */
   noteKnownLeader({ leaderNodeId, electionTimeoutMs }) {
     const now = this.now()
+    this.state.role = "follower"
     this.state.leaderNodeId = leaderNodeId
     this.state.leaderHeartbeatAt = now
     this.state.electionDeadlineAt = now + electionTimeoutMs
@@ -316,7 +321,7 @@ export class ConsensusEngine {
     }
   }
 
-  #evaluateHeartbeatAuthority({ nodeId, currentTerm, localMembershipVersion, operation, previousOperation }) {
+  #evaluateHeartbeatAuthority({ nodeId, currentTerm, votedFor, localMembershipVersion, operation, previousOperation }) {
     if (operation.kind !== "heartbeat") {
       return { accepted: false, refusalReason: "not-heartbeat" }
     }
@@ -330,6 +335,9 @@ export class ConsensusEngine {
     }
     if (heartbeat.leaderId !== nodeId || heartbeat.observedLeader !== nodeId) {
       return { accepted: false, refusalReason: "not-leader-heartbeat" }
+    }
+    if (this.state.leaderNodeId !== nodeId && votedFor !== nodeId) {
+      return { accepted: false, refusalReason: "not-elected-leader" }
     }
     if (
       Number.isInteger(localMembershipVersion) &&
