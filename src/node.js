@@ -1479,6 +1479,7 @@ export class HolepunchSwarmNode {
       networkPolicy: this.options.networkPolicy ?? null
     })
     await this.network.start()
+    this.#refreshDirectPeerConnections()
   }
 
   async #appendKvOperation(type, key, value, options) {
@@ -2345,6 +2346,61 @@ export class HolepunchSwarmNode {
     }
   }
 
+  #refreshDirectPeerConnections() {
+    if (!this.network) return
+
+    const prioritizedKeys = []
+    const seen = new Set()
+    const pushPeerKey = (peerPublicKey) => {
+      if (
+        typeof peerPublicKey !== "string" ||
+        peerPublicKey.length === 0 ||
+        peerPublicKey === this.transportIdentity?.publicKeyHex ||
+        seen.has(peerPublicKey)
+      ) {
+        return
+      }
+      seen.add(peerPublicKey)
+      prioritizedKeys.push(peerPublicKey)
+    }
+
+    const leaderNodeId =
+      this.currentLeader()
+      ?? this.#lastKnownLeaderId()
+      ?? this.joinState.leaderNodeId
+      ?? this.joinState.recovery?.leaderNodeId
+      ?? null
+    const leaderHint = leaderNodeId ? this.#peerHint(leaderNodeId) : null
+    pushPeerKey(
+      leaderNodeId
+        ? (
+            this.network.peerPublicKeyForNodeId(leaderNodeId)
+            ?? leaderHint?.peerPublicKey
+            ?? this.joinState.recovery?.leaderHints?.peerPublicKey
+            ?? null
+          )
+        : null
+    )
+
+    for (const witness of this.#witnessHintEntries(leaderNodeId)) {
+      pushPeerKey(witness.peerPublicKey)
+    }
+
+    const cachedHints = [...this.peerHints.values()]
+      .filter((hint) => hint?.peerPublicKey && hint.role !== "removed")
+      .sort((left, right) => {
+        const leftRank = left.nodeId === leaderNodeId ? 0 : (left.role === "voter" ? 1 : 2)
+        const rightRank = right.nodeId === leaderNodeId ? 0 : (right.role === "voter" ? 1 : 2)
+        if (leftRank !== rightRank) return leftRank - rightRank
+        return String(right.seenAt ?? "").localeCompare(String(left.seenAt ?? ""))
+      })
+    for (const hint of cachedHints) {
+      pushPeerKey(hint.peerPublicKey)
+    }
+
+    this.network.setExplicitPeerPublicKeys(prioritizedKeys.slice(0, 8))
+  }
+
   #peerHint(nodeId) {
     const hint = this.peerHints.get(nodeId) ?? null
     if (!hint) return null
@@ -2360,10 +2416,12 @@ export class HolepunchSwarmNode {
     const now = Date.now()
     const nextHttpAddress = patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress
     const nextPeerPublicKey = patch.peerPublicKey ?? existing?.peerPublicKey ?? null
+    const nextMachineId = patch.machineId ?? existing?.machineId ?? null
     const nextRole = patch.role ?? existing?.role ?? null
     if (
       existing &&
       existing.peerPublicKey === nextPeerPublicKey &&
+      existing.machineId === nextMachineId &&
       JSON.stringify(existing.httpAddress) === JSON.stringify(nextHttpAddress) &&
       existing.role === nextRole &&
       Number.isInteger(existing.expiresAt) &&
@@ -2374,13 +2432,16 @@ export class HolepunchSwarmNode {
     const next = {
       nodeId,
       peerPublicKey: nextPeerPublicKey,
+      machineId: nextMachineId,
       httpAddress: nextHttpAddress,
       role: nextRole,
       seenAt: new Date().toISOString(),
+      lastSuccessfulAt: new Date(now).toISOString(),
       expiresAt: now + PEER_HINT_TTL_MS
     }
     this.peerHints.set(nodeId, next)
     await this.consensusBee.put(`peer-hints/${nodeId}`, next)
+    this.#refreshDirectPeerConnections()
   }
 
   #normalizeHttpAddress(address) {
@@ -2820,6 +2881,8 @@ export class HolepunchSwarmNode {
     const record = this.#ensureAuthorizedNodeRecord(node)
     await this.#ensureFeedCore(record)
     await this.#recordPeerHint(record.nodeId, {
+      machineId: node.machineId ?? null,
+      peerPublicKey: node.noisePublicKey ?? null,
       role: this.#membershipRole(record.nodeId)
     })
     if (record.nodeId !== this.options.identity.publicKeyId) {
@@ -2909,6 +2972,7 @@ export class HolepunchSwarmNode {
         role: this.#membershipRole(witness.nodeId)
       })
     }
+    this.#refreshDirectPeerConnections()
 
     await this.#repairFromRecoveryWatermark(recovery)
   }
@@ -3068,7 +3132,9 @@ export class HolepunchSwarmNode {
       await this.#ensureJoinedNode({
         nodeId: summary.nodeId,
         publicKey: summary.identityPublicKey,
-        feedKey: summary.feedKey
+        feedKey: summary.feedKey,
+        machineId: summary.machineId,
+        noisePublicKey: summary.noisePublicKey
       })
 
       session.sendResponse({
@@ -3310,7 +3376,7 @@ export class HolepunchSwarmNode {
   async #adoptJoinMembershipSnapshot(message) {
     const previousRole = this.#role()
     const snapshot = message.membership?.current
-    this.membershipState = {
+    const nextMembershipState = {
       current: this.#normalizeMembershipConfig(snapshot ?? {
         version: message.membership?.version ?? this.membershipState.current.version,
         voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
@@ -3319,13 +3385,15 @@ export class HolepunchSwarmNode {
       }),
       joint: null
     }
-    await this.#persistMembershipState(this.membershipState)
+    await this.#persistMembershipState(nextMembershipState)
+    this.membershipState = nextMembershipState
     this.consensusState = await this.consensusStateStore.save({
       currentTerm: message.consensus?.currentTerm ?? this.consensusState.currentTerm,
       commitIndex: message.consensus?.commitIndex ?? this.consensusState.commitIndex,
       lastApplied: message.consensus?.lastApplied ?? this.consensusState.lastApplied,
       membershipVersion: this.membershipState.current.version
     })
+    this.#refreshDirectPeerConnections()
     await this.#refreshHeartbeatRole(previousRole)
   }
 
@@ -3695,6 +3763,7 @@ export class HolepunchSwarmNode {
 
     await this.#persistMembershipState(nextMembershipState)
     this.membershipState = nextMembershipState
+    this.#refreshDirectPeerConnections()
     await this.#refreshHeartbeatRole(previousRole)
   }
 

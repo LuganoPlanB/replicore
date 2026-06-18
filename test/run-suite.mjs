@@ -66,7 +66,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "node replacement|mismatched membership|offline follower|offline leader|isolated leader|isolated follower|bootstrap outage|restarted follower stays disconnected|rolling restarts|subgroup partition",
+      "node replacement|mismatched membership|offline follower|offline leader|isolated leader|isolated follower|bootstrap outage|restarted follower reconnects through cached peers|rolling restarts|subgroup partition",
       "test/network-perturbation.test.js"
     ]
   },

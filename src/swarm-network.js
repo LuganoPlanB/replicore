@@ -25,6 +25,7 @@ export class SwarmNetwork {
     this.remoteNodeIdsByConnectionKey = new Map()
     this.observedNodeIdsByConnectionKey = new Map()
     this.peerPublicKeyByObservedNodeId = new Map()
+    this.explicitPeerPublicKeys = new Set()
     this.networkPolicy = options.networkPolicy ?? null
   }
 
@@ -45,6 +46,7 @@ export class SwarmNetwork {
     })
 
     this.discovery = this.swarm.join(this.options.topic, { client: true, server: true })
+    this.#applyExplicitPeerJoins()
     await this.discovery.flushed()
   }
 
@@ -73,6 +75,31 @@ export class SwarmNetwork {
   setPolicy(networkPolicy = null) {
     this.networkPolicy = networkPolicy
     this.#enforceConnectionPolicy()
+  }
+
+  /**
+   * Keep a bounded set of direct peer reconnect attempts active alongside
+   * ordinary topic discovery.
+   *
+   * @param {string[]} peerPublicKeys
+   */
+  setExplicitPeerPublicKeys(peerPublicKeys = []) {
+    const next = new Set(peerPublicKeys.filter((key) => typeof key === "string" && key.length > 0))
+    if (
+      next.size === this.explicitPeerPublicKeys.size &&
+      [...next].every((key) => this.explicitPeerPublicKeys.has(key))
+    ) {
+      return
+    }
+
+    const previous = this.explicitPeerPublicKeys
+    this.explicitPeerPublicKeys = next
+    if (!this.swarm) return
+
+    for (const key of previous) {
+      if (!next.has(key)) this.swarm.leavePeer(Buffer.from(key, "hex"))
+    }
+    this.#applyExplicitPeerJoins()
   }
 
   refreshConnectionPermissions() {
@@ -151,6 +178,7 @@ export class SwarmNetwork {
 
     return {
       policyActive: Boolean(this.networkPolicy),
+      directPeerPublicKeys: [...this.explicitPeerPublicKeys].sort(),
       allowedNodeIds: this.#allowedNodeIds(),
       learnerCandidates: learnerCandidates.sort(),
       peers
@@ -225,6 +253,14 @@ export class SwarmNetwork {
    */
   #connectionKey(publicKey) {
     return publicKey ? publicKey.toString("hex") : null
+  }
+
+  #applyExplicitPeerJoins() {
+    if (!this.swarm) return
+
+    for (const key of this.explicitPeerPublicKeys) {
+      this.swarm.joinPeer(Buffer.from(key, "hex"))
+    }
   }
 
   /**
