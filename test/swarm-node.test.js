@@ -205,6 +205,93 @@ test(
   }
 )
 
+test("history keeps actor audit data and logical index order across leader failover", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("history-order-leader"))
+    const follower1Identity = generateIdentity(seed("history-order-follower-1"))
+    const follower2Identity = generateIdentity(seed("history-order-follower-2"))
+    const authorizedNodes = [leaderIdentity, follower1Identity, follower2Identity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower1 = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: follower1Identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower2 = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: follower2Identity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower1, follower2)
+    for (const node of nodes) {
+      await node.start()
+    }
+
+    const firstLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
+      .map((identity) => identity.publicKeyId)
+      .sort()[0]
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+
+    const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
+    const firstWrite = await firstLeaderNode.put("hash:history-order", { phase: "before" })
+    await waitFor(async () => (await follower1.get("hash:history-order"))?.value?.phase === "before")
+
+    await firstLeaderNode.close()
+    nodes.splice(nodes.indexOf(firstLeaderNode), 1)
+
+    const secondLeaderId = nodes
+      .map((node) => node.options.identity.publicKeyId)
+      .sort()[0]
+    const secondLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === secondLeaderId)
+    await waitFor(async () => nodes.every((node) => node.currentLeader() === secondLeaderId))
+
+    const secondWrite = await secondLeaderNode.put("hash:history-order", { phase: "after" })
+    await waitFor(async () => {
+      const values = await Promise.all(nodes.map((node) => node.get("hash:history-order")))
+      return values.every((value) => value?.value?.phase === "after")
+    })
+
+    const history = await nodes[0].getHistory("hash:history-order")
+    assert.equal(history.length, 2)
+    assert.equal(history[0].actor, firstWrite.actor)
+    assert.equal(history[0].opId, firstWrite.opId)
+    assert.equal(history[1].actor, secondWrite.actor)
+    assert.equal(history[1].opId, secondWrite.opId)
+    assert.ok(history[0].index < history[1].index)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("authorized HTTP API forwards writes and exposes status routes", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []

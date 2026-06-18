@@ -27,10 +27,16 @@ export class MaterializedView {
     const key = /** @type {string} */ (operation.key)
     const currentKey = `kv/current/${keyspace}/${key}`
     const valueKey = `kv/value/${keyspace}/${key}`
-    const historyKey = `kv/history/${keyspace}/${key}/${String(operation.seq).padStart(12, "0")}`
+    const historyKey = this.#historyKey(keyspace, key, operation)
     const summary = {
       opId: operation.opId,
       seq: operation.seq,
+      term: operation.term,
+      index: operation.index,
+      prevIndex: operation.prevIndex,
+      prevHash: operation.prevHash,
+      entryHash: operation.entryHash,
+      feed: operation.feed,
       ts: operation.ts,
       type: operation.type,
       keyspace,
@@ -194,6 +200,11 @@ export class MaterializedView {
       validation: staged.validation,
       resolution: existing?.resolution ?? staged.resolution ?? "pending",
       seq: operation.seq,
+      term: operation.term,
+      index: operation.index,
+      prevIndex: operation.prevIndex,
+      prevHash: operation.prevHash,
+      entryHash: operation.entryHash,
       opId: operation.opId,
       kind: operation.kind,
       type: operation.type,
@@ -435,6 +446,16 @@ export class MaterializedView {
    */
   #stagedEntryKey(feedKey, seq) {
     return `feeds/${feedKey}/staged/${String(seq).padStart(12, "0")}`
+  }
+
+  /**
+   * @param {string} keyspace
+   * @param {string} key
+   * @param {Record<string, unknown>} operation
+   */
+  #historyKey(keyspace, key, operation) {
+    const paddedIndex = String(operation.index).padStart(12, "0")
+    return `kv/history/${keyspace}/${key}/${paddedIndex}/${operation.actor}`
   }
 
   /**
