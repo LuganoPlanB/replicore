@@ -8,6 +8,7 @@ import { createHash, randomBytes } from "node:crypto"
 import createTestnet from "hyperdht/testnet.js"
 
 import {
+  createPromotionCredential,
   createSignedOperation,
   generateIdentity,
   HolepunchHttpServer,
@@ -622,6 +623,147 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
       const replicated = await learner.get("hash:learner-after")
       return replicated?.value?.value === "after-learner"
     })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("a learner can store a valid promotion credential without becoming a voter yet", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "2222222222222222222222222222222222222222222222222222222222222222",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("promotion-leader"))
+    const followerIdentity = generateIdentity(seed("promotion-follower"))
+    const learnerIdentity = generateIdentity(seed("promotion-learner"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "promotion-cluster",
+      clusterSecret,
+      machineId: "promotion-voter-leader",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await leader.start()
+    nodes.push(leader)
+
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "promotion-cluster",
+      clusterSecret,
+      machineId: "promotion-voter-follower",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await follower.start()
+    nodes.push(follower)
+
+    const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort()[0]
+    const leaderNode = leaderId === leaderIdentity.publicKeyId ? leader : follower
+    await waitFor(async () => leader.currentLeader() === leaderId && follower.currentLeader() === leaderId)
+    await leaderNode.put("hash:promotion-baseline", { value: "ready" })
+
+    const learner = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "promotion-cluster",
+      clusterSecret,
+      machineId: "promotion-learner-node",
+      identity: learnerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learner.start()
+    nodes.push(learner)
+
+    const earlyCredential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: "promotion-cluster",
+        membershipVersion: 0,
+        learnerNodeId: learnerIdentity.publicKeyId,
+        learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: "2026-06-18T10:00:00.000Z",
+        expiresAt: "2026-06-18T11:00:00.000Z",
+        nonce: "promotion-early",
+        signerNodeId: leaderIdentity.publicKeyId
+      },
+      signerSecretKey: leaderIdentity.secretKey
+    })
+
+    await assert.rejects(learner.submitPromotionCredential(earlyCredential), /catch up/)
+
+    await waitFor(async () => {
+      const visible = await learner.get("hash:promotion-baseline")
+      return visible?.value?.value === "ready"
+    })
+
+    const credential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: "promotion-cluster",
+        membershipVersion: 0,
+        learnerNodeId: learnerIdentity.publicKeyId,
+        learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: "2026-06-18T10:00:00.000Z",
+        expiresAt: "2026-06-18T11:00:00.000Z",
+        nonce: "promotion-valid",
+        signerNodeId: leaderIdentity.publicKeyId
+      },
+      signerSecretKey: leaderIdentity.secretKey
+    })
+
+    let promotion = null
+    await waitFor(async () => {
+      try {
+        promotion = await learner.submitPromotionCredential(credential)
+        return true
+      } catch (error) {
+        if (/catch up/.test(error.message)) return false
+        throw error
+      }
+    })
+
+    assert.equal(promotion.eligible, true)
+    assert.equal(promotion.accepted, false)
+    assert.equal(promotion.targetRole, "voter")
+
+    const status = await learner.getReplicationStatus()
+    assert.equal(status.role, "learner")
+    assert.equal(status.promotion.eligible, true)
+    assert.equal(status.promotion.accepted, false)
+    assert.equal(status.promotion.signerNodeId, leaderIdentity.publicKeyId)
+
+    await assert.rejects(
+      learner.submitPromotionCredential(credential),
+      /hash was already submitted/
+    )
+    await assert.rejects(
+      learner.put("hash:promotion-write", { value: "still-forbidden" }),
+      (error) => error?.code === "READ_ONLY_LEARNER"
+    )
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

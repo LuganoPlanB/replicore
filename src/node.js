@@ -18,6 +18,7 @@ import {
 import { MaterializedView } from "./materialized-view.js"
 import { NodeRpcRouter } from "./node-rpc.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
+import { validatePromotionCredential } from "./promotion-credential.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
 import { resolveTransportIdentity } from "./transport-identity.js"
@@ -336,6 +337,7 @@ export class HolepunchSwarmNode {
       encryptionKeyId: this.encryption.currentKeyId,
       knownPeerNodeIds: this.network?.knownPeerPublicKeys ?? [],
       membership: this.#membershipStatus(heartbeats),
+      promotion: await this.#promotionStatus(),
       network: this.network?.networkStatus() ?? { policyActive: false, allowedNodeIds: [], peers: {} },
       readStatus: this.#readStatus(),
       feeds,
@@ -373,6 +375,40 @@ export class HolepunchSwarmNode {
 
   async getConsensusState() {
     return { ...this.consensusState }
+  }
+
+  async submitPromotionCredential(credential) {
+    if (!this.#isLearner()) {
+      throw new Error("Only learners may accept promotion credentials")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.consensusState.membershipVersion,
+      learnerNodeId: this.options.identity.publicKeyId,
+      learnerNoisePublicKey: this.transportIdentity?.publicKeyHex ?? "",
+      authorizedNodes: this.options.authorizedNodes,
+      seenCredentialHashes: await this.#seenPromotionCredentialHashes(),
+      seenNonces: await this.#seenPromotionNonces(),
+      isCaughtUp: await this.#isPromotionEligible()
+    })
+
+    const batch = this.consensusBee.batch()
+    await batch.put(`promotion/seen/hash/${summary.credentialHash}`, true)
+    await batch.put(`promotion/seen/nonce/${credential.payload.nonce}`, true)
+    await batch.put("promotion/current", {
+      credentialHash: summary.credentialHash,
+      targetRole: summary.targetRole,
+      signerNodeId: summary.signerNodeId,
+      learnerNodeId: summary.learnerNodeId,
+      learnerNoisePublicKey: summary.learnerNoisePublicKey,
+      expiresAt: summary.expiresAt,
+      eligible: true,
+      accepted: false
+    })
+    await batch.flush()
+
+    return await this.#promotionStatus()
   }
 
   /**
@@ -752,6 +788,38 @@ export class HolepunchSwarmNode {
     error.statusCode = 403
     error.leader = this.currentLeader()
     return error
+  }
+
+  async #promotionStatus() {
+    const entry = await this.consensusBee.get("promotion/current")
+    return entry?.value ?? null
+  }
+
+  async #seenPromotionCredentialHashes() {
+    const seen = new Set()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "promotion/seen/hash/",
+      lt: "promotion/seen/hash/~"
+    })) {
+      seen.add(entry.key.slice("promotion/seen/hash/".length))
+    }
+    return seen
+  }
+
+  async #seenPromotionNonces() {
+    const seen = new Set()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "promotion/seen/nonce/",
+      lt: "promotion/seen/nonce/~"
+    })) {
+      seen.add(entry.key.slice("promotion/seen/nonce/".length))
+    }
+    return seen
+  }
+
+  async #isPromotionEligible() {
+    if (!this.#isLearner()) return false
+    return this.currentLeader() !== null
   }
 
   #isLeaderReachable(nodeId) {
