@@ -162,8 +162,9 @@ test("new and restarted followers read the same authoritative leader-log prefix"
       return true
     })
 
+    const electedLeader = [leader, follower1].find((node) => node.options.identity.publicKeyId === leaderId) ?? leader
     const forwarded = await follower1.put("hash:authoritative-prefix", { source: "forwarded" })
-    await waitFor(async () => (await leader.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
+    await waitFor(async () => (await electedLeader.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
 
     const lateFollower = await createFollower({
       dirs,
@@ -178,7 +179,7 @@ test("new and restarted followers read the same authoritative leader-log prefix"
 
     await waitFor(async () => (await lateFollower.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
 
-    const leaderLog = await leader.getAuthoritativeLogStatus()
+    const leaderLog = await electedLeader.getAuthoritativeLogStatus()
     const follower1Log = await follower1.getAuthoritativeLogStatus()
     const lateFollowerLog = await lateFollower.getAuthoritativeLogStatus()
     for (const status of [follower1Log, lateFollowerLog]) {
@@ -194,9 +195,9 @@ test("new and restarted followers read the same authoritative leader-log prefix"
     assert.equal(follower1Replication.authoritativeLog.length, leaderLog.length)
     assert.equal(follower1Replication.authoritativeLog.term, leaderLog.term)
 
-    const leaderCoreEntry = await (leader.options.clusterSecret
-      ? leader.authoritativeLogCore
-      : leader.feedCores.get(leaderId)).get(forwarded.seq)
+    const leaderCoreEntry = await (electedLeader.options.clusterSecret
+      ? electedLeader.authoritativeLogCore
+      : electedLeader.feedCores.get(leaderId)).get(forwarded.seq)
     const lateFollowerHistory = await lateFollower.getHistory("hash:authoritative-prefix")
     assert.equal(lateFollowerHistory.length, 1)
     assert.equal(lateFollowerHistory[0].opId, leaderCoreEntry.opId)
@@ -1049,8 +1050,12 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
       servers.push(server)
     }
 
-    const followerServer = servers[1]
+    const leaderNode = nodes.find((node) => node.options.identity.publicKeyId === expectedLeaderId)
+    const leaderServer = servers[nodes.indexOf(leaderNode)]
+    const followerServer = servers.find((server) => server !== leaderServer)
+    const followerNode = nodes[servers.indexOf(followerServer)]
     const baseUrl = `http://${followerServer.address.address}:${followerServer.address.port}`
+    const leaderBaseUrl = `http://${leaderServer.address.address}:${leaderServer.address.port}`
 
     const putResponse = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
       method: "PUT",
@@ -1063,6 +1068,23 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     assert.equal(putResponse.status, 200)
     const operation = await putResponse.json()
     assert.equal(typeof operation.opId, "string")
+
+    await waitFor(async () => {
+      const response = await fetch(`${leaderBaseUrl}/kv/hash:http-direct?keyspace=default`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer writer",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ value: { through: "leader" } })
+      })
+      if (response.status !== 503) return false
+      const payload = await response.json()
+      return (
+        payload.code === "not-witness-entrypoint" &&
+        payload.reconnectHints?.witnesses?.some((hint) => hint.httpAddress?.port === followerServer.address.port)
+      )
+    })
 
     const unauthorized = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
       headers: { authorization: "Bearer missing" }
@@ -1086,11 +1108,11 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     const replicationResponse = await fetch(`${baseUrl}/status/replication`)
     assert.equal(replicationResponse.status, 200)
     const replication = await replicationResponse.json()
-    assert.equal(replication.nodeId, nodes[1].options.identity.publicKeyId)
+    assert.equal(replication.nodeId, followerNode.options.identity.publicKeyId)
     assert.equal(typeof replication.lastDurableSequence, "number")
     assert.equal(typeof replication.knownPeerNodeIds.length, "number")
-    assert.equal(typeof replication.peerReplication[nodes[1].options.identity.publicKeyId].lag, "number")
-    assert.equal(typeof replication.peerReplication[nodes[1].options.identity.publicKeyId].alive, "boolean")
+    assert.equal(typeof replication.peerReplication[followerNode.options.identity.publicKeyId].lag, "number")
+    assert.equal(typeof replication.peerReplication[followerNode.options.identity.publicKeyId].alive, "boolean")
 
     const writersResponse = await fetch(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)

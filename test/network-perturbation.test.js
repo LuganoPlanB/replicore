@@ -2481,7 +2481,7 @@ test("concurrent writes during split fencing do not create accepted operations b
   }
 })
 
-test("HTTP writes fail while durability is unavailable and recover after a follower returns", { concurrency: false }, async () => {
+test("HTTP witness writes fail while leader connectivity is unsafe and recover after heal", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
     heartbeatIntervalMs: 100,
@@ -2502,7 +2502,8 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
 
     const leaderId = currentLeaderId(cluster)
     const leader = cluster.record(leaderId).node
-    const offlineFollowers = liveFollowerIds(cluster, leaderId)
+    const [witnessId, passiveFollowerId] = liveFollowerIds(cluster, leaderId)
+    const witness = cluster.record(witnessId).node
 
     await waitFor(
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
@@ -2513,7 +2514,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
     )
 
     const server = new HolepunchHttpServer({
-      node: leader,
+      node: witness,
       auth: {
         tokens: {
           admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
@@ -2525,22 +2526,30 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
     await server.start()
     servers.push(server)
 
-    await leader.put("hash:http-baseline", { baseline: true })
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const baselinePut = await fetch(`${baseUrl}/kv/hash:http-baseline?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ value: { baseline: true } })
+    })
+    assert.equal(baselinePut.status, 200)
 
-    await Promise.all(offlineFollowers.map((nodeId) => cluster.stopNode(nodeId)))
+    await cluster.partitionGroups([[witnessId], [leaderId, passiveFollowerId]])
 
     await waitFor(
       async () => {
-        const status = await leader.getReplicationStatus()
-        return offlineFollowers.every((nodeId) => status.peerReplication[nodeId]?.alive === false)
+        const status = await witness.getReplicationStatus()
+        return status.splitStatus?.fenced === true && status.readStatus.reason === "split-fenced"
       },
       {
-        description: "HTTP test waits for durability loss",
-        onTimeout: () => leader.getReplicationStatus()
+        description: "HTTP witness becomes split-fenced when leader connectivity is lost",
+        onTimeout: () => witness.getReplicationStatus()
       }
     )
 
-    const baseUrl = `http://${server.address.address}:${server.address.port}`
     const blockedPut = await fetch(`${baseUrl}/kv/hash:http-blocked?keyspace=default`, {
       method: "PUT",
       headers: {
@@ -2549,8 +2558,8 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
       },
       body: JSON.stringify({ value: { blocked: true } })
     })
-    assert.equal(blockedPut.status, 500)
-    assert.match((await blockedPut.json()).error, /Durability requirement not met/)
+    assert.equal(blockedPut.status, 503)
+    assert.match((await blockedPut.json()).code, /split-fenced|leader-unreachable/)
 
     const blockedDelete = await fetch(`${baseUrl}/kv/hash:http-baseline?keyspace=default`, {
       method: "DELETE",
@@ -2558,19 +2567,19 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
         authorization: "Bearer writer"
       }
     })
-    assert.equal(blockedDelete.status, 500)
-    assert.match((await blockedDelete.json()).error, /Durability requirement not met/)
+    assert.equal(blockedDelete.status, 503)
+    assert.match((await blockedDelete.json()).code, /split-fenced|leader-unreachable/)
 
-    await cluster.restartNode(offlineFollowers[0])
+    await cluster.healPartition()
 
     await waitFor(
       async () => {
-        const status = await leader.getReplicationStatus()
-        return status.peerReplication[offlineFollowers[0]]?.alive === true && status.peerReplication[offlineFollowers[0]]?.connectedPeers > 0
+        const status = await witness.getReplicationStatus()
+        return status.splitStatus?.fenced === false && status.readStatus.staleReadsPossible === false
       },
       {
-        description: "HTTP durability recovers when follower returns",
-        onTimeout: () => leader.getReplicationStatus()
+        description: "HTTP witness clears split fencing after heal",
+        onTimeout: () => witness.getReplicationStatus()
       }
     )
 
@@ -2585,12 +2594,9 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
     assert.equal(recoveredPut.status, 200)
 
     await waitFor(
-      async () => {
-        const follower = cluster.record(offlineFollowers[0]).node
-        return (await follower.get("hash:http-blocked"))?.value?.blocked === false
-      },
+      async () => hasClusterValue(cluster.nodes, "hash:http-blocked", { blocked: false }),
       {
-        description: "recovered HTTP write reaches restarted follower",
+        description: "recovered HTTP witness write converges after heal",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )

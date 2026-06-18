@@ -2357,13 +2357,27 @@ export class HolepunchSwarmNode {
 
   async #recordPeerHint(nodeId, patch) {
     const existing = this.#peerHint(nodeId)
+    const now = Date.now()
+    const nextHttpAddress = patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress
+    const nextPeerPublicKey = patch.peerPublicKey ?? existing?.peerPublicKey ?? null
+    const nextRole = patch.role ?? existing?.role ?? null
+    if (
+      existing &&
+      existing.peerPublicKey === nextPeerPublicKey &&
+      JSON.stringify(existing.httpAddress) === JSON.stringify(nextHttpAddress) &&
+      existing.role === nextRole &&
+      Number.isInteger(existing.expiresAt) &&
+      existing.expiresAt > now + Math.floor(PEER_HINT_TTL_MS / 2)
+    ) {
+      return
+    }
     const next = {
       nodeId,
-      peerPublicKey: patch.peerPublicKey ?? existing?.peerPublicKey ?? null,
-      httpAddress: patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress,
-      role: patch.role ?? existing?.role ?? null,
+      peerPublicKey: nextPeerPublicKey,
+      httpAddress: nextHttpAddress,
+      role: nextRole,
       seenAt: new Date().toISOString(),
-      expiresAt: Date.now() + PEER_HINT_TTL_MS
+      expiresAt: now + PEER_HINT_TTL_MS
     }
     this.peerHints.set(nodeId, next)
     await this.consensusBee.put(`peer-hints/${nodeId}`, next)
@@ -2614,7 +2628,11 @@ export class HolepunchSwarmNode {
   }
 
   #isIgnoredSyncError(error) {
-    if (error?.code === "REQUEST_CANCELLED" || error?.code === "SESSION_CLOSED") {
+    if (
+      error?.code === "REQUEST_CANCELLED"
+      || error?.code === "SESSION_CLOSED"
+      || error?.code === "SNAPSHOT_NOT_AVAILABLE"
+    ) {
       return true
     }
     return typeof error?.message === "string" && error.message.startsWith("Unknown authorized node ")
@@ -3655,13 +3673,12 @@ export class HolepunchSwarmNode {
       })
     }
 
-    if (membership.phase === "joint") {
-      this.membershipState = {
+    const nextMembershipState = membership.phase === "joint"
+      ? {
         current: { ...this.membershipState.current },
         joint: this.#normalizeJointMembership(membership)
       }
-    } else {
-      this.membershipState = {
+      : {
         current: this.#normalizeMembershipConfig({
           version: membership.toVersion,
           voters: membership.newVoters,
@@ -3670,12 +3687,14 @@ export class HolepunchSwarmNode {
         }),
         joint: null
       }
+    if (membership.phase !== "joint") {
       this.consensusState = await this.consensusStateStore.save({
         membershipVersion: membership.toVersion
       })
     }
 
-    await this.#persistMembershipState(this.membershipState)
+    await this.#persistMembershipState(nextMembershipState)
+    this.membershipState = nextMembershipState
     await this.#refreshHeartbeatRole(previousRole)
   }
 
