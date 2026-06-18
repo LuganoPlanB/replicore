@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { HolepunchHttpServer, validateLogLink } from "../src/index.js"
+import { createPromotionCredential, HolepunchHttpServer, validateLogLink } from "../src/index.js"
 import {
   assertClusterValue,
   collectClusterDiagnostics,
@@ -480,6 +480,215 @@ test("planned node addition works after full-cluster restart with expanded membe
       await expandedCluster.destroyResources()
     }
     await initialCluster.destroyResources()
+  }
+})
+
+test("joint-consensus learner promotion blocks when only one side of the joint quorum is available", { concurrency: false }, async () => {
+  const identities = createIdentities(4, ["leader", "follower-1", "follower-2", "standby"])
+  const learnerIdentity = identities[3]
+  const cluster = await createSwarmCluster({
+    identities,
+    membership: {
+      version: 0,
+      voters: identities.slice(0, 3).map((identity) => identity.publicKeyId),
+      learners: [learnerIdentity.publicKeyId],
+      removed: []
+    },
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leader = currentLeaderNode(cluster)
+    const leaderId = leader.options.identity.publicKeyId
+    const leaderIdentity = cluster.record(leaderId).identity
+
+    await leader.put("hash:promotion-before", { phase: "before" })
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:promotion-before", { phase: "before" }),
+      {
+        description: "learner catches up before promotion",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const learner = cluster.record(learnerIdentity.publicKeyId).node
+    const credential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: cluster.options.clusterId,
+        membershipVersion: 0,
+        learnerNodeId: learnerIdentity.publicKeyId,
+        learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: "2026-06-18T12:00:00.000Z",
+        expiresAt: "2026-06-18T13:00:00.000Z",
+        nonce: "joint-promotion-blocked",
+        signerNodeId: leaderIdentity.publicKeyId
+      },
+      signerSecretKey: leaderIdentity.secretKey
+    })
+
+    const oldFollowerIds = identities
+      .slice(0, 3)
+      .map((identity) => identity.publicKeyId)
+      .filter((nodeId) => nodeId !== leaderId)
+      .sort()
+    await cluster.partitionGroups([
+      [leaderId, oldFollowerIds[0]],
+      [oldFollowerIds[1], learnerIdentity.publicKeyId]
+    ])
+
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return status.network.policyActive && status.connections === 1
+      },
+      {
+        description: "promotion test partition settles",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    await assert.rejects(
+      leader.commitPromotionCredential(credential),
+      /(Timed out waiting for follower acknowledgement|Durability requirement not met)/
+    )
+
+    const blockedStatus = await leader.getReplicationStatus()
+    assert.equal(blockedStatus.membership.version, 0)
+    assert.equal(blockedStatus.membership.joint, null)
+    assert.equal(
+      blockedStatus.membership.learners.some((entry) => entry.nodeId === learnerIdentity.publicKeyId),
+      true
+    )
+
+    await cluster.healPartition()
+    await waitForClusterConvergence(cluster)
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return identities
+          .slice(0, 3)
+          .map((identity) => identity.publicKeyId)
+          .filter((nodeId) => nodeId !== leaderId)
+          .every((nodeId) => status.feeds[nodeId]?.connectedPeers > 0)
+      },
+      {
+        description: "promotion leader regains enough live connectivity after heal",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const committed = await leader.commitPromotionCredential(credential)
+    assert.equal(committed.version, 1)
+    assert.equal(committed.joint, null)
+    assert.equal(committed.voters.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
+
+    await waitFor(
+      async () => cluster.nodes.every((node) => node.getWritersStatus().membership.some((entry) => (
+        entry.nodeId === learnerIdentity.publicKeyId && entry.role === "voter"
+      ))),
+      {
+        description: "promotion final membership converges",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+  } finally {
+    await cluster.closeAll()
+  }
+})
+
+test("joint-consensus voter removal blocks when only one side of the joint quorum is available", { concurrency: false }, async () => {
+  const identities = createIdentities(4, ["leader", "follower-1", "follower-2", "follower-3"])
+  const cluster = await createSwarmCluster({
+    identities,
+    membership: {
+      version: 0,
+      voters: identities.map((identity) => identity.publicKeyId),
+      learners: [],
+      removed: []
+    },
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 1000
+  })
+
+  try {
+    await cluster.startAll()
+    await waitForClusterConvergence(cluster)
+
+    const leader = currentLeaderNode(cluster)
+    const leaderId = leader.options.identity.publicKeyId
+    const removalTargetId = identities
+      .map((identity) => identity.publicKeyId)
+      .filter((nodeId) => nodeId !== leaderId)
+      .sort()
+      .at(-1)
+    const retainedFollowerId = identities
+      .map((identity) => identity.publicKeyId)
+      .filter((nodeId) => nodeId !== leaderId && nodeId !== removalTargetId)
+      .sort()[0]
+    const isolatedCompanionId = identities
+      .map((identity) => identity.publicKeyId)
+      .filter((nodeId) => ![leaderId, retainedFollowerId, removalTargetId].includes(nodeId))
+      .sort()[0]
+
+    await cluster.partitionGroups([
+      [leaderId, retainedFollowerId],
+      [removalTargetId, isolatedCompanionId]
+    ])
+
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return status.network.policyActive && status.connections === 1
+      },
+      {
+        description: "removal test partition settles",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    await assert.rejects(
+      leader.removeVoter(removalTargetId),
+      /(Timed out waiting for follower acknowledgement|Durability requirement not met)/
+    )
+
+    const blockedStatus = await leader.getReplicationStatus()
+    assert.equal(blockedStatus.membership.version, 0)
+    assert.equal(blockedStatus.membership.joint, null)
+    assert.equal(
+      blockedStatus.membership.voters.some((entry) => entry.nodeId === removalTargetId),
+      true
+    )
+
+    await cluster.healPartition()
+    await waitForClusterConvergence(cluster)
+    await waitFor(
+      async () => {
+        const status = await leader.getReplicationStatus()
+        return identities
+          .map((identity) => identity.publicKeyId)
+          .filter((nodeId) => nodeId !== leaderId)
+          .every((nodeId) => status.feeds[nodeId]?.connectedPeers > 0)
+      },
+      {
+        description: "removal leader regains enough live connectivity after heal",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    const committed = await leader.removeVoter(removalTargetId)
+    assert.equal(committed.version, 1)
+    assert.equal(committed.joint, null)
+    assert.equal(committed.removed.some((entry) => entry.nodeId === removalTargetId), true)
+    assert.equal(committed.voters.some((entry) => entry.nodeId === removalTargetId), false)
+  } finally {
+    await cluster.closeAll()
   }
 })
 
@@ -2519,7 +2728,10 @@ async function delay(ms) {
 
 async function waitForClusterConvergence(cluster) {
   await waitFor(
-    async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= cluster.nodes.length),
+    async () => {
+      const statuses = await Promise.all(cluster.nodes.map((node) => node.getReplicationStatus()))
+      return statuses.every((status) => Object.keys(status.heartbeats).length >= status.membership.voters.length)
+    },
     {
       description: "cluster heartbeat convergence",
       onTimeout: () => collectClusterDiagnostics(cluster)
@@ -2527,8 +2739,8 @@ async function waitForClusterConvergence(cluster) {
   )
   await waitFor(
     async () => {
-      const leaderId = currentLeaderId({ identities: cluster.nodes.map((node) => node.options.identity) })
-      return cluster.nodes.every((node) => node.currentLeader() === leaderId)
+      const leaders = cluster.nodes.map((node) => node.currentLeader()).filter(Boolean)
+      return leaders.length === cluster.nodes.length && new Set(leaders).size === 1
     },
     {
       description: "cluster leader convergence",

@@ -38,6 +38,7 @@ export class HolepunchSwarmNode {
    *   topicSalt?: string,
    *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
    *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
+   *   membership?: { version?: number, voters?: string[], learners?: string[], removed?: string[] },
    *   revokedNodeIds?: string[],
    *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
    *   encryptionKey?: Buffer,
@@ -71,6 +72,7 @@ export class HolepunchSwarmNode {
     this.consensusBee = null
     this.consensusStateStore = null
     this.consensusState = null
+    this.membershipState = null
     this.network = null
     this.rpc = null
     this.transportIdentity = null
@@ -113,6 +115,7 @@ export class HolepunchSwarmNode {
     await this.consensusBee.ready()
     this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
     this.consensusState = await this.consensusStateStore.load()
+    this.membershipState = await this.#loadMembershipState()
     this.rpc = new NodeRpcRouter({
       localNodeId: this.options.identity.publicKeyId,
       timeoutMs: this.options.durability.timeoutMs,
@@ -389,7 +392,7 @@ export class HolepunchSwarmNode {
 
     const summary = validatePromotionCredential(credential, {
       clusterId: this.options.clusterId,
-      membershipVersion: this.consensusState.membershipVersion,
+      membershipVersion: this.membershipState.current.version,
       learnerNodeId: this.options.identity.publicKeyId,
       learnerNoisePublicKey: this.transportIdentity?.publicKeyHex ?? "",
       authorizedNodes: this.options.authorizedNodes,
@@ -414,6 +417,97 @@ export class HolepunchSwarmNode {
     await batch.flush()
 
     return await this.#promotionStatus()
+  }
+
+  async commitPromotionCredential(credential) {
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      throw new Error("Only the current leader may commit membership promotions")
+    }
+    if (this.#jointMembership()) {
+      throw new Error("Another membership change is already in progress")
+    }
+
+    const learnerNodeId = credential?.payload?.learnerNodeId
+    const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
+    if (!learnerRecord) {
+      throw new Error("Promotion target must be a pre-authorized learner in this implementation")
+    }
+    if (this.#currentMembershipRole(learnerNodeId) !== "learner") {
+      throw new Error("Promotion target is not currently a learner")
+    }
+
+    const learnerNoisePublicKey = this.network?.peerPublicKeyForNodeId(learnerNodeId)
+    if (!learnerNoisePublicKey) {
+      throw new Error("Promotion target must be connected before promotion")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.membershipState.current.version,
+      learnerNodeId,
+      learnerNoisePublicKey,
+      authorizedNodes: this.#voterNodes().map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: node.publicKey
+      })),
+      seenCredentialHashes: await this.#seenPromotionCredentialHashes(),
+      seenNonces: await this.#seenPromotionNonces(),
+      isCaughtUp: await this.#isLearnerPromotionReady(learnerRecord.feedKey)
+    })
+
+    const oldVoters = this.membershipState.current.voters
+    const newVoters = [...new Set([...oldVoters, learnerNodeId])].sort()
+    const learners = this.membershipState.current.learners.filter((nodeId) => nodeId !== learnerNodeId).sort()
+    const removed = this.membershipState.current.removed.filter((nodeId) => nodeId !== learnerNodeId).sort()
+
+    await this.#commitMembershipChange({
+      changeType: "promotion",
+      targetNodeId: learnerNodeId,
+      newVoters,
+      learners,
+      removed,
+      promotion: {
+        credentialHash: summary.credentialHash,
+        targetRole: summary.targetRole,
+        signerNodeId: summary.signerNodeId,
+        learnerNodeId: summary.learnerNodeId,
+        learnerNoisePublicKey: summary.learnerNoisePublicKey,
+        expiresAt: summary.expiresAt,
+        eligible: true,
+        accepted: true
+      }
+    })
+
+    return await this.#membershipStatusSnapshot()
+  }
+
+  async removeVoter(nodeId) {
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      throw new Error("Only the current leader may remove voters")
+    }
+    if (this.#jointMembership()) {
+      throw new Error("Another membership change is already in progress")
+    }
+    if (nodeId === this.options.identity.publicKeyId) {
+      throw new Error("Self-removal is not supported in this implementation")
+    }
+    if (this.#currentMembershipRole(nodeId) !== "voter") {
+      throw new Error("Removal target is not currently a voter")
+    }
+
+    const newVoters = this.membershipState.current.voters.filter((entry) => entry !== nodeId).sort()
+    const learners = this.membershipState.current.learners.filter((entry) => entry !== nodeId).sort()
+    const removed = [...new Set([...this.membershipState.current.removed, nodeId])].sort()
+
+    await this.#commitMembershipChange({
+      changeType: "removal",
+      targetNodeId: nodeId,
+      newVoters,
+      learners,
+      removed
+    })
+
+    return await this.#membershipStatusSnapshot()
   }
 
   /**
@@ -544,6 +638,14 @@ export class HolepunchSwarmNode {
           validation: "valid",
           operation
         })
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+        if (nodeId !== this.options.identity.publicKeyId) {
+          void this.#sendAck(nodeId, operation.seq)
+        }
+      } else if (operation.kind === "membership") {
         await this.view.setRawProgress(node.feedKey, {
           applied: operation.seq + 1,
           lastOpId: operation.opId
@@ -780,13 +882,12 @@ export class HolepunchSwarmNode {
   }
 
   #role() {
-    return this.#isLearner() ? "learner" : "voter"
+    const role = this.#membershipRole(this.options.identity.publicKeyId)
+    return role ?? "learner"
   }
 
   #isLearner() {
-    return !this.options.authorizedNodes.some(
-      (node) => node.nodeId === this.options.identity.publicKeyId
-    )
+    return this.#role() !== "voter"
   }
 
   #createLearnerWriteError() {
@@ -827,6 +928,12 @@ export class HolepunchSwarmNode {
   async #isPromotionEligible() {
     if (!this.#isLearner()) return false
     return this.currentLeader() !== null
+  }
+
+  async #isLearnerPromotionReady(feedKey) {
+    const learnerNode = this.options.authorizedNodes.find((node) => node.feedKey === feedKey)
+    if (!learnerNode) return false
+    return (await this.view.getApplied(feedKey)) === this.feedCores.get(learnerNode.nodeId)?.length
   }
 
   #isLeaderReachable(nodeId) {
@@ -907,17 +1014,24 @@ export class HolepunchSwarmNode {
         await this.view.skipCommitted(operation, node.feedKey)
       } else {
         await this.view.applyCommitted(operation, node.feedKey)
+        if (operation.kind === "membership") {
+          await this.#applyCommittedMembershipOperation(operation)
+        }
       }
       committedApplied += 1
     }
   }
 
   #membershipFingerprint() {
-    const membership = this.options.authorizedNodes.map((node) => ({
-      nodeId: node.nodeId,
-      feedKey: node.feedKey,
-      role: this.#membershipRole(node.nodeId)
-    }))
+    const membership = {
+      current: this.membershipState?.current ?? null,
+      joint: this.membershipState?.joint ?? null,
+      entries: this.options.authorizedNodes.map((node) => ({
+        nodeId: node.nodeId,
+        feedKey: node.feedKey,
+        role: this.#membershipRole(node.nodeId)
+      }))
+    }
     return createHash("sha256").update(canonicalize(membership)).digest("hex")
   }
 
@@ -941,6 +1055,8 @@ export class HolepunchSwarmNode {
     return {
       localFingerprint,
       localRole: this.#role(),
+      version: this.membershipState.current.version,
+      joint: this.membershipState.joint,
       voters: entries.filter((entry) => entry.role === "voter"),
       learners: entries.filter((entry) => entry.role === "learner"),
       removed: entries.filter((entry) => entry.role === "removed"),
@@ -986,11 +1102,23 @@ export class HolepunchSwarmNode {
     return this.revokedNodeIds.has(nodeId)
   }
 
+  #currentMembershipRole(nodeId) {
+    if (this.membershipState.current.voters.includes(nodeId)) return "voter"
+    if (this.membershipState.current.learners.includes(nodeId)) return "learner"
+    if (this.membershipState.current.removed.includes(nodeId)) return "removed"
+    return null
+  }
+
   #membershipRole(nodeId) {
+    if (this.#effectiveVoterNodeIds().includes(nodeId)) {
+      return "voter"
+    }
+    const currentRole = this.#currentMembershipRole(nodeId)
+    if (currentRole) return currentRole
     if (!this.options.authorizedNodes.some((node) => node.nodeId === nodeId)) {
       return nodeId === this.options.identity.publicKeyId ? "learner" : null
     }
-    return this.#isRevokedNode(nodeId) ? "removed" : "voter"
+    return this.#isRevokedNode(nodeId) ? "removed" : "learner"
   }
 
   #membershipEntries() {
@@ -999,7 +1127,7 @@ export class HolepunchSwarmNode {
       feedKey: node.feedKey,
       role: this.#membershipRole(node.nodeId)
     }))
-    if (this.#isLearner()) {
+    if (this.#isLearner() && !entries.some((entry) => entry.nodeId === this.options.identity.publicKeyId)) {
       entries.push({
         nodeId: this.options.identity.publicKeyId,
         feedKey: this.options.identity.feedKey,
@@ -1010,6 +1138,291 @@ export class HolepunchSwarmNode {
   }
 
   #voterNodes() {
-    return this.options.authorizedNodes.filter((node) => this.#membershipRole(node.nodeId) === "voter")
+    return this.options.authorizedNodes.filter((node) => this.#effectiveVoterNodeIds().includes(node.nodeId))
+  }
+
+  #effectiveVoterNodeIds() {
+    if (!this.membershipState) {
+      return this.options.authorizedNodes
+        .map((node) => node.nodeId)
+        .filter((nodeId) => !this.#isRevokedNode(nodeId))
+    }
+    if (!this.membershipState.joint) {
+      return [...this.membershipState.current.voters]
+    }
+    return [...new Set([
+      ...this.membershipState.joint.oldVoters,
+      ...this.membershipState.joint.newVoters
+    ])].sort()
+  }
+
+  #jointMembership() {
+    return this.membershipState?.joint ?? null
+  }
+
+  async #loadMembershipState() {
+    const currentEntry = await this.consensusBee.get("membership/current")
+    const jointEntry = await this.consensusBee.get("membership/joint")
+    if (currentEntry?.value) {
+      return {
+        current: this.#normalizeMembershipConfig(currentEntry.value),
+        joint: jointEntry?.value ? this.#normalizeJointMembership(jointEntry.value) : null
+      }
+    }
+
+    const initial = this.#initialMembershipConfig()
+    await this.#persistMembershipState({
+      current: initial,
+      joint: null
+    })
+    this.consensusState = await this.consensusStateStore.save({
+      membershipVersion: initial.version
+    })
+    return {
+      current: initial,
+      joint: null
+    }
+  }
+
+  #initialMembershipConfig() {
+    const configured = this.options.membership ?? {}
+    const voters = (configured.voters ?? this.options.authorizedNodes
+      .map((node) => node.nodeId)
+      .filter((nodeId) => !this.#isRevokedNode(nodeId))).sort()
+    const removed = [...new Set(configured.removed ?? [...this.revokedNodeIds])].sort()
+    const learners = (configured.learners ?? this.options.authorizedNodes
+      .map((node) => node.nodeId)
+      .filter((nodeId) => !voters.includes(nodeId) && !removed.includes(nodeId))).sort()
+    return this.#normalizeMembershipConfig({
+      version: configured.version ?? 0,
+      voters,
+      learners,
+      removed
+    })
+  }
+
+  #normalizeMembershipConfig(config) {
+    return {
+      version: config.version ?? 0,
+      voters: [...new Set(config.voters ?? [])].sort(),
+      learners: [...new Set(config.learners ?? [])].sort(),
+      removed: [...new Set(config.removed ?? [])].sort()
+    }
+  }
+
+  #normalizeJointMembership(joint) {
+    return {
+      changeType: joint.changeType,
+      targetNodeId: joint.targetNodeId,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: [...new Set(joint.oldVoters ?? [])].sort(),
+      newVoters: [...new Set(joint.newVoters ?? [])].sort()
+    }
+  }
+
+  async #persistMembershipState(state) {
+    const batch = this.consensusBee.batch()
+    await batch.put("membership/current", state.current)
+    if (state.joint) {
+      await batch.put("membership/joint", state.joint)
+    } else {
+      await batch.del("membership/joint")
+    }
+    await batch.flush()
+  }
+
+  async #commitMembershipChange({ changeType, targetNodeId, newVoters, learners, removed, promotion = null }) {
+    const current = this.membershipState.current
+    const nextVersion = current.version + 1
+    const joint = {
+      changeType,
+      targetNodeId,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: [...current.voters].sort(),
+      newVoters: [...newVoters].sort()
+    }
+    const finalConfig = this.#normalizeMembershipConfig({
+      version: nextVersion,
+      voters: newVoters,
+      learners,
+      removed
+    })
+    const quorumGroups = this.#jointQuorumGroups(joint)
+
+    const jointOperation = await this.#appendMembershipOperation({
+      phase: "joint",
+      changeType,
+      targetNodeId,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners: finalConfig.learners,
+      removed: finalConfig.removed,
+      quorumGroups
+    })
+    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, jointOperation.seq + 1)
+    await this.#runHeartbeat()
+
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType,
+      targetNodeId,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners: finalConfig.learners,
+      removed: finalConfig.removed,
+      quorumGroups
+    })
+    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, finalOperation.seq + 1)
+
+    if (promotion) {
+      await this.consensusBee.put("promotion/current", promotion)
+    }
+
+    await this.#runHeartbeat()
+  }
+
+  #jointQuorumGroups(joint) {
+    return [
+      {
+        eligibleNodeIds: joint.oldVoters,
+        requiredCount: this.#majoritySize(joint.oldVoters.length)
+      },
+      {
+        eligibleNodeIds: joint.newVoters,
+        requiredCount: this.#majoritySize(joint.newVoters.length)
+      }
+    ]
+  }
+
+  async #appendMembershipOperation({
+    phase,
+    changeType,
+    targetNodeId,
+    fromVersion,
+    toVersion,
+    oldVoters,
+    newVoters,
+    learners,
+    removed,
+    quorumGroups
+  }) {
+    let operation = null
+    let ackPromise = null
+    await this.#withLocalAppendLock(async () => {
+      const previousOperation = await this.#previousLocalOperation()
+      operation = createSignedOperation({
+        kind: "membership",
+        type: "put",
+        key: `membership:${toVersion}:${phase}`,
+        keyspace: "system",
+        membership: {
+          phase,
+          changeType,
+          targetNodeId,
+          fromVersion,
+          toVersion,
+          oldVoters,
+          newVoters,
+          learners,
+          removed
+        },
+        seq: this.#localCore().length,
+        term: this.consensusState.currentTerm,
+        index: this.#localCore().length,
+        prevIndex: previousOperation?.index ?? -1,
+        prevHash: previousOperation?.entryHash ?? null,
+        feed: this.options.identity.feedKey,
+        actor: this.options.identity.publicKeyId,
+        secretKey: this.options.identity.secretKey,
+        encryptionKey: this.#currentEncryptionKey(),
+        encryptionKeyId: this.encryption.currentKeyId
+      })
+      ackPromise = this.durabilityWaiter.waitForGroups(
+        operation.seq,
+        quorumGroups,
+        [this.options.identity.publicKeyId]
+      )
+      ackPromise.catch(() => {})
+      await this.#localCore().append(operation)
+    })
+
+    await this.syncFeed(this.options.identity.publicKeyId)
+    try {
+      await ackPromise
+    } catch (error) {
+      await this.view.markSkippedEntry(this.options.identity.feedKey, operation.seq)
+      await this.#runHeartbeat()
+      throw error
+    }
+    return operation
+  }
+
+  async #applyCommittedMembershipOperation(operation) {
+    const previousRole = this.#role()
+    const membership = operation.membership
+    if (!membership || typeof membership !== "object") {
+      throw new Error("Committed membership operation is missing membership metadata")
+    }
+
+    if (membership.phase === "joint") {
+      this.membershipState = {
+        current: { ...this.membershipState.current },
+        joint: this.#normalizeJointMembership(membership)
+      }
+    } else {
+      this.membershipState = {
+        current: this.#normalizeMembershipConfig({
+          version: membership.toVersion,
+          voters: membership.newVoters,
+          learners: membership.learners,
+          removed: membership.removed
+        }),
+        joint: null
+      }
+      this.consensusState = await this.consensusStateStore.save({
+        membershipVersion: membership.toVersion
+      })
+    }
+
+    await this.#persistMembershipState(this.membershipState)
+    await this.#refreshHeartbeatRole(previousRole)
+  }
+
+  async #membershipStatusSnapshot() {
+    const heartbeats = await this.view.getHeartbeats()
+    return this.#membershipStatus(heartbeats)
+  }
+
+  #majoritySize(size) {
+    return Math.floor(size / 2) + 1
+  }
+
+  async #refreshHeartbeatRole(previousRole) {
+    const currentRole = this.#role()
+    if (previousRole !== "voter" && currentRole === "voter") {
+      if (!this.heartbeatTimer && !this.closing) {
+        await this.#runHeartbeat()
+        this.heartbeatTimer = setInterval(() => {
+          void this.#runHeartbeat().catch((error) => {
+            if (!this.closing && error?.code !== "SESSION_CLOSED") {
+              throw error
+            }
+          })
+        }, this.options.heartbeatIntervalMs)
+        this.heartbeatTimer.unref?.()
+      }
+      return
+    }
+
+    if (previousRole === "voter" && currentRole !== "voter" && this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
   }
 }

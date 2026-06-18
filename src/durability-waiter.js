@@ -16,14 +16,36 @@ export class DurabilityWaiter {
    * @param {number} required
    */
   async waitFor(seq, required) {
+    return this.waitForGroups(seq, [
+      {
+        eligibleNodeIds: null,
+        requiredCount: required
+      }
+    ])
+  }
+
+  /**
+   * @param {number} seq
+   * @param {Array<{ eligibleNodeIds: string[] | null, requiredCount: number }>} groups
+   * @param {string[]} [initialNodeIds]
+   */
+  async waitForGroups(seq, groups, initialNodeIds = []) {
     const key = this.#waiterKey(seq)
     const existing = this.waiters.get(key) ?? {
       nodes: new Set(),
+      groups: groups.map((group) => ({
+        eligibleNodeIds: group.eligibleNodeIds ? new Set(group.eligibleNodeIds) : null,
+        requiredCount: group.requiredCount
+      })),
       resolve: null,
       reject: null,
       timer: null,
       promise: null,
       handledPromise: null
+    }
+
+    for (const nodeId of initialNodeIds) {
+      existing.nodes.add(nodeId)
     }
 
     if (!existing.promise) {
@@ -41,7 +63,7 @@ export class DurabilityWaiter {
       this.waiters.set(key, existing)
     }
 
-    if (existing.nodes.size >= required) {
+    if (this.#groupsSatisfied(existing)) {
       clearTimeout(existing.timer)
       this.waiters.delete(key)
       this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
@@ -60,7 +82,7 @@ export class DurabilityWaiter {
     if (!waiter) return
 
     waiter.nodes.add(nodeId)
-    if (waiter.nodes.size >= this.options.requiredFollowerAcks) {
+    if (this.#groupsSatisfied(waiter)) {
       clearTimeout(waiter.timer)
       this.waiters.delete(this.#waiterKey(seq))
       this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
@@ -85,5 +107,21 @@ export class DurabilityWaiter {
    */
   #waiterKey(seq) {
     return `${this.options.feedKey}:${seq}`
+  }
+
+  /**
+   * @param {{ nodes: Set<string>, groups: Array<{ eligibleNodeIds: Set<string> | null, requiredCount: number }> }} waiter
+   */
+  #groupsSatisfied(waiter) {
+    return waiter.groups.every((group) => {
+      if (group.requiredCount <= 0) return true
+
+      const matchedCount =
+        group.eligibleNodeIds === null
+          ? waiter.nodes.size
+          : [...waiter.nodes].filter((nodeId) => group.eligibleNodeIds.has(nodeId)).length
+
+      return matchedCount >= group.requiredCount
+    })
   }
 }

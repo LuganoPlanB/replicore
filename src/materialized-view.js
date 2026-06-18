@@ -22,6 +22,14 @@ export class MaterializedView {
       return
     }
 
+    if (operation.kind === "membership") {
+      await this.setCommittedProgress(feedKey, {
+        applied: operation.seq + 1,
+        lastOpId: operation.opId
+      })
+      return
+    }
+
     const batch = this.bee.batch()
     const keyspace = /** @type {string} */ (operation.keyspace)
     const key = /** @type {string} */ (operation.key)

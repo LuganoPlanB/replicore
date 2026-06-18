@@ -59,6 +59,7 @@ export function buildWritersStatus({
   revokedNodeIds,
   encryptionKeyId,
   membershipFingerprint,
+  membership,
   authorizedNodes
 }) {
   return {
@@ -67,6 +68,7 @@ export function buildWritersStatus({
     revokedNodeIds,
     encryptionKeyId,
     membershipFingerprint,
+    membership,
     authorizedNodes
   }
 }

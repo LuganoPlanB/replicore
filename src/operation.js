@@ -23,6 +23,17 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
  *   prevIndex?: number,
  *   prevHash?: string | null,
  *   kind?: "kv" | "heartbeat",
+ *   membership?: null | {
+ *     phase: "joint" | "final",
+ *     changeType: "promotion" | "removal",
+ *     targetNodeId: string,
+ *     fromVersion: number,
+ *     toVersion: number,
+ *     oldVoters: string[],
+ *     newVoters: string[],
+ *     learners: string[],
+ *     removed: string[]
+ *   },
  *   heartbeat?: null | {
  *     observedLeader: string | null,
  *     reachableLeader: boolean,
@@ -58,6 +69,7 @@ export function createSignedOperation(input) {
     key: input.key,
     keyspace: input.keyspace ?? "default",
     value,
+    membership: input.membership ?? null,
     heartbeat: input.heartbeat ?? null,
     ts,
     expiresAt,
@@ -163,6 +175,16 @@ export function validateOperation(operation, expected, options = {}) {
     }
     if (typeof operation.heartbeat !== "object" || operation.heartbeat === null) {
       throw new Error("Heartbeat operation must include heartbeat metadata")
+    }
+    return
+  }
+
+  if (operation.kind === "membership") {
+    if (operation.type !== "put") {
+      throw new Error("Membership operations must use type=put")
+    }
+    if (typeof operation.membership !== "object" || operation.membership === null) {
+      throw new Error("Membership operation must include membership metadata")
     }
     return
   }

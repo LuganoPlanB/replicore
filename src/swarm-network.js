@@ -23,6 +23,7 @@ export class SwarmNetwork {
     this.connections = new Set()
     this.remoteNodeIdsByConnectionKey = new Map()
     this.observedNodeIdsByConnectionKey = new Map()
+    this.peerPublicKeyByObservedNodeId = new Map()
     this.networkPolicy = options.networkPolicy ?? null
   }
 
@@ -103,12 +104,14 @@ export class SwarmNetwork {
     if (!connectionKey) return
 
     this.observedNodeIdsByConnectionKey.set(connectionKey, nodeId)
+    this.peerPublicKeyByObservedNodeId.set(nodeId, connectionKey)
     this.#enforceConnectionPolicyForKey(connectionKey)
   }
 
   clear() {
     this.remoteNodeIdsByConnectionKey.clear()
     this.observedNodeIdsByConnectionKey.clear()
+    this.peerPublicKeyByObservedNodeId.clear()
   }
 
   get connectionCount() {
@@ -160,6 +163,13 @@ export class SwarmNetwork {
       }
     }
     return false
+  }
+
+  /**
+   * @param {string} nodeId
+   */
+  peerPublicKeyForNodeId(nodeId) {
+    return this.peerPublicKeyByObservedNodeId.get(nodeId) ?? null
   }
 
   #allowedNodeIds() {
