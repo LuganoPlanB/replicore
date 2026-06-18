@@ -125,7 +125,8 @@ export class HolepunchSwarmNode {
     })
     this.joinState = {
       accepted: false,
-      leaderNodeId: null
+      leaderNodeId: null,
+      recovery: null
     }
     this.sentJoinRequestKeys = new Set()
     this.seenJoinRequestNonces = new Set()
@@ -750,14 +751,77 @@ export class HolepunchSwarmNode {
   }
 
   async createSnapshot() {
-    return this.view.exportSnapshot()
+    const content = await this.view.exportSnapshot()
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return content
+    }
+
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const snapshot = {
+      version: 2,
+      createdAt: new Date().toISOString(),
+      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId(),
+      membershipVersion: this.membershipState.current.version,
+      lastIncludedIndex: this.consensusState.lastApplied,
+      lastIncludedTerm: authoritativeLog.lastLogTerm,
+      content
+    }
+    return {
+      ...snapshot,
+      contentHash: this.#snapshotContentHash(snapshot)
+    }
   }
 
   /**
    * @param {{ version: number, entries: Array<{ key: string, value: unknown }> }} snapshot
    */
   async restoreSnapshot(snapshot) {
+    const envelope = this.#normalizeSnapshotEnvelope(snapshot)
+    if (envelope) {
+      const expectedHash = this.#snapshotContentHash({
+        version: envelope.version,
+        createdAt: envelope.createdAt,
+        leaderNodeId: envelope.leaderNodeId,
+        membershipVersion: envelope.membershipVersion,
+        lastIncludedIndex: envelope.lastIncludedIndex,
+        lastIncludedTerm: envelope.lastIncludedTerm,
+        content: envelope.content
+      })
+      if (expectedHash !== envelope.contentHash) {
+        throw new Error("Snapshot content hash mismatch")
+      }
+      if (this.currentLeader() && envelope.leaderNodeId && envelope.leaderNodeId !== this.currentLeader()) {
+        throw new Error("Snapshot leader identity does not match current leader")
+      }
+      await this.view.importSnapshot(envelope.content)
+      if (Number.isInteger(envelope.lastIncludedIndex)) {
+        this.consensusState = await this.consensusStateStore.save({
+          commitIndex: Math.max(this.consensusState.commitIndex, envelope.lastIncludedIndex),
+          lastApplied: Math.max(this.consensusState.lastApplied, envelope.lastIncludedIndex)
+        })
+      }
+      this.diagnosticState.reconciliation = {
+        state: "snapshot-installed",
+        at: new Date().toISOString(),
+        detail: envelope.leaderNodeId ?? "unknown-leader"
+      }
+      await this.syncAuthoritativeLog()
+      return
+    }
+
     await this.view.importSnapshot(snapshot)
+  }
+
+  #normalizeSnapshotEnvelope(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return null
+    if (snapshot.version !== 2) return null
+    if (!snapshot.content || typeof snapshot.content !== "object") return null
+    if (typeof snapshot.contentHash !== "string" || snapshot.contentHash.length === 0) return null
+    return snapshot
+  }
+
+  #snapshotContentHash(snapshot) {
+    return createHash("sha256").update(canonicalize(snapshot)).digest("hex")
   }
 
   /**
@@ -855,17 +919,55 @@ export class HolepunchSwarmNode {
     }
   }
 
+  async #runAntiEntropyPull() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() === this.options.identity.publicKeyId) return
+
+    const leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
+    if (!leaderNodeId || !this.#isLeaderReachable(leaderNodeId)) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const localApplied = await this.view.getApplied(feedKey)
+    const advertisedCommitIndex = this.#advertisedLeaderCommitIndex(leaderNodeId)
+    const targetLength = advertisedCommitIndex + 1
+    if (targetLength <= localApplied && !this.#isSplitFenced()) return
+
+    this.diagnosticState.reconciliation = {
+      state: "anti-entropy-pull",
+      at: new Date().toISOString(),
+      detail: `leader:${leaderNodeId}`
+    }
+    await this.syncAuthoritativeLog()
+    await this.#advanceCommittedFeed(Math.max(localApplied, targetLength))
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "anti-entropy-pull"
+    }
+  }
+
   #scheduleAuthoritativeSyncTimer() {
     if (this.closing || !this.#usesSharedAuthoritativeLog() || this.authoritativeSyncTimer) return
 
     this.authoritativeSyncTimer = setInterval(() => {
-      void this.syncAuthoritativeLog().catch((error) => {
+      void this.#runAntiEntropyPull().catch((error) => {
         if (!this.closing && !this.#isIgnoredSyncError(error)) {
           throw error
         }
       })
     }, this.options.heartbeatIntervalMs)
     this.authoritativeSyncTimer.unref?.()
+  }
+
+  #advertisedLeaderCommitIndex(leaderNodeId) {
+    if (leaderNodeId === this.options.identity.publicKeyId) {
+      return this.consensusState.commitIndex
+    }
+    const heartbeat = this.lastHeartbeatByNode.get(leaderNodeId)
+    if (!heartbeat) return this.consensusState.commitIndex
+    const leaderCommitIndex = heartbeat.appliedFeeds?.[this.#authoritativeLogFeedKey()]
+    if (!Number.isInteger(leaderCommitIndex)) return this.consensusState.commitIndex
+    return Math.max(this.consensusState.commitIndex, leaderCommitIndex - 1)
   }
 
   /**
@@ -1317,7 +1419,10 @@ export class HolepunchSwarmNode {
   async #startNetworking() {
     const topic = await deriveTopic(this.options)
     this.joinControl ??= new JoinControl({
-      onChannelOpen: (session) => this.#maybeSendJoinRequest(session),
+      onChannelOpen: (session) => {
+        this.#maybeSendJoinRequest(session)
+        this.#maybeSendRecoveryWatermarkRequest(session)
+      },
       onJoinRequest: (session, message) => {
         void this.#handleJoinRequest(session, message).catch((error) => {
           if (!this.closing) {
@@ -2514,6 +2619,118 @@ export class HolepunchSwarmNode {
     return record
   }
 
+  async #createRecoveryWatermark() {
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const heartbeats = await this.view.getHeartbeats()
+    const leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
+    return {
+      leaderNodeId,
+      term: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
+      splitFenced: this.#isSplitFenced(),
+      consensus: {
+        commitIndex: this.consensusState.commitIndex,
+        appliedIndex: this.consensusState.lastApplied
+      },
+      authoritativeLog: {
+        lastLogIndex: authoritativeLog.lastLogIndex,
+        lastLogTerm: authoritativeLog.lastLogTerm,
+        lastLogHash: authoritativeLog.lastLogHash,
+        snapshotIndex: Math.max(-1, (await this.view.getApplied(this.#authoritativeLogFeedKey())) - 1)
+      },
+      witnessLiveness: this.#witnessLivenessSummary(heartbeats, leaderNodeId),
+      leaderHints: {
+        nodeId: leaderNodeId,
+        peerPublicKey: leaderNodeId ? (this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? null) : null
+      }
+    }
+  }
+
+  #witnessLivenessSummary(heartbeats, leaderNodeId) {
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    let freshWitnessCount = 0
+    for (const nodeId of this.#effectiveVoterNodeIds()) {
+      if (nodeId === leaderNodeId) continue
+      if (nodeId === this.options.identity.publicKeyId) continue
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) continue
+      const ts = Date.parse(heartbeat.ts)
+      if (!Number.isFinite(ts) || ts < freshnessCutoff) continue
+      freshWitnessCount += 1
+    }
+    return {
+      freshWitnessCount,
+      reachableVoters: this.#reachableVotingNodeIds(),
+      quorum: this.#majoritySize(this.#effectiveVoterNodeIds().length)
+    }
+  }
+
+  async #adoptRecoveryWatermark(recovery) {
+    if (!recovery || typeof recovery !== "object") return
+    this.joinState.recovery = recovery
+
+    const leaderNodeId = recovery.leaderNodeId
+    if (
+      leaderNodeId &&
+      leaderNodeId !== this.options.identity.publicKeyId &&
+      this.#membershipRole(leaderNodeId) === "voter"
+    ) {
+      this.joinState.leaderNodeId = leaderNodeId
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+    }
+
+    await this.#repairFromRecoveryWatermark(recovery)
+  }
+
+  async #repairFromRecoveryWatermark(recovery) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    const leaderNodeId = recovery.leaderNodeId
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return
+    if (this.#membershipRole(leaderNodeId) !== "voter") return
+    if (!this.#isLeaderReachable(leaderNodeId)) return
+
+    const authoritative = recovery.authoritativeLog ?? {}
+    const consensus = recovery.consensus ?? {}
+    const leaderLastLogIndex = Number.isInteger(authoritative.lastLogIndex) ? authoritative.lastLogIndex : -1
+    const leaderLength = Math.max(0, leaderLastLogIndex + 1)
+    const leaderLastLogHash = typeof authoritative.lastLogHash === "string" ? authoritative.lastLogHash : null
+    const feedKey = this.#authoritativeLogFeedKey()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const core = this.#authoritativeLogCore()
+
+    if (leaderLength >= committedApplied && core.length > leaderLength) {
+      this.diagnosticState.reconciliation = {
+        state: "truncating-tail",
+        at: new Date().toISOString(),
+        detail: "recovery-watermark-length"
+      }
+      await this.#truncateAuthoritativeTail(leaderLength, "recovery-watermark-length")
+    }
+    if (leaderLastLogHash && leaderLength > 0 && core.length >= leaderLength) {
+      const localTail = await core.get(leaderLength - 1)
+      if (localTail?.entryHash !== leaderLastLogHash) {
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "recovery-watermark-hash"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "recovery-watermark-hash")
+      }
+    }
+
+    await this.syncAuthoritativeLog()
+    const targetLength = Number.isInteger(consensus.commitIndex) ? Math.max(0, consensus.commitIndex + 1) : committedApplied
+    await this.#advanceCommittedFeed(targetLength)
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "recovery-watermark"
+    }
+  }
+
   #maybeSendJoinRequest(session) {
     if (
       this.closing ||
@@ -2527,6 +2744,19 @@ export class HolepunchSwarmNode {
 
     this.sentJoinRequestKeys.add(session.remotePublicKeyHex)
     session.sendRequest(this.#createJoinRequest())
+  }
+
+  #maybeSendRecoveryWatermarkRequest(session) {
+    if (this.closing || !this.#usesSharedAuthoritativeLog()) return
+    if (!this.#isLearner() && !this.#isSplitFenced()) return
+    if (this.#isLearner() && !this.joinState.accepted) return
+    if (this.currentLeader() === this.options.identity.publicKeyId) return
+    if (this.#isSplitFenced() && this.#lastKnownLeaderId() && this.#lastKnownLeaderId() !== this.options.identity.publicKeyId) {
+      const knownLeaderKey = this.network?.peerPublicKeyForNodeId(this.#lastKnownLeaderId())
+      if (knownLeaderKey && knownLeaderKey !== session.remotePublicKeyHex) return
+    }
+
+    session.sendRequest(this.#createRecoveryWatermarkRequest())
   }
 
   #createJoinRequest() {
@@ -2552,10 +2782,30 @@ export class HolepunchSwarmNode {
     }
   }
 
+  #createRecoveryWatermarkRequest() {
+    return {
+      v: 1,
+      type: "replicore.recovery-watermark-request",
+      nodeId: this.options.identity.publicKeyId,
+      issuedAt: new Date().toISOString()
+    }
+  }
+
   async #handleJoinRequest(session, message) {
-    if (!message || message.type !== "replicore.join-request") return
+    if (!message) return
+    if (message.type === "replicore.recovery-watermark-request") {
+      session.sendResponse({
+        v: 1,
+        type: "replicore.recovery-watermark",
+        ok: true,
+        recovery: await this.#createRecoveryWatermark()
+      })
+      return
+    }
+    if (message.type !== "replicore.join-request") return
 
     const currentLeader = this.currentLeader()
+    const recovery = await this.#createRecoveryWatermark()
     if (currentLeader !== this.options.identity.publicKeyId) {
       const leaderHint = currentLeader ?? this.#lastKnownLeaderId()
       session.sendResponse({
@@ -2564,6 +2814,7 @@ export class HolepunchSwarmNode {
         ok: false,
         redirect: true,
         leaderNodeId: leaderHint,
+        recovery,
         errorCode: currentLeader ? "NOT_LEADER" : "LEADER_UNAVAILABLE",
         error: leaderHint
           ? "Join requests must be handled by the current leader"
@@ -2617,6 +2868,7 @@ export class HolepunchSwarmNode {
           commitIndex: this.consensusState.commitIndex,
           lastApplied: this.consensusState.lastApplied
         },
+        recovery,
         readOnly: true
       })
     } catch (error) {
@@ -2628,6 +2880,7 @@ export class HolepunchSwarmNode {
         redirect: false,
         leaderNodeId: this.options.identity.publicKeyId,
         errorCode,
+        recovery,
         error: error instanceof Error ? error.message : String(error),
         ...(errorCode === "REMOVED_IDENTITY"
             ? {
@@ -2661,7 +2914,17 @@ export class HolepunchSwarmNode {
   }
 
   async #handleJoinResponse(_session, message) {
-    if (!message || message.type !== "replicore.join-response") return
+    if (!message) return
+    if (message.type === "replicore.recovery-watermark") {
+      if (message.ok && message.recovery) {
+        await this.#adoptRecoveryWatermark(message.recovery)
+      }
+      return
+    }
+    if (message.type !== "replicore.join-response") return
+    if (message.recovery) {
+      await this.#adoptRecoveryWatermark(message.recovery)
+    }
     if (!message.ok) {
       if (message.membership) {
         await this.#adoptJoinMembershipSnapshot(message)
@@ -2691,7 +2954,8 @@ export class HolepunchSwarmNode {
 
     this.joinState = {
       accepted: true,
-      leaderNodeId: message.leaderNodeId ?? null
+      leaderNodeId: message.leaderNodeId ?? null,
+      recovery: message.recovery ?? null
     }
     if (message.leaderNodeId) {
       this.consensusEngine.noteKnownLeader({
