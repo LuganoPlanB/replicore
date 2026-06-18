@@ -2623,6 +2623,10 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
 
   try {
     const encryptionKey = randomBytes(32)
+    const durability = {
+      requiredFollowerAcks: 1,
+      timeoutMs: 20_000
+    }
     const leaderIdentity = generateIdentity(seed("leader"))
     const followerIdentity = generateIdentity(seed("follower-1"))
     const observerIdentity = generateIdentity(seed("follower-2"))
@@ -2643,6 +2647,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       identity: leaderIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const follower = new HolepunchSwarmNode({
@@ -2652,6 +2657,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       identity: followerIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     const observer = new HolepunchSwarmNode({
@@ -2661,6 +2667,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       identity: observerIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
 
@@ -2691,6 +2698,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       identity: restoreIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: []
     })
     await restoredOffline.start()
@@ -2721,6 +2729,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       identity: restoreIdentity,
       authorizedNodes,
       encryptionKey,
+      durability,
       bootstrap: testnet.bootstrap
     })
     await restoredOnline.start()
