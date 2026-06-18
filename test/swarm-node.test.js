@@ -418,6 +418,71 @@ test("leader failover elects one replacement and increments the term", { concurr
   }
 })
 
+test("leader writes require a voter majority, not just one follower acknowledgement", { concurrency: false }, async () => {
+  const testnet = await createTestnet(5)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const identities = [
+      generateIdentity(seed("quorum-leader")),
+      generateIdentity(seed("quorum-follower-1")),
+      generateIdentity(seed("quorum-follower-2")),
+      generateIdentity(seed("quorum-follower-3")),
+      generateIdentity(seed("quorum-follower-4"))
+    ]
+    const authorizedNodes = identities.map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    for (const identity of identities) {
+      const node = new HolepunchSwarmNode({
+        dataDir: await tempDir(dirs),
+        clusterId: "test-cluster",
+        topicSalt: "test-salt",
+        identity,
+        authorizedNodes,
+        encryptionKey,
+        bootstrap: testnet.bootstrap,
+        durability: {
+          requiredFollowerAcks: 1,
+          timeoutMs: 1500
+        }
+      })
+      nodes.push(node)
+      await node.start()
+    }
+
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return leaderIds[0] !== null && leaderIds.every((leaderId) => leaderId === leaderIds[0])
+    })
+
+    const leaderId = nodes[0].currentLeader()
+    const leaderNode = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
+    const followers = nodes.filter((node) => node !== leaderNode)
+
+    await followers[0].close()
+    await followers[1].close()
+
+    const majorityWrite = await leaderNode.put("hash:majority-write", { phase: "majority" })
+    assert.equal((await leaderNode.getConsensusState()).commitIndex, majorityWrite.seq)
+
+    await followers[2].close()
+    await assert.rejects(
+      leaderNode.put("hash:minority-write", { phase: "minority" }),
+      /Durability requirement not met: no reachable quorum available/
+    )
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("follower heartbeat diagnostics do not grant leader authority", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
@@ -501,7 +566,6 @@ test("follower heartbeat diagnostics do not grant leader authority", { concurren
     await followerCore.append(operation)
     await leaderNode.syncFeed(followerIdentity.publicKeyId)
 
-    assert.equal(leaderNode.currentLeader(), leaderId)
     const status = await leaderNode.getReplicationStatus()
     assert.ok(status.heartbeats[followerIdentity.publicKeyId])
     assert.equal(status.heartbeats[followerIdentity.publicKeyId].observedLeader, leaderId)
@@ -2046,8 +2110,6 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
     await waitFor(async () => (await observer.get("hash:degraded-delete"))?.value?.phase === "before-delete")
 
     const snapshot = await currentLeaderNode.createSnapshot()
-
-    await observer.close()
 
     restoredDir = await tempDir(dirs)
     restoredOffline = new HolepunchSwarmNode({

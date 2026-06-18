@@ -932,9 +932,9 @@ export class HolepunchSwarmNode {
   }
 
   async #appendKvOperation(type, key, value, options) {
-    const followerRequirement = this.options.durability.requiredFollowerAcks
-    if (this.#aliveFollowers().length < followerRequirement) {
-      throw new Error("Durability requirement not met: no reachable follower available")
+    const quorumGroups = this.#writeQuorumGroups()
+    if (!this.#hasReachableQuorum(quorumGroups)) {
+      throw new Error("Durability requirement not met: no reachable quorum available")
     }
 
     let operation = null
@@ -959,7 +959,11 @@ export class HolepunchSwarmNode {
         encryptionKeyId: this.encryption.currentKeyId,
         ttlMs: options.ttlMs
       })
-      ackPromise = this.durabilityWaiter.waitFor(operation.seq, followerRequirement)
+      ackPromise = this.durabilityWaiter.waitForGroups(
+        operation.seq,
+        quorumGroups,
+        [this.options.identity.publicKeyId]
+      )
       ackPromise.catch(() => {})
       await this.#localCore().append(operation)
     })
@@ -1084,15 +1088,32 @@ export class HolepunchSwarmNode {
     return node
   }
 
-  #aliveFollowers() {
-    const leader = this.options.identity.publicKeyId
-    const now = Date.now()
-    return [...this.lastHeartbeatByNode.entries()]
-      .filter(([nodeId]) => nodeId !== leader)
-      .filter(([nodeId]) => this.#membershipRole(nodeId) === "voter")
-      .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
-      .filter(([nodeId]) => this.#isLeaderReachable(nodeId))
-      .map(([nodeId]) => nodeId)
+  #reachableVotingNodeIds() {
+    return this.#effectiveVoterNodeIds().filter((nodeId) => this.#isLeaderReachable(nodeId))
+  }
+
+  #writeQuorumGroups() {
+    const joint = this.#jointMembership()
+    if (joint) {
+      return this.#jointQuorumGroups(joint)
+    }
+    return [
+      {
+        eligibleNodeIds: this.membershipState.current.voters,
+        requiredCount: this.#majoritySize(this.membershipState.current.voters.length)
+      }
+    ]
+  }
+
+  #hasReachableQuorum(groups) {
+    const reachable = new Set(this.#reachableVotingNodeIds())
+    return groups.every((group) => {
+      if (group.requiredCount <= 0) return true
+      const matchedCount = group.eligibleNodeIds
+        ? group.eligibleNodeIds.filter((nodeId) => reachable.has(nodeId)).length
+        : reachable.size
+      return matchedCount >= group.requiredCount
+    })
   }
 
   #role() {
@@ -1231,6 +1252,12 @@ export class HolepunchSwarmNode {
         if (operation.kind === "membership") {
           await this.#applyCommittedMembershipOperation(operation)
         }
+      }
+      if (nodeId === this.options.identity.publicKeyId) {
+        this.consensusState = await this.consensusStateStore.save({
+          commitIndex: operation.seq,
+          lastApplied: operation.seq
+        })
       }
       committedApplied += 1
     }
@@ -1902,6 +1929,10 @@ export class HolepunchSwarmNode {
     removed,
     quorumGroups
   }) {
+    if (!this.#hasReachableQuorum(quorumGroups)) {
+      throw new Error("Durability requirement not met: no reachable quorum available")
+    }
+
     let operation = null
     let ackPromise = null
     await this.#withLocalAppendLock(async () => {
