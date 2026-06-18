@@ -669,19 +669,24 @@ export class HolepunchSwarmNode {
     if (this.#isLearner()) return
 
     const leader = this.currentLeader()
-    const heartbeat = {
-      observedLeader: leader,
-      reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
-      appliedFeeds: await this.#appliedFeeds(),
-      rejectedFeeds: await this.#rejectedFeeds(),
-      membershipFingerprint: this.#membershipFingerprint()
-    }
-
     if (this.closing) return
 
     try {
       await this.#withLocalAppendLock(async () => {
         const previousOperation = await this.#previousLocalOperation()
+        const heartbeat = {
+          leaderId: leader,
+          leaderCommitIndex: this.consensusState.commitIndex,
+          membershipVersion: this.membershipState.current.version,
+          prevLogIndex: previousOperation?.index ?? -1,
+          prevLogTerm: previousOperation?.term ?? -1,
+          prevLogHash: previousOperation?.entryHash ?? null,
+          observedLeader: leader,
+          reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
+          appliedFeeds: await this.#appliedFeeds(),
+          rejectedFeeds: await this.#rejectedFeeds(),
+          membershipFingerprint: this.#membershipFingerprint()
+        }
         const operation = createSignedOperation({
           kind: "heartbeat",
           type: "put",
@@ -847,11 +852,16 @@ export class HolepunchSwarmNode {
   }
 
   async #observeRemoteOperation(nodeId, operation) {
+    const previousOperation = operation?.seq > 0
+      ? await this.feedCores.get(nodeId)?.get(operation.seq - 1)
+      : null
     const observation = this.consensusEngine.observeRemoteOperation({
       nodeId,
       voterNodeIds: this.membershipState.current.voters,
       currentTerm: this.consensusState.currentTerm,
+      localMembershipVersion: this.membershipState.current.version,
       operation,
+      previousOperation,
       electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
     })
     if (observation.persistPatch) {

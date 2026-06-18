@@ -140,11 +140,23 @@ test("accepted heartbeat resets leader lease and exposes the current leader", ()
     nodeId: "node-a",
     voterNodeIds: ["node-a", "node-b", "node-c"],
     currentTerm: 6,
+    localMembershipVersion: 2,
     electionTimeoutMaxMs: 900,
+    previousOperation: {
+      index: 11,
+      term: 6,
+      entryHash: "prev-hash"
+    },
     operation: {
       kind: "heartbeat",
       term: 6,
       heartbeat: {
+        leaderId: "node-a",
+        leaderCommitIndex: 11,
+        membershipVersion: 2,
+        prevLogIndex: 11,
+        prevLogTerm: 6,
+        prevLogHash: "prev-hash",
         observedLeader: "node-a"
       }
     }
@@ -154,6 +166,70 @@ test("accepted heartbeat resets leader lease and exposes the current leader", ()
   assert.equal(engine.currentLeader({ isLearner: false, heartbeatTtlMs: 100 }), "node-a")
   now += 901
   assert.equal(engine.currentLeader({ isLearner: false, heartbeatTtlMs: 100 }), null)
+})
+
+test("stale-term heartbeat is rejected for authority", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const observation = engine.observeRemoteOperation({
+    nodeId: "node-a",
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    currentTerm: 6,
+    localMembershipVersion: 2,
+    electionTimeoutMaxMs: 900,
+    previousOperation: {
+      index: 11,
+      term: 6,
+      entryHash: "prev-hash"
+    },
+    operation: {
+      kind: "heartbeat",
+      term: 5,
+      heartbeat: {
+        leaderId: "node-a",
+        leaderCommitIndex: 11,
+        membershipVersion: 2,
+        prevLogIndex: 11,
+        prevLogTerm: 6,
+        prevLogHash: "prev-hash",
+        observedLeader: "node-a"
+      }
+    }
+  })
+
+  assert.equal(observation.acceptedLeader, false)
+  assert.equal(observation.refusalReason, "stale-term")
+})
+
+test("heartbeat authority rejects log mismatch", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const observation = engine.observeRemoteOperation({
+    nodeId: "node-a",
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    currentTerm: 6,
+    localMembershipVersion: 2,
+    electionTimeoutMaxMs: 900,
+    previousOperation: {
+      index: 11,
+      term: 6,
+      entryHash: "prev-hash"
+    },
+    operation: {
+      kind: "heartbeat",
+      term: 6,
+      heartbeat: {
+        leaderId: "node-a",
+        leaderCommitIndex: 11,
+        membershipVersion: 2,
+        prevLogIndex: 11,
+        prevLogTerm: 6,
+        prevLogHash: "wrong-hash",
+        observedLeader: "node-a"
+      }
+    }
+  })
+
+  assert.equal(observation.acceptedLeader, false)
+  assert.equal(observation.refusalReason, "prev-hash-mismatch")
 })
 
 test("higher-term vote request steps down and grants an up-to-date voter", () => {
@@ -251,6 +327,49 @@ test("membership version mismatch rejects the vote but still records a higher te
     currentTerm: 7,
     votedFor: null
   })
+})
+
+test("higher-term heartbeat causes step-down before accepting leader authority", () => {
+  const engine = new ConsensusEngine({ localNodeId: "node-b", now: () => 10 })
+  const becameLeader = engine.becomeLeader({
+    term: 4,
+    currentTerm: 4,
+    electionTimeoutMaxMs: 500
+  })
+  assert.equal(becameLeader.becameLeader, true)
+
+  const observation = engine.observeRemoteOperation({
+    nodeId: "node-a",
+    voterNodeIds: ["node-a", "node-b", "node-c"],
+    currentTerm: 4,
+    localMembershipVersion: 2,
+    electionTimeoutMaxMs: 900,
+    previousOperation: {
+      index: 11,
+      term: 4,
+      entryHash: "prev-hash"
+    },
+    operation: {
+      kind: "heartbeat",
+      term: 5,
+      heartbeat: {
+        leaderId: "node-a",
+        leaderCommitIndex: 11,
+        membershipVersion: 2,
+        prevLogIndex: 11,
+        prevLogTerm: 4,
+        prevLogHash: "prev-hash",
+        observedLeader: "node-a"
+      }
+    }
+  })
+
+  assert.equal(engine.role, "follower")
+  assert.deepEqual(observation.persistPatch, {
+    currentTerm: 5,
+    votedFor: null
+  })
+  assert.equal(observation.acceptedLeader, true)
 })
 
 test("wrapper-style write authority follows consensus output instead of heartbeat maps", () => {

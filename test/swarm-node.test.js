@@ -418,6 +418,100 @@ test("leader failover elects one replacement and increments the term", { concurr
   }
 })
 
+test("follower heartbeat diagnostics do not grant leader authority", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const firstIdentity = generateIdentity(seed("diagnostic-heartbeat-first"))
+    const secondIdentity = generateIdentity(seed("diagnostic-heartbeat-second"))
+    const authorizedNodes = [firstIdentity, secondIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: firstIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-cluster",
+      topicSalt: "test-salt",
+      identity: secondIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(first, second)
+    await first.start()
+    await second.start()
+
+    let leaderNode = null
+    await waitFor(async () => {
+      const convergedLeaderId = first.currentLeader()
+      if (convergedLeaderId === null || convergedLeaderId !== second.currentLeader()) return false
+      leaderNode = [first, second].find((node) => node.currentLeader() === node.options.identity.publicKeyId) ?? null
+      return leaderNode !== null
+    })
+    const leaderId = leaderNode.currentLeader()
+    const followerNode = leaderNode === first ? second : first
+    const followerIdentity = followerNode === first ? firstIdentity : secondIdentity
+
+    const followerCore = followerNode.feedCores.get(followerIdentity.publicKeyId)
+    const slot = followerCore.length
+    const previous = slot === 0 ? null : await followerCore.get(slot - 1)
+    const operation = createSignedOperation({
+      kind: "heartbeat",
+      type: "put",
+      key: `heartbeat:${followerIdentity.publicKeyId}`,
+      keyspace: "system",
+      seq: slot,
+      term: (await followerNode.getConsensusState()).currentTerm,
+      index: slot,
+      prevIndex: previous?.index ?? -1,
+      prevHash: previous?.entryHash ?? null,
+      feed: followerIdentity.feedKey,
+      actor: followerIdentity.publicKeyId,
+      secretKey: followerIdentity.secretKey,
+      encryptionKey,
+      heartbeat: {
+        leaderId,
+        leaderCommitIndex: (await followerNode.getConsensusState()).commitIndex,
+        membershipVersion: 0,
+        prevLogIndex: previous?.index ?? -1,
+        prevLogTerm: previous?.term ?? -1,
+        prevLogHash: previous?.entryHash ?? null,
+        observedLeader: leaderId,
+        reachableLeader: true,
+        appliedFeeds: {},
+        rejectedFeeds: {},
+        membershipFingerprint: "diagnostic-only"
+      }
+    })
+    await followerCore.append(operation)
+    await leaderNode.syncFeed(followerIdentity.publicKeyId)
+
+    assert.equal(leaderNode.currentLeader(), leaderId)
+    const status = await leaderNode.getReplicationStatus()
+    assert.ok(status.heartbeats[followerIdentity.publicKeyId])
+    assert.equal(status.heartbeats[followerIdentity.publicKeyId].observedLeader, leaderId)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("consensus state persists votedFor across restart", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
@@ -1625,6 +1719,12 @@ test("sync rejects a feed entry with a bad previous hash", { concurrency: false 
       secretKey: identity.secretKey,
       encryptionKey: randomBytes(32),
       heartbeat: {
+        leaderId: identity.publicKeyId,
+        leaderCommitIndex: slot,
+        membershipVersion: 0,
+        prevLogIndex: previous?.index ?? -1,
+        prevLogTerm: previous?.term ?? -1,
+        prevLogHash: previous?.entryHash ?? null,
         observedLeader: identity.publicKeyId,
         reachableLeader: true,
         appliedFeeds: {},
@@ -1659,6 +1759,12 @@ test("sync rejects a feed entry with a corrupted signature", { concurrency: fals
       secretKey: identity.secretKey,
       encryptionKey: randomBytes(32),
       heartbeat: {
+        leaderId: identity.publicKeyId,
+        leaderCommitIndex: slot,
+        membershipVersion: 0,
+        prevLogIndex: previous?.index ?? -1,
+        prevLogTerm: previous?.term ?? -1,
+        prevLogHash: previous?.entryHash ?? null,
         observedLeader: identity.publicKeyId,
         reachableLeader: true,
         appliedFeeds: {},

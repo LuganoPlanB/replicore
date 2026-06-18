@@ -231,11 +231,21 @@ export class ConsensusEngine {
    *   nodeId: string,
    *   voterNodeIds: string[],
    *   currentTerm: number,
+   *   localMembershipVersion?: number,
    *   operation: any,
+   *   previousOperation?: any,
    *   electionTimeoutMaxMs: number
    * }} options
    */
-  observeRemoteOperation({ nodeId, voterNodeIds, currentTerm, operation, electionTimeoutMaxMs }) {
+  observeRemoteOperation({
+    nodeId,
+    voterNodeIds,
+    currentTerm,
+    localMembershipVersion,
+    operation,
+    previousOperation,
+    electionTimeoutMaxMs
+  }) {
     if (nodeId === this.localNodeId) return { persistPatch: null, acceptedLeader: false }
     if (!voterNodeIds.includes(nodeId)) return { persistPatch: null, acceptedLeader: false }
     if (!operation || !Number.isInteger(operation.term)) return { persistPatch: null, acceptedLeader: false }
@@ -254,11 +264,14 @@ export class ConsensusEngine {
     }
 
     let acceptedLeader = false
-    if (
-      operation.kind === "heartbeat" &&
-      operation.term === currentTerm &&
-      operation.heartbeat?.observedLeader === nodeId
-    ) {
+    const authority = this.#evaluateHeartbeatAuthority({
+      nodeId,
+      currentTerm,
+      localMembershipVersion,
+      operation,
+      previousOperation
+    })
+    if (authority.accepted) {
       const now = this.now()
       this.state.role = "follower"
       this.state.leaderNodeId = nodeId
@@ -267,7 +280,11 @@ export class ConsensusEngine {
       acceptedLeader = true
     }
 
-    return { persistPatch, acceptedLeader }
+    return {
+      persistPatch,
+      acceptedLeader,
+      refusalReason: authority.refusalReason
+    }
   }
 
   /**
@@ -297,6 +314,45 @@ export class ConsensusEngine {
         refusalReason
       }
     }
+  }
+
+  #evaluateHeartbeatAuthority({ nodeId, currentTerm, localMembershipVersion, operation, previousOperation }) {
+    if (operation.kind !== "heartbeat") {
+      return { accepted: false, refusalReason: "not-heartbeat" }
+    }
+
+    const heartbeat = operation.heartbeat
+    if (!heartbeat || typeof heartbeat !== "object") {
+      return { accepted: false, refusalReason: "missing-heartbeat-metadata" }
+    }
+    if (operation.term < currentTerm) {
+      return { accepted: false, refusalReason: "stale-term" }
+    }
+    if (heartbeat.leaderId !== nodeId || heartbeat.observedLeader !== nodeId) {
+      return { accepted: false, refusalReason: "not-leader-heartbeat" }
+    }
+    if (
+      Number.isInteger(localMembershipVersion) &&
+      Number.isInteger(heartbeat.membershipVersion) &&
+      heartbeat.membershipVersion !== localMembershipVersion
+    ) {
+      return { accepted: false, refusalReason: "membership-version-mismatch" }
+    }
+
+    const expectedPrevIndex = previousOperation ? previousOperation.index : -1
+    const expectedPrevTerm = previousOperation ? previousOperation.term : -1
+    const expectedPrevHash = previousOperation ? previousOperation.entryHash : null
+    if (heartbeat.prevLogIndex !== expectedPrevIndex) {
+      return { accepted: false, refusalReason: "prev-index-mismatch" }
+    }
+    if (heartbeat.prevLogTerm !== expectedPrevTerm) {
+      return { accepted: false, refusalReason: "prev-term-mismatch" }
+    }
+    if (heartbeat.prevLogHash !== expectedPrevHash) {
+      return { accepted: false, refusalReason: "prev-hash-mismatch" }
+    }
+
+    return { accepted: true, refusalReason: null }
   }
 }
 

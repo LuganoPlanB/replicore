@@ -35,6 +35,12 @@ import { decryptString, encryptString, signPayload, verifyPayload } from "./cryp
  *     removed: string[]
  *   },
  *   heartbeat?: null | {
+ *     leaderId?: string | null,
+ *     leaderCommitIndex?: number,
+ *     membershipVersion?: number,
+ *     prevLogIndex?: number,
+ *     prevLogTerm?: number,
+ *     prevLogHash?: string | null,
  *     observedLeader: string | null,
  *     reachableLeader: boolean,
  *     appliedFeeds: Record<string, number>,
@@ -175,6 +181,36 @@ export function validateOperation(operation, expected, options = {}) {
     }
     if (typeof operation.heartbeat !== "object" || operation.heartbeat === null) {
       throw new Error("Heartbeat operation must include heartbeat metadata")
+    }
+    if (
+      operation.heartbeat.leaderId !== null &&
+      typeof operation.heartbeat.leaderId !== "string"
+    ) {
+      throw new Error("Heartbeat operation must include a string or null leaderId")
+    }
+    if (
+      !Number.isInteger(operation.heartbeat.leaderCommitIndex) ||
+      operation.heartbeat.leaderCommitIndex < -1
+    ) {
+      throw new Error("Heartbeat operation must include a leaderCommitIndex >= -1")
+    }
+    if (
+      !Number.isInteger(operation.heartbeat.membershipVersion) ||
+      operation.heartbeat.membershipVersion < 0
+    ) {
+      throw new Error("Heartbeat operation must include a non-negative membershipVersion")
+    }
+    if (!Number.isInteger(operation.heartbeat.prevLogIndex)) {
+      throw new Error("Heartbeat operation must include prevLogIndex")
+    }
+    if (!Number.isInteger(operation.heartbeat.prevLogTerm)) {
+      throw new Error("Heartbeat operation must include prevLogTerm")
+    }
+    if (
+      operation.heartbeat.prevLogHash !== null &&
+      typeof operation.heartbeat.prevLogHash !== "string"
+    ) {
+      throw new Error("Heartbeat operation must include a string or null prevLogHash")
     }
     return
   }
