@@ -129,9 +129,7 @@ export class HolepunchHttpServer {
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
-      return this.#json(res, status, {
-        error: error instanceof Error ? error.message : String(error)
-      })
+      return this.#json(res, status, this.#errorPayload(error))
     }
   }
 
@@ -139,6 +137,7 @@ export class HolepunchHttpServer {
     const grants = this.#tokenGrants(req)
     if (!grants) {
       const error = new Error("Unauthorized")
+      error.code = "UNAUTHORIZED"
       error.statusCode = 401
       throw error
     }
@@ -146,6 +145,7 @@ export class HolepunchHttpServer {
     const allowed = mode === "read" ? grants.readKeyspaces ?? [] : grants.writeKeyspaces ?? []
     if (!(allowed.includes("*") || allowed.includes(keyspace))) {
       const error = new Error("Forbidden")
+      error.code = "FORBIDDEN"
       error.statusCode = 403
       throw error
     }
@@ -155,12 +155,14 @@ export class HolepunchHttpServer {
     const grants = this.#tokenGrants(req)
     if (!grants) {
       const error = new Error("Unauthorized")
+      error.code = "UNAUTHORIZED"
       error.statusCode = 401
       throw error
     }
 
     if (grants.admin !== true) {
       const error = new Error("Forbidden")
+      error.code = "FORBIDDEN"
       error.statusCode = 403
       throw error
     }
@@ -177,6 +179,29 @@ export class HolepunchHttpServer {
     for await (const chunk of req) chunks.push(chunk)
     if (chunks.length === 0) return {}
     return JSON.parse(Buffer.concat(chunks).toString("utf8"))
+  }
+
+  #errorPayload(error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const payload = {
+      error: message
+    }
+    if (error?.code) payload.code = error.code
+    if (error?.refusal) {
+      payload.refusal = error.refusal
+      payload.code = error.refusal.code
+      payload.message = error.refusal.message
+      payload.retryable = error.refusal.retryable
+      payload.currentTerm = error.refusal.currentTerm
+      payload.knownLeaderId = error.refusal.knownLeaderId
+      payload.leaderReachable = error.refusal.leaderReachable
+      payload.splitStatus = error.refusal.splitStatus
+      payload.commitIndex = error.refusal.commitIndex
+      payload.membershipVersion = error.refusal.membershipVersion
+      payload.role = error.refusal.role
+      payload.reconnectHints = error.refusal.reconnectHints
+    }
+    return payload
   }
 
   #json(res, statusCode, payload) {
