@@ -36,7 +36,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       async () => {
         const status = await leader.getReplicationStatus()
         return liveFollowerIds(cluster, leaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -60,7 +60,7 @@ test("five-node static membership supports forwarding, replication, and deletes"
       async () => {
         const status = await leader.getReplicationStatus()
         return liveFollowerIds(cluster, leaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -98,8 +98,8 @@ test("five-node static membership supports forwarding, replication, and deletes"
     )
 
     for (const status of Object.values(await collectReplicationStatus(cluster.nodes))) {
-      assert.equal(Object.keys(status.feeds).length, 5)
-      assert.equal(Object.keys(status.heartbeats).length, 5)
+      assert.equal(Object.keys(status.peerReplication).length, 5)
+      assert.equal(Object.keys(status.heartbeatByNode).length, 5)
       assert.equal(status.leader, leaderId)
     }
 
@@ -141,7 +141,7 @@ test("five-node cluster stays durable when two non-leader followers go offline",
         const status = await leader.getReplicationStatus()
         return liveFollowerIds(cluster, leaderId)
           .filter((nodeId) => !offlineFollowers.includes(nodeId))
-          .some((nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0)
+          .some((nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0)
       },
       {
         description: "surviving follower remains durable after two followers stop",
@@ -268,7 +268,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
         const status = await leader.getReplicationStatus()
         return (
           [leaderId, null].includes(leader.currentLeader()) &&
-          offlineFollowers.every((nodeId) => status.feeds[nodeId]?.alive === false)
+          offlineFollowers.every((nodeId) => status.peerReplication[nodeId]?.alive === false)
         )
       },
       {
@@ -291,7 +291,7 @@ test("single surviving node serves reads but blocks writes until a follower retu
     await waitFor(
       async () => {
         const status = await leader.getReplicationStatus()
-        return status.feeds[offlineFollowers[0]]?.alive === true && status.feeds[offlineFollowers[0]]?.connectedPeers > 0
+        return status.peerReplication[offlineFollowers[0]]?.alive === true && status.peerReplication[offlineFollowers[0]]?.connectedPeers > 0
       },
       {
         description: "durability recovers when a follower returns",
@@ -366,8 +366,8 @@ test("pre-authorized standby node can join later and catch up without config cha
 
     const standbyId = cluster.identities[3].publicKeyId
     const preJoinStatus = await leader.getReplicationStatus()
-    assert.ok(preJoinStatus.feeds[standbyId])
-    assert.equal(preJoinStatus.feeds[standbyId].alive, false)
+    assert.ok(preJoinStatus.peerReplication[standbyId])
+    assert.equal(preJoinStatus.peerReplication[standbyId].alive, false)
 
     await cluster.startNode(standbyId)
 
@@ -501,7 +501,7 @@ test("planned node addition works after full-cluster restart with expanded membe
     )
 
     for (const status of Object.values(await collectReplicationStatus(expandedCluster.nodes))) {
-      assert.equal(Object.keys(status.feeds).length, 4)
+      assert.equal(Object.keys(status.peerReplication).length, 4)
     }
   } finally {
     if (expandedCluster) {
@@ -606,7 +606,7 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
           .slice(0, 3)
           .map((identity) => identity.publicKeyId)
           .filter((nodeId) => nodeId !== leaderId)
-          .every((nodeId) => status.feeds[nodeId]?.connectedPeers > 0)
+          .every((nodeId) => status.peerReplication[nodeId]?.connectedPeers > 0)
       },
       {
         description: "promotion leader regains enough live connectivity after heal",
@@ -725,7 +725,7 @@ test("joint-consensus voter removal blocks when only one side of the joint quoru
         return identities
           .map((identity) => identity.publicKeyId)
           .filter((nodeId) => nodeId !== leaderId)
-          .every((nodeId) => status.feeds[nodeId]?.connectedPeers > 0)
+          .every((nodeId) => status.peerReplication[nodeId]?.connectedPeers > 0)
       },
       {
         description: "removal leader regains enough live connectivity after heal",
@@ -866,7 +866,7 @@ test("node replacement via revocation and new identity restores service without 
       async () => {
         const status = await replacementLeader.getReplicationStatus()
         return liveFollowerIds(replacementCluster, replacementLeaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -1374,7 +1374,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
 
         const status = await settledLeader.getReplicationStatus()
         return liveFollowerIds(cluster, settledLeaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -1506,7 +1506,7 @@ test("isolated leader blocks writes on both sides until heal and followers becom
       async () => {
         const status = await originalLeader.getReplicationStatus()
         return liveFollowerIds(cluster, originalLeaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -1582,7 +1582,7 @@ test("isolated leader blocks writes on both sides until heal and followers becom
       async () => {
         const status = await originalLeader.getReplicationStatus()
         return liveFollowerIds(cluster, healedLeaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -1700,7 +1700,7 @@ test(
         async () => {
           const status = await originalLeader.getReplicationStatus()
           return liveFollowerIds(cluster, healedLeaderId).some(
-            (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+            (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
           )
         },
         {
@@ -1776,7 +1776,7 @@ test("timed-out local append stays uncommitted across leader restart and later h
     )
 
     await waitFor(
-      async () => (await originalLeader.getReplicationStatus()).authoritativeLog.staged.count === 0,
+      async () => (await originalLeader.getReplicationStatus()).authoritativeLog.stagedTail.count === 0,
       {
         description: "timed-out local append is removed from the uncommitted authoritative tail",
         onTimeout: () => originalLeader.getReplicationStatus()
@@ -1789,7 +1789,7 @@ test("timed-out local append stays uncommitted across leader restart and later h
 
     const restartedLeader = await cluster.restartNode(leaderId)
     await waitFor(
-      async () => (await restartedLeader.getReplicationStatus()).authoritativeLog.staged.count === 0,
+      async () => (await restartedLeader.getReplicationStatus()).authoritativeLog.stagedTail.count === 0,
       {
         description: "truncated timed-out append stays absent after leader restart",
         onTimeout: () => restartedLeader.getReplicationStatus()
@@ -1870,7 +1870,7 @@ test("isolated follower serves stale reads until heal and status shows stale con
         const status = await isolatedFollower.getReplicationStatus()
         return (
           status.connections === 0 &&
-          status.feeds[leaderId]?.connectedPeers === 0 &&
+          status.peerReplication[leaderId]?.connectedPeers === 0 &&
           status.readStatus.staleReadsPossible === true &&
           status.readStatus.reason === "leader-unreachable"
         )
@@ -1911,7 +1911,7 @@ test("isolated follower serves stale reads until heal and status shows stale con
       async () => {
         const status = await isolatedFollower.getReplicationStatus()
         return (
-          status.feeds[leaderId]?.alive === false &&
+          status.peerReplication[leaderId]?.alive === false &&
           status.readStatus.staleReadsPossible === true &&
           status.readStatus.reason === "split-fenced" &&
           status.splitStatus?.fenced === true &&
@@ -1972,7 +1972,7 @@ test("bootstrap outage after discovery does not break writes for already connect
       async () => {
         const status = await leader.getReplicationStatus()
         return liveFollowerIds(cluster, leaderId).some(
-          (nodeId) => status.feeds[nodeId]?.alive === true && status.feeds[nodeId]?.connectedPeers > 0
+          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
         )
       },
       {
@@ -2052,9 +2052,9 @@ test("restarted follower stays disconnected while bootstrap remains unavailable"
       async () => {
         const status = await leader.getReplicationStatus()
         return (
-          status.feeds[survivingFollowerId]?.alive === true &&
-          status.feeds[survivingFollowerId]?.connectedPeers > 0 &&
-          status.feeds[restartingFollowerId]?.alive === false
+          status.peerReplication[survivingFollowerId]?.alive === true &&
+          status.peerReplication[survivingFollowerId]?.connectedPeers > 0 &&
+          status.peerReplication[restartingFollowerId]?.alive === false
         )
       },
       {
@@ -2085,8 +2085,8 @@ test("restarted follower stays disconnected while bootstrap remains unavailable"
         return (
           status.connections === 0 &&
           status.knownPeerNodeIds.length === 0 &&
-          status.feeds[leaderId]?.connectedPeers === 0 &&
-          status.feeds[survivingFollowerId]?.connectedPeers === 0 &&
+          status.peerReplication[leaderId]?.connectedPeers === 0 &&
+          status.peerReplication[survivingFollowerId]?.connectedPeers === 0 &&
           status.readStatus.staleReadsPossible === true &&
           status.readStatus.reason === "no-live-peer-connections" &&
           [restartingFollowerId, null].includes(restartedFollower.currentLeader())
@@ -2180,7 +2180,7 @@ test("rolling restarts across a four-node cluster preserve availability and conv
           const liveLeaderId = liveLeader.options.identity.publicKeyId
           const status = await liveLeader.getReplicationStatus()
           return liveFollowerIds(cluster, liveLeaderId).some(
-            (followerId) => cluster.record(followerId).node && status.feeds[followerId]?.alive === true
+            (followerId) => cluster.record(followerId).node && status.peerReplication[followerId]?.alive === true
           )
         },
         {
@@ -2528,7 +2528,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
     await waitFor(
       async () => {
         const status = await leader.getReplicationStatus()
-        return offlineFollowers.every((nodeId) => status.feeds[nodeId]?.alive === false)
+        return offlineFollowers.every((nodeId) => status.peerReplication[nodeId]?.alive === false)
       },
       {
         description: "HTTP test waits for durability loss",
@@ -2562,7 +2562,7 @@ test("HTTP writes fail while durability is unavailable and recover after a follo
     await waitFor(
       async () => {
         const status = await leader.getReplicationStatus()
-        return status.feeds[offlineFollowers[0]]?.alive === true && status.feeds[offlineFollowers[0]]?.connectedPeers > 0
+        return status.peerReplication[offlineFollowers[0]]?.alive === true && status.peerReplication[offlineFollowers[0]]?.connectedPeers > 0
       },
       {
         description: "HTTP durability recovers when follower returns",
@@ -2909,7 +2909,7 @@ async function waitForClusterConvergence(cluster) {
   await waitFor(
     async () => {
       const statuses = await Promise.all(cluster.nodes.map((node) => node.getReplicationStatus()))
-      return statuses.every((status) => Object.keys(status.heartbeats).length >= status.membership.voters.length)
+      return statuses.every((status) => Object.keys(status.heartbeatByNode).length >= status.membership.voters.length)
     },
     {
       description: "cluster heartbeat convergence",
@@ -2986,7 +2986,7 @@ async function assertClusterInvariants(cluster) {
   const statuses = await collectReplicationStatus(cluster.nodes)
 
   for (const status of Object.values(statuses)) {
-    for (const feed of Object.values(status.feeds)) {
+    for (const feed of Object.values(status.peerReplication)) {
       assert.ok(feed.applied <= feed.length)
       assert.ok(feed.lag >= 0)
     }
@@ -3025,7 +3025,7 @@ async function assertRecoveryWindowInvariants(cluster, label) {
     assert.equal(status.leader, agreedLeader, `leader mismatch after ${label}`)
     assert.deepEqual(status.membership.mismatchedNodeIds, [], `membership mismatch after ${label}`)
 
-    for (const feed of Object.values(status.feeds)) {
+    for (const feed of Object.values(status.peerReplication)) {
       assert.ok(feed.applied <= feed.length, `applied exceeds length after ${label}`)
       assert.ok(feed.lag >= 0, `negative lag after ${label}`)
     }

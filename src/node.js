@@ -136,6 +136,17 @@ export class HolepunchSwarmNode {
       leaderNodeId: null,
       since: null
     }
+    this.diagnosticState = {
+      lastTruncationAt: null,
+      lastTruncationReason: null,
+      lastRejectedWriteAt: null,
+      lastRejectedWriteReason: null,
+      reconciliation: {
+        state: "idle",
+        at: null,
+        detail: null
+      }
+    }
     this.consensusEngine = new ConsensusEngine({
       localNodeId: this.options.identity.publicKeyId
     })
@@ -362,22 +373,24 @@ export class HolepunchSwarmNode {
 
   async getReplicationStatus() {
     const heartbeats = await this.view.getHeartbeats()
-    const feeds = {}
+    const peerReplication = {}
     const now = Date.now()
 
     for (const node of this.options.authorizedNodes) {
       if (this.#isRevokedNode(node.nodeId)) continue
       const status = await this.#feedReplicationStatus(node.nodeId, heartbeats, now)
       if (!status) continue
-      feeds[node.nodeId] = status
+      peerReplication[node.nodeId] = status
     }
 
     const authoritativeLogNodeId = this.#authoritativeLogNodeId()
     const authoritativeLog = await this.getAuthoritativeLogStatus()
     const authoritativeReplication = await this.#authoritativeReplicationStatus()
     const leaderFeedStatus =
-      feeds[authoritativeLogNodeId] ??
+      peerReplication[authoritativeLogNodeId] ??
       (await this.#feedReplicationStatus(authoritativeLogNodeId, heartbeats, now))
+    const uncommittedTailLength = Math.max(0, authoritativeLog.length - authoritativeReplication.applied)
+    const reconciliationState = uncommittedTailLength > 0 ? "reconciling" : "in-sync"
 
     return buildReplicationStatus({
       nodeId: this.options.identity.publicKeyId,
@@ -391,14 +404,25 @@ export class HolepunchSwarmNode {
       },
       authoritativeLog: {
         ...authoritativeLog,
-        applied: authoritativeReplication.applied,
-        lag: authoritativeReplication.lag,
-        staged: authoritativeReplication.staged,
+        commitIndex: this.consensusState.commitIndex,
+        lastAppliedIndex: this.consensusState.lastApplied,
+        snapshotWatermark: authoritativeReplication.applied - 1,
+        uncommittedTailLength,
+        stagedTail: authoritativeReplication.staged,
+        lastTruncationAt: this.diagnosticState.lastTruncationAt,
+        lastTruncationReason: this.diagnosticState.lastTruncationReason,
+        lastRejectedWriteAt: this.diagnosticState.lastRejectedWriteAt,
+        lastRejectedWriteReason: this.diagnosticState.lastRejectedWriteReason,
+        reconciliation: {
+          state: reconciliationState,
+          at: this.diagnosticState.reconciliation.at,
+          detail: this.diagnosticState.reconciliation.detail
+        },
         connectedPeers: leaderFeedStatus?.connectedPeers ?? 0,
         alive: leaderFeedStatus?.alive ?? false,
         heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? null
       },
-      peerReplication: feeds,
+      peerReplication,
       splitStatus: { ...this.splitState },
       connections: this.network?.connectionCount ?? 0,
       lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
@@ -408,8 +432,7 @@ export class HolepunchSwarmNode {
       promotion: await this.#promotionStatus(),
       network: this.network?.networkStatus() ?? { policyActive: false, allowedNodeIds: [], peers: {} },
       readStatus: this.#readStatus(),
-      feeds,
-      heartbeats
+      heartbeatByNode: heartbeats
     })
   }
 
@@ -470,13 +493,16 @@ export class HolepunchSwarmNode {
       })
     }
 
+    const lastOperation = (core?.length ?? 0) > 0 ? await core.get(core.length - 1) : null
+
     return {
       nodeId: node.nodeId,
       feedKey: node.feedKey,
       length: core?.length ?? 0,
       term: this.consensusState.currentTerm,
-      commitIndex: this.consensusState.commitIndex,
-      lastApplied: this.consensusState.lastApplied,
+      lastLogIndex: lastOperation?.index ?? -1,
+      lastLogTerm: lastOperation?.term ?? -1,
+      lastLogHash: lastOperation?.entryHash ?? null,
       tail
     }
   }
@@ -1371,6 +1397,8 @@ export class HolepunchSwarmNode {
           if (this.closing) {
             throw new Error("Node is closing")
           }
+          this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
+          this.diagnosticState.lastRejectedWriteReason = error instanceof Error ? error.message : String(error)
           await this.#truncateUncommittedAuthoritativeTail()
           throw error
         }
@@ -1695,10 +1723,10 @@ export class HolepunchSwarmNode {
 
     const feedKey = this.#authoritativeLogFeedKey()
     const keepLength = await this.view.getApplied(feedKey)
-    await this.#truncateAuthoritativeTail(keepLength)
+    await this.#truncateAuthoritativeTail(keepLength, "write-rejected")
   }
 
-  async #truncateAuthoritativeTail(keepLength) {
+  async #truncateAuthoritativeTail(keepLength, reason = "reconcile") {
     if (!this.#usesSharedAuthoritativeLog()) return
 
     const core = this.#authoritativeLogCore()
@@ -1713,6 +1741,8 @@ export class HolepunchSwarmNode {
         lastApplied: keepLength - 1
       })
     }
+    this.diagnosticState.lastTruncationAt = new Date().toISOString()
+    this.diagnosticState.lastTruncationReason = reason
   }
 
   /**
@@ -1744,7 +1774,17 @@ export class HolepunchSwarmNode {
       return
     }
 
-    await this.#truncateAuthoritativeTail(keepLength)
+    this.diagnosticState.reconciliation = {
+      state: "truncating-tail",
+      at: new Date().toISOString(),
+      detail: "heartbeat-boundary"
+    }
+    await this.#truncateAuthoritativeTail(keepLength, "heartbeat-boundary")
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "heartbeat-boundary-applied"
+    }
   }
 
   async #reconcileAuthoritativeTailFromAppendEntries(message) {
@@ -1759,7 +1799,12 @@ export class HolepunchSwarmNode {
       throw new Error("Leader append request cannot roll back the committed authoritative prefix")
     }
     if (core.length > leaderLength && leaderLength >= committedApplied) {
-      await this.#truncateAuthoritativeTail(leaderLength)
+      this.diagnosticState.reconciliation = {
+        state: "truncating-tail",
+        at: new Date().toISOString(),
+        detail: "append-entries-length"
+      }
+      await this.#truncateAuthoritativeTail(leaderLength, "append-entries-length")
     }
 
     if (message.prevLogIndex >= 0 && core.length > message.prevLogIndex) {
@@ -1771,7 +1816,12 @@ export class HolepunchSwarmNode {
         if (message.prevLogIndex < committedApplied) {
           throw new Error("AppendEntries mismatch reached the committed authoritative prefix")
         }
-        await this.#truncateAuthoritativeTail(committedApplied)
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "append-entries-prev-mismatch"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "append-entries-prev-mismatch")
       }
     }
 
@@ -1781,8 +1831,18 @@ export class HolepunchSwarmNode {
         if (leaderLength - 1 < committedApplied) {
           throw new Error("AppendEntries tail mismatch reached the committed authoritative prefix")
         }
-        await this.#truncateAuthoritativeTail(committedApplied)
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "append-entries-tail-mismatch"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "append-entries-tail-mismatch")
       }
+    }
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "append-entries"
     }
   }
 
@@ -3028,6 +3088,8 @@ export class HolepunchSwarmNode {
           try {
             await ackPromise
           } catch (error) {
+            this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
+            this.diagnosticState.lastRejectedWriteReason = error instanceof Error ? error.message : String(error)
             await this.#truncateUncommittedAuthoritativeTail()
             throw error
           }

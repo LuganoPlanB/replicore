@@ -37,8 +37,7 @@ export function buildReplicationStatus({
   promotion,
   network,
   readStatus,
-  feeds,
-  heartbeats
+  heartbeatByNode
 }) {
   return {
     nodeId,
@@ -56,8 +55,7 @@ export function buildReplicationStatus({
     promotion,
     network,
     readStatus,
-    feeds,
-    heartbeats
+    heartbeatByNode
   }
 }
 

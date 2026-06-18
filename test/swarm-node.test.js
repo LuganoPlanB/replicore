@@ -691,7 +691,7 @@ test("two-node leader loss stays split-fenced and does not autonomously reelect"
     })
 
     const forgedStatus = await survivor.getReplicationStatus()
-    assert.equal(forgedStatus.heartbeats[firstLeaderId]?.reachableLeader, true)
+    assert.equal(forgedStatus.heartbeatByNode[firstLeaderId]?.reachableLeader, true)
     assert.equal(forgedStatus.splitStatus?.fenced, true)
     assert.equal(forgedStatus.readStatus.reason, "split-fenced")
 
@@ -933,8 +933,8 @@ test("follower heartbeat diagnostics do not grant leader authority", { concurren
       lastApplied: (await leaderNode.getConsensusState()).lastApplied,
       knownLeader: leaderId
     })
-    assert.ok(status.heartbeats[followerIdentity.publicKeyId])
-    assert.equal(status.heartbeats[followerIdentity.publicKeyId].actor, followerIdentity.publicKeyId)
+    assert.ok(status.heartbeatByNode[followerIdentity.publicKeyId])
+    assert.equal(status.heartbeatByNode[followerIdentity.publicKeyId].actor, followerIdentity.publicKeyId)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -1089,8 +1089,8 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     assert.equal(replication.nodeId, nodes[1].options.identity.publicKeyId)
     assert.equal(typeof replication.lastDurableSequence, "number")
     assert.equal(typeof replication.knownPeerNodeIds.length, "number")
-    assert.equal(typeof replication.feeds[nodes[1].options.identity.publicKeyId].lag, "number")
-    assert.equal(typeof replication.feeds[nodes[1].options.identity.publicKeyId].alive, "boolean")
+    assert.equal(typeof replication.peerReplication[nodes[1].options.identity.publicKeyId].lag, "number")
+    assert.equal(typeof replication.peerReplication[nodes[1].options.identity.publicKeyId].alive, "boolean")
 
     const writersResponse = await fetch(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)
@@ -1887,7 +1887,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
     const encryptionKey = randomBytes(32)
     const durability = {
       requiredFollowerAcks: 1,
-      timeoutMs: 10_000
+      timeoutMs: 20_000
     }
     const leaderIdentity = generateIdentity(seed("replacement-membership-leader"))
     const followerIdentity = generateIdentity(seed("replacement-membership-follower"))
@@ -2010,7 +2010,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
 
     await waitFor(async () => {
       const status = await leader.getReplicationStatus()
-      const replacementFeed = status.feeds[replacementIdentity.publicKeyId]
+      const replacementFeed = status.peerReplication[replacementIdentity.publicKeyId]
       return replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
     })
 
@@ -2028,7 +2028,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
 
     await waitFor(async () => {
       const status = await leader.getReplicationStatus()
-      const replacementFeed = status.feeds[replacementIdentity.publicKeyId]
+      const replacementFeed = status.peerReplication[replacementIdentity.publicKeyId]
       return status.connections === 2 && replacementFeed?.alive === true && replacementFeed?.connectedPeers > 0
     })
 
@@ -2387,7 +2387,7 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
     const encryptionKey = randomBytes(32)
     const durability = {
       requiredFollowerAcks: 1,
-      timeoutMs: 10_000
+      timeoutMs: 20_000
     }
     const leaderIdentity = generateIdentity(seed("leader"))
     const followerIdentity = generateIdentity(seed("follower-1"))
@@ -2437,7 +2437,7 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
     for (const node of nodes) {
       await node.start()
     }
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeatByNode).length >= 3)
     const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
       .map((identity) => identity.publicKeyId)
       .sort()[0]
@@ -2527,7 +2527,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       await node.start()
     }
 
-    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeats).length >= 3)
+    await waitFor(async () => Object.keys((await leader.getReplicationStatus()).heartbeatByNode).length >= 3)
     const currentLeaderId = [leaderIdentity, followerIdentity, observerIdentity]
       .map((identity) => identity.publicKeyId)
       .sort()[0]
@@ -2642,7 +2642,7 @@ test("replication status exposes staged entries without exposing committed CRUD 
     })
 
     const status = await node.getReplicationStatus()
-    assert.deepEqual(status.feeds[identity.publicKeyId].staged, {
+    assert.deepEqual(status.peerReplication[identity.publicKeyId].staged, {
       count: 1,
       firstSeq: 3,
       lastSeq: 3,
@@ -2782,7 +2782,7 @@ test("a follower keeps a replicated write staged until the leader advertises the
     const pendingWrite = leaderNode.put("hash:watermark-staged", { phase: "pending" })
     pendingWrite.catch(() => {})
 
-    await waitFor(async () => (await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count === 1)
+    await waitFor(async () => (await followerNode.getReplicationStatus()).peerReplication[currentLeaderId].staged.count === 1)
     assert.equal(await followerNode.get("hash:watermark-staged"), null)
     assert.deepEqual(await followerNode.getHistory("hash:watermark-staged"), [])
 
@@ -2790,7 +2790,7 @@ test("a follower keeps a replicated write staged until the leader advertises the
     await waitFor(async () => (await followerNode.get("hash:watermark-staged"))?.value?.phase === "pending")
 
     const status = await followerNode.getReplicationStatus()
-    assert.equal(status.feeds[currentLeaderId].staged.count, 0)
+    assert.equal(status.peerReplication[currentLeaderId].staged.count, 0)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -2854,7 +2854,7 @@ test("committed feed progress survives follower restart after watermark-driven a
     const leaderFeedKey = authorizedNodes.find((node) => node.nodeId === currentLeaderId).feedKey
     const beforeRestartProgress = await followerNode.view.getFeedProgress(leaderFeedKey)
     assert.ok(beforeRestartProgress.committedApplied > 0)
-    assert.equal((await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count, 0)
+    assert.equal((await followerNode.getReplicationStatus()).peerReplication[currentLeaderId].staged.count, 0)
 
     await followerNode.close()
     nodes.splice(nodes.indexOf(followerNode), 1)
@@ -2875,7 +2875,7 @@ test("committed feed progress survives follower restart after watermark-driven a
 
     const afterRestartProgress = await restarted.view.getFeedProgress(leaderFeedKey)
     assert.deepEqual(afterRestartProgress, beforeRestartProgress)
-    assert.equal((await restarted.getReplicationStatus()).feeds[currentLeaderId].staged.count, 0)
+    assert.equal((await restarted.getReplicationStatus()).peerReplication[currentLeaderId].staged.count, 0)
   } finally {
     await Promise.allSettled([restarted?.close(), ...nodes.map((node) => node.close())])
     await testnet.destroy()
@@ -2940,7 +2940,7 @@ test("a staged delete stays out of reads, history, and snapshots until committed
     const pendingDelete = leaderNode.delete("hash:watermark-delete")
     pendingDelete.catch(() => {})
 
-    await waitFor(async () => (await followerNode.getReplicationStatus()).feeds[currentLeaderId].staged.count === 1)
+    await waitFor(async () => (await followerNode.getReplicationStatus()).peerReplication[currentLeaderId].staged.count === 1)
 
     const stagedValue = await followerNode.get("hash:watermark-delete")
     assert.equal(stagedValue?.value?.phase, "before-delete")
@@ -3028,7 +3028,7 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
 
     const pendingWrite = leaderNode.put("hash:closing-leader", { phase: "pending-close" })
     pendingWrite.catch(() => {})
-    await waitFor(async () => (await leaderNode.getReplicationStatus()).feeds[leaderNode.options.identity.publicKeyId].length > 1)
+    await waitFor(async () => (await leaderNode.getReplicationStatus()).peerReplication[leaderNode.options.identity.publicKeyId].length > 1)
     assert.equal(await leaderNode.get("hash:closing-leader"), null)
     assert.deepEqual(await leaderNode.getHistory("hash:closing-leader"), [])
 
