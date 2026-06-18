@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 
-const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "300000")
+const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "180000")
 const steps = [
   {
     label: "raft-engine",
@@ -11,8 +11,34 @@ const steps = [
     args: ["--test", "--test-concurrency=1", "test/config-loader.test.js"]
   },
   {
-    label: "swarm-node",
-    args: ["--test", "--test-concurrency=1", "test/swarm-node.test.js"]
+    label: "swarm-node-a",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "leader operations replicate|new and restarted followers|reconnected follower truncates|followers forward writes|history keeps actor audit|startup election converges|leader-only loss|two-node leader loss|leader loss plus a second|leader writes require|follower heartbeat diagnostics|consensus state persists|authorized HTTP API",
+      "test/swarm-node.test.js"
+    ]
+  },
+  {
+    label: "swarm-node-b",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "same-secret unknown peers|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion|removed voter cannot regain|replacement learner can join",
+      "test/swarm-node.test.js"
+    ]
+  },
+  {
+    label: "swarm-node-c",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "snapshot restore rejects tampered|operation validation rejects mismatched|operation validation rejects inconsistent|operation validation rejects revoked|logical log link validation|sync rejects a feed entry with a bad|sync rejects a feed entry with a corrupted|encryption rotation preserves|fresh node can restore current state|restored node can serve snapshot reads|replication status exposes staged|concurrent leader appends|follower keeps a replicated write staged|committed feed progress survives|staged delete stays out|closing a leader rejects",
+      "test/swarm-node.test.js"
+    ]
   },
   {
     label: "perturbation-a",

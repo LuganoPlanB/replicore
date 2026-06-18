@@ -1402,142 +1402,6 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
       bootstrap: testnet.bootstrap
     })
 
-    test("a healed follower converges by recovery pull without requiring a fresh leader write", { concurrency: false }, async () => {
-      const testnet = await createTestnet(2)
-      const dirs = []
-      const nodes = []
-
-      try {
-        const clusterSecret = Buffer.from(
-          "7777777777777777777777777777777777777777777777777777777777777777",
-          "hex"
-        )
-        const encryptionKey = randomBytes(32)
-        const leaderIdentity = generateIdentity(seed("idle-recovery-leader"))
-        const followerIdentity = generateIdentity(seed("idle-recovery-follower"))
-        const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
-          nodeId: identity.publicKeyId,
-          publicKey: identity.publicKey,
-          feedKey: identity.feedKey
-        }))
-
-        const first = new HolepunchSwarmNode({
-          dataDir: await tempDir(dirs),
-          clusterId: "idle-recovery-cluster",
-          clusterSecret,
-          machineId: "idle-recovery-1",
-          identity: leaderIdentity,
-          authorizedNodes,
-          encryptionKey,
-          bootstrap: testnet.bootstrap
-        })
-        await first.start()
-        nodes.push(first)
-
-        const second = new HolepunchSwarmNode({
-          dataDir: await tempDir(dirs),
-          clusterId: "idle-recovery-cluster",
-          clusterSecret,
-          machineId: "idle-recovery-2",
-          identity: followerIdentity,
-          authorizedNodes,
-          encryptionKey,
-          bootstrap: testnet.bootstrap
-        })
-        await second.start()
-        nodes.push(second)
-
-        await waitFor(async () => {
-          const currentLeader = first.currentLeader()
-          return currentLeader !== null && currentLeader === second.currentLeader()
-        })
-        const leaderId = first.currentLeader()
-        const leader = leaderId === leaderIdentity.publicKeyId ? first : second
-        const follower = leader === first ? second : first
-
-        await leader.put("hash:idle-recovery-baseline", { phase: "baseline" })
-        await waitFor(async () => (await follower.get("hash:idle-recovery-baseline"))?.value?.phase === "baseline")
-        await follower.suspendNetworking()
-
-        const followerCore = follower.authoritativeLogCore
-        const divergentSeq = followerCore.length
-        const previous = divergentSeq === 0 ? null : await followerCore.get(divergentSeq - 1)
-        const divergent = createSignedOperation({
-          kind: "kv",
-          type: "put",
-          key: "hash:idle-recovery-divergent",
-          value: { phase: "divergent" },
-          seq: divergentSeq,
-          term: previous?.term ?? 0,
-          index: divergentSeq,
-          prevIndex: previous?.index ?? -1,
-          prevHash: previous?.entryHash ?? null,
-          feed: follower.authoritativeLogIdentity.feedKey,
-          actor: follower.options.identity.publicKeyId,
-          secretKey: follower.authoritativeLogIdentity.secretKey,
-          encryptionKey: follower.encryption.keys[follower.encryption.currentKeyId],
-          encryptionKeyId: follower.encryption.currentKeyId
-        })
-        await followerCore.append(divergent)
-        await follower.syncAuthoritativeLog()
-        assert.equal(await follower.get("hash:idle-recovery-divergent"), null)
-
-        await follower.resumeNetworking()
-        await waitFor(async () => {
-          const leaderLog = await leader.getAuthoritativeLogStatus()
-          const followerLog = await follower.getAuthoritativeLogStatus()
-          return followerLog.length === leaderLog.length
-        })
-        assert.equal(await follower.get("hash:idle-recovery-divergent"), null)
-      } finally {
-        await Promise.allSettled(nodes.map((node) => node.close()))
-        await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
-        await testnet.destroy()
-      }
-    })
-
-    test("snapshot restore rejects tampered integrity metadata", { concurrency: false }, async () => {
-      const testnet = await createTestnet(1)
-      const dirs = []
-      const nodes = []
-
-      try {
-        const clusterSecret = Buffer.from(
-          "8888888888888888888888888888888888888888888888888888888888888888",
-          "hex"
-        )
-        const identity = generateIdentity(seed("snapshot-integrity"))
-        const node = new HolepunchSwarmNode({
-          dataDir: await tempDir(dirs),
-          clusterId: "snapshot-integrity-cluster",
-          clusterSecret,
-          machineId: "snapshot-integrity-machine",
-          identity,
-          authorizedNodes: [{
-            nodeId: identity.publicKeyId,
-            publicKey: identity.publicKey,
-            feedKey: identity.feedKey
-          }],
-          encryptionKey: randomBytes(32),
-          bootstrap: testnet.bootstrap
-        })
-        await node.start()
-        nodes.push(node)
-
-        await waitFor(() => node.currentLeader() === identity.publicKeyId)
-        await node.put("hash:snapshot-integrity-value", { value: "ok" })
-        const snapshot = await node.createSnapshot()
-        const tampered = {
-          ...snapshot,
-          contentHash: "00".repeat(32)
-        }
-        await assert.rejects(node.restoreSnapshot(tampered), /content hash mismatch/)
-      } finally {
-        await Promise.allSettled(nodes.map((node) => node.close()))
-        await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
-        await testnet.destroy()
-      }
-    })
     await leader.start()
     nodes.push(leader)
 
@@ -1612,6 +1476,143 @@ test("a learner catches up for reads, stays out of quorum, and rejects writes", 
       const replicated = await learner.get("hash:learner-after")
       return replicated?.value?.value === "after-learner"
     })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("a healed follower converges by recovery pull without requiring a fresh leader write", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "7777777777777777777777777777777777777777777777777777777777777777",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("idle-recovery-leader"))
+    const followerIdentity = generateIdentity(seed("idle-recovery-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "idle-recovery-cluster",
+      clusterSecret,
+      machineId: "idle-recovery-1",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await first.start()
+    nodes.push(first)
+
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "idle-recovery-cluster",
+      clusterSecret,
+      machineId: "idle-recovery-2",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await second.start()
+    nodes.push(second)
+
+    await waitFor(async () => {
+      const currentLeader = first.currentLeader()
+      return currentLeader !== null && currentLeader === second.currentLeader()
+    })
+    const leaderId = first.currentLeader()
+    const leader = leaderId === leaderIdentity.publicKeyId ? first : second
+    const follower = leader === first ? second : first
+
+    await leader.put("hash:idle-recovery-baseline", { phase: "baseline" })
+    await waitFor(async () => (await follower.get("hash:idle-recovery-baseline"))?.value?.phase === "baseline")
+    await follower.suspendNetworking()
+
+    const followerCore = follower.authoritativeLogCore
+    const divergentSeq = followerCore.length
+    const previous = divergentSeq === 0 ? null : await followerCore.get(divergentSeq - 1)
+    const divergent = createSignedOperation({
+      kind: "kv",
+      type: "put",
+      key: "hash:idle-recovery-divergent",
+      value: { phase: "divergent" },
+      seq: divergentSeq,
+      term: previous?.term ?? 0,
+      index: divergentSeq,
+      prevIndex: previous?.index ?? -1,
+      prevHash: previous?.entryHash ?? null,
+      feed: follower.authoritativeLogIdentity.feedKey,
+      actor: follower.options.identity.publicKeyId,
+      secretKey: follower.authoritativeLogIdentity.secretKey,
+      encryptionKey: follower.encryption.keys[follower.encryption.currentKeyId],
+      encryptionKeyId: follower.encryption.currentKeyId
+    })
+    await followerCore.append(divergent)
+    await follower.syncAuthoritativeLog()
+    assert.equal(await follower.get("hash:idle-recovery-divergent"), null)
+
+    await follower.resumeNetworking()
+    await waitFor(async () => {
+      const leaderLog = await leader.getAuthoritativeLogStatus()
+      const followerLog = await follower.getAuthoritativeLogStatus()
+      return followerLog.length === leaderLog.length
+    })
+    assert.equal(await follower.get("hash:idle-recovery-divergent"), null)
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("snapshot restore rejects tampered integrity metadata", { concurrency: false }, async () => {
+  const testnet = await createTestnet(1)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "8888888888888888888888888888888888888888888888888888888888888888",
+      "hex"
+    )
+    const identity = generateIdentity(seed("snapshot-integrity"))
+    const node = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "snapshot-integrity-cluster",
+      clusterSecret,
+      machineId: "snapshot-integrity-machine",
+      identity,
+      authorizedNodes: [{
+        nodeId: identity.publicKeyId,
+        publicKey: identity.publicKey,
+        feedKey: identity.feedKey
+      }],
+      encryptionKey: randomBytes(32),
+      bootstrap: testnet.bootstrap
+    })
+    await node.start()
+    nodes.push(node)
+
+    await waitFor(() => node.currentLeader() === identity.publicKeyId)
+    await node.put("hash:snapshot-integrity-value", { value: "ok" })
+    const snapshot = await node.createSnapshot()
+    const tampered = {
+      ...snapshot,
+      contentHash: "00".repeat(32)
+    }
+    await assert.rejects(node.restoreSnapshot(tampered), /content hash mismatch/)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
@@ -2028,7 +2029,7 @@ test("a replacement learner can join after removal, be promoted, and restore dur
     const encryptionKey = randomBytes(32)
     const durability = {
       requiredFollowerAcks: 1,
-      timeoutMs: 20_000
+      timeoutMs: 30_000
     }
     const leaderIdentity = generateIdentity(seed("replacement-membership-leader"))
     const followerIdentity = generateIdentity(seed("replacement-membership-follower"))

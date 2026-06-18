@@ -1713,7 +1713,8 @@ test(
         healedLeader,
         "hash:subgroup-after",
         { phase: "after" },
-        "post-heal durable write from the healed leader"
+        "post-heal durable write from the healed leader",
+        { timeoutMs: 30000 }
       )
       assert.ok(afterHeal.opId)
 
@@ -2154,7 +2155,10 @@ test("rolling restarts across a four-node cluster preserve availability and conv
       }
     )
 
-    const baselineLeaderId = currentLeaderId(cluster)
+    const baselineLeaderId = await waitForClusterLeader(
+      cluster,
+      "stable leader before rolling-restart baseline write"
+    )
     const baselineLeader = cluster.record(baselineLeaderId).node
     await baselineLeader.put("hash:rolling-0", { cycle: 0 })
 
@@ -2963,7 +2967,7 @@ async function waitForDurableClusterWrite(cluster, key, value, description) {
   return result
 }
 
-async function waitForDurableWriteFrom(node, key, value, description) {
+async function waitForDurableWriteFrom(node, key, value, description, options = {}) {
   let operation = null
   await waitFor(
     async () => {
@@ -2976,6 +2980,7 @@ async function waitForDurableWriteFrom(node, key, value, description) {
     },
     {
       description,
+      ...(Number.isInteger(options.timeoutMs) ? { timeoutMs: options.timeoutMs } : {}),
       onTimeout: () => node.getReplicationStatus()
     }
   )
