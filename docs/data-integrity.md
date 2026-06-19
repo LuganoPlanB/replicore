@@ -45,6 +45,35 @@ Until strong reads exist, the API and status responses must not imply
 linearizable reads. Existing stale-read metadata should remain explicit and be
 extended rather than removed.
 
+## CRUD Outcome Matrix
+
+This matrix defines the public contract for `PUT`, `GET`, `DELETE`, and
+history-related behavior. Tests should assert this contract directly instead of
+encoding current incidental behavior.
+
+| Condition | Operation | HTTP status | Expected result | Retry | State/history effect | Required hints |
+| --- | --- | --- | --- | --- | --- | --- |
+| Healthy voter witness, current leader reachable | `PUT` / `DELETE` via witness HTTP API | `200` / `201` / `204` | Success after leader-log commit | Not needed | Committed change appears exactly once in K/V and history | `leader`, `witness`, `committed: true` |
+| Healthy voter witness, current leader reachable | `GET` | `200` or `404` for committed absence | Success | Not needed | Returns current committed value or committed deletion/absence | `staleReadsPossible: false` |
+| Healthy voter witness, current leader reachable | `GET /history` | `200` | Success | Not needed | Returns only committed leader-log operations in consensus order | `committedOnly: true` |
+| Direct leader-facing CRUD request | `PUT` / `DELETE` / admin-style write to leader endpoint | `409` or `503` | Refused | Yes, against a witness | No change | Error code such as `not-witness-entrypoint`, plus witness/peer hints |
+| Direct leader-facing read request | `GET` / `GET /history` | `200` or `404` for committed absence | Allowed if the node is healthy and not split-fenced | Not needed | Returns committed state only | `staleReadsPossible` metadata still present |
+| Witness on majority side during split, leader still reachable from that side | `PUT` / `DELETE` | `200` / `201` / `204` | Success after leader-log commit | Not needed | Committed change survives heal and appears in final history | `leader`, `witness`, `committed: true` |
+| Witness on majority side during split, leader still reachable from that side | `GET` / `GET /history` | `200` or `404` for committed absence | Success | Not needed | Returns committed state/history from authoritative log | `staleReadsPossible: false` or equivalent healthy metadata |
+| Split-fenced witness on minority side, leader unreachable | `PUT` / `DELETE` | `409` or `503` | Refused | Yes, after reconnecting to a witness on the leader-connected side | No committed change; the refused operation must never appear after heal | Error code such as `split-fenced`, `leader-unreachable`, or `stale-term`; include leader/witness hints when known |
+| Split-fenced witness on minority side, leader unreachable | local `GET` | `200` or `404` | Success with warning | Not needed | Returns last locally known committed value, which may be stale | `staleReadsPossible: true`, split status, leader hint if known |
+| Split-fenced witness on minority side, leader unreachable | strong `GET` / strong history read | `409` or `503` | Refused or redirected | Yes, against leader-connected witness | No change | Error code such as `strong-read-unavailable` or redirect hints |
+| Majority side commits `DELETE` during split | `DELETE` | `204` or `200` | Success on leader-connected witness | Not needed | Tombstone or equivalent committed delete becomes authoritative after heal | `committed: true` |
+| Minority side attempts `DELETE` during split | `DELETE` | `409` or `503` | Refused | Yes, after reconnecting to leader-connected witness | Delete must not appear after heal | Same refusal metadata as other split-fenced writes |
+| Split heals after majority-side writes | `GET` / `GET /history` on any voter | `200` or `404` for committed absence | Success after convergence | Not needed | Every node returns the majority-committed value/history only; refused minority writes stay absent | `staleReadsPossible: false` once healed |
+| Leader crashes after append but before commit acknowledgement | `PUT` / `DELETE` | `5xx`, timeout, or disconnect | Client must see failure or disconnect, never a durable success | Yes | Operation must remain absent after recovery unless recommitted later | Error code or transport failure with retry-safe semantics |
+| Leader crashes after commit but before local apply becomes externally visible | `PUT` / `DELETE` | `2xx`, timeout, or disconnect depending on when the client loses the response | Success is allowed only if quorum commit already happened | Maybe, but client must treat ambiguous timeout as retriable | Committed result must appear after restart/recovery and exactly once in history | Response or recovery diagnostics must preserve committed state |
+| Leader-only disappearance in 3+ voter cluster after tolerance window and reelection enabled | `PUT` / `DELETE` via witness | `2xx` only after new leader is active; otherwise `409` / `503` | Success only after a new leader is elected and reachable | Yes, after reelection | New committed entries append to the same logical authoritative history | `leaderChanged`, new leader hint, current term |
+| Leader-only disappearance in minimal 2-voter topology with no quorum for reelection | `PUT` / `DELETE` via witness | `409` or `503` | Refused | Yes, only after quorum is restored | No change | Error code such as `no-quorum` or `leader-unreachable` with peer hints |
+| Learner before promotion | `PUT` / `DELETE` | `403` or `409` | Refused | Yes, against a voter witness after promotion is not required for the client itself | No change | Error code such as `non-voter` / `read-only-role`; include role metadata |
+| Learner before promotion | local `GET` / `GET /history` after catch-up | `200` or `404` | Success with role metadata | Not needed | Returns locally replicated committed state/history only | `role: learner`, stale metadata when applicable |
+| Wrong-secret node | discovery, replication, CRUD, history | no HTTP route in normal operation; forced contact should yield `401` / `403` / `409` | Refused or unavailable | No, unless reconfigured with the right secret | No membership, no state visibility, no history visibility | Connection failure or explicit `wrong-secret` / `not-member` diagnostics if direct contact is forced |
+
 ## Non-Goals
 
 This production path does not include:
