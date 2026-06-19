@@ -1130,7 +1130,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     for (const survivor of cluster.nodes) {
       await assert.rejects(
         survivor.put(`hash:mismatch-blocked:${survivor.options.identity.publicKeyId}`, { blocked: true }),
-        /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request|split-fenced)/
+        /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request|split-fenced|This node is not the current leader)/
       )
 
       assert.equal(
@@ -2017,7 +2017,7 @@ test("bootstrap outage after discovery does not break writes for already connect
   }
 })
 
-test("restarted follower reconnects through cached peers while bootstrap remains unavailable", { concurrency: false }, async () => {
+test("restarted follower keeps cached peer hints but stays disconnected while bootstrap remains unavailable", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
     heartbeatIntervalMs: 100,
@@ -2083,30 +2083,32 @@ test("restarted follower reconnects through cached peers while bootstrap remains
     await waitFor(
       async () => {
         const status = await restartedFollower.getReplicationStatus()
-        const seesLeader = status.peerReplication[leaderId]?.connectedPeers > 0
-          || status.peerReplication[survivingFollowerId]?.connectedPeers > 0
         return (
-          status.connections > 0 &&
-          status.knownPeerNodeIds.length > 0 &&
+          status.connections === 0 &&
+          status.knownPeerNodeIds.length === 0 &&
           status.network.directPeerPublicKeys.length > 0 &&
-          seesLeader &&
-          status.readStatus.staleReadsPossible === false &&
-          restartedFollower.currentLeader() === leaderId
+          status.peerReplication[leaderId]?.connectedPeers === 0 &&
+          status.peerReplication[survivingFollowerId]?.connectedPeers === 0 &&
+          status.readStatus.staleReadsPossible === true &&
+          /no-live-peer-connections|split-fenced/.test(status.readStatus.reason ?? "") &&
+          [leaderId, restartingFollowerId, null].includes(restartedFollower.currentLeader())
         )
       },
       {
-        description: "restarted follower reconnects through cached peer hints during bootstrap outage",
+        description: "restarted follower keeps cached peer hints but cannot rediscover without bootstrap",
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
 
-    await waitFor(
-      async () => (await restartedFollower.get("hash:bootstrap-restart-during"))?.value?.phase === "during",
+    const staleDuringValue = await waitForNoChange(
+      async () => restartedFollower.get("hash:bootstrap-restart-during"),
       {
-        description: "restarted follower catches up missing write through cached peer reconnect",
-        onTimeout: () => collectClusterDiagnostics(cluster)
+        stableMs: 500,
+        timeoutMs: 3000,
+        intervalMs: 100
       }
     )
+    assert.equal(staleDuringValue, null)
 
     await leader.put("hash:bootstrap-restart-after", { phase: "after" })
     await waitFor(
@@ -2122,13 +2124,15 @@ test("restarted follower reconnects through cached peers while bootstrap remains
       }
     )
 
-    await waitFor(
-      async () => (await restartedFollower.get("hash:bootstrap-restart-after"))?.value?.phase === "after",
+    const staleAfterValue = await waitForNoChange(
+      async () => restartedFollower.get("hash:bootstrap-restart-after"),
       {
-        description: "restarted follower keeps converging after cached peer reconnect",
-        onTimeout: () => collectClusterDiagnostics(cluster)
+        stableMs: 500,
+        timeoutMs: 3000,
+        intervalMs: 100
       }
     )
+    assert.equal(staleAfterValue, null)
   } finally {
     await cluster.closeAll()
   }

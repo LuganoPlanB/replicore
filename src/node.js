@@ -189,6 +189,7 @@ export class HolepunchSwarmNode {
       since: null
     }
     this.membershipState = await this.#loadMembershipState()
+    await this.#seedKnownLeaderFromPersistedHeartbeats()
     this.rpc = new NodeRpcRouter({
       localNodeId: this.options.identity.publicKeyId,
       timeoutMs: this.options.requestTimeoutMs,
@@ -1532,10 +1533,11 @@ export class HolepunchSwarmNode {
           if (this.closing) {
             throw new Error("Node is closing")
           }
+          const normalizedError = this.#normalizeDurabilityWaitError(error)
           this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
-          this.diagnosticState.lastRejectedWriteReason = error instanceof Error ? error.message : String(error)
+          this.diagnosticState.lastRejectedWriteReason = normalizedError instanceof Error ? normalizedError.message : String(normalizedError)
           await this.#truncateUncommittedAuthoritativeTail()
-          throw error
+          throw normalizedError
         }
         await this.#advanceCommittedFeed(operation.seq + 1)
         return operation
@@ -1586,10 +1588,11 @@ export class HolepunchSwarmNode {
       if (this.closing) {
         throw new Error("Node is closing")
       }
+      const normalizedError = this.#normalizeDurabilityWaitError(error)
       await this.view.markSkippedEntry(this.options.identity.feedKey, operation.seq)
       await this.view.setStagedEntryResolution(this.options.identity.feedKey, operation.seq, "rejected")
       await this.#runHeartbeat()
-      throw error
+      throw normalizedError
     }
     await this.#advanceCommittedFeed(this.options.identity.publicKeyId, operation.seq + 1)
     await this.#runHeartbeat()
@@ -2265,6 +2268,16 @@ export class HolepunchSwarmNode {
     })
   }
 
+  #normalizeDurabilityWaitError(error) {
+    if (
+      typeof error?.message === "string" &&
+      error.message.startsWith("Timed out waiting for follower acknowledgement")
+    ) {
+      return this.#createDurabilityUnavailableError()
+    }
+    return error
+  }
+
   #createJoinError(code, message, options = {}) {
     return this.#createRefusalError({
       code,
@@ -2410,6 +2423,28 @@ export class HolepunchSwarmNode {
     }
 
     this.network.setExplicitPeerPublicKeys(prioritizedKeys.slice(0, 8))
+  }
+
+  async #seedKnownLeaderFromPersistedHeartbeats() {
+    const heartbeats = await this.view.getHeartbeats()
+    let freshestLeader = null
+    let freshestTimestamp = ""
+
+    for (const [nodeId, heartbeat] of Object.entries(heartbeats)) {
+      if (this.#membershipRole(nodeId) !== "voter") continue
+      const leaderNodeId = heartbeat?.observedLeader ?? heartbeat?.leaderId ?? null
+      if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) continue
+      if (this.#membershipRole(leaderNodeId) !== "voter") continue
+      if (String(heartbeat?.ts ?? "") <= freshestTimestamp) continue
+      freshestLeader = leaderNodeId
+      freshestTimestamp = String(heartbeat?.ts ?? "")
+    }
+
+    if (!freshestLeader) return
+    this.consensusEngine.noteKnownLeader({
+      leaderNodeId: freshestLeader,
+      electionTimeoutMs: this.options.electionTimeoutMaxMs
+    })
   }
 
   #schedulePeerMaintenanceTimer() {

@@ -178,6 +178,9 @@ test("new and restarted followers read the same authoritative leader-log prefix"
     nodes.push(lateFollower)
 
     await waitFor(async () => (await lateFollower.get("hash:authoritative-prefix"))?.value?.source === "forwarded")
+    await waitFor(async () =>
+      [leader, follower1, lateFollower].every((node) => node.currentLeader() === leaderId)
+    )
 
     const leaderLog = await electedLeader.getAuthoritativeLogStatus()
     const follower1Log = await follower1.getAuthoritativeLogStatus()
@@ -1091,19 +1094,23 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     })
     assert.equal(unauthorized.status, 401)
 
-    const readResponse = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
-      headers: { authorization: "Bearer reader" }
+    await waitFor(async () => {
+      const response = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
+        headers: { authorization: "Bearer reader" }
+      })
+      if (response.status !== 200) return false
+      const current = await response.json()
+      return current.value?.through === "http"
     })
-    assert.equal(readResponse.status, 200)
-    const current = await readResponse.json()
-    assert.equal(current.value.through, "http")
 
-    const historyResponse = await fetch(`${baseUrl}/kv/hash:http/history?keyspace=default`, {
-      headers: { authorization: "Bearer reader" }
+    await waitFor(async () => {
+      const response = await fetch(`${baseUrl}/kv/hash:http/history?keyspace=default`, {
+        headers: { authorization: "Bearer reader" }
+      })
+      if (response.status !== 200) return false
+      const history = await response.json()
+      return history.history.length === 1
     })
-    assert.equal(historyResponse.status, 200)
-    const history = await historyResponse.json()
-    assert.equal(history.history.length, 1)
 
     const replicationResponse = await fetch(`${baseUrl}/status/replication`)
     assert.equal(replicationResponse.status, 200)
@@ -1943,14 +1950,13 @@ test("a removed voter cannot regain write authority or satisfy durability after 
     const leaderId = [leaderIdentity.publicKeyId, followerIdentity.publicKeyId, removedIdentity.publicKeyId]
       .sort()[0]
     const leader = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
-    const nonLeaderNodes = nodes
-      .filter((node) => node.options.identity.publicKeyId !== leaderId)
-      .sort((left, right) =>
-        left.options.identity.publicKeyId.localeCompare(right.options.identity.publicKeyId)
-      )
-    const retainedFollower = nonLeaderNodes[0]
-    const removalTarget = nonLeaderNodes[1]
-    const removalTargetId = removalTarget.options.identity.publicKeyId
+    const removalTargetId = removedIdentity.publicKeyId
+    const removalTarget = nodes.find((node) => node.options.identity.publicKeyId === removalTargetId)
+    const retainedFollower = nodes.find((node) =>
+      node.options.identity.publicKeyId !== leaderId && node.options.identity.publicKeyId !== removalTargetId
+    )
+    assert.ok(removalTarget)
+    assert.ok(retainedFollower)
 
     await waitFor(async () => nodes.every((node) => node.currentLeader() === leaderId))
     await leader.put("hash:removed-before", { value: "before-removal" })
@@ -2607,6 +2613,12 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
       .sort()[0]
     const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
     await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
+    await waitFor(async () => {
+      const status = await currentLeaderNode.getReplicationStatus()
+      return nodes
+        .filter((node) => node.options.identity.publicKeyId !== currentLeaderId)
+        .every((node) => status.peerReplication[node.options.identity.publicKeyId]?.alive === true)
+    })
 
     await currentLeaderNode.put("hash:snapshot", { state: "present" })
 
@@ -2704,6 +2716,12 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       .sort()[0]
     const currentLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === currentLeaderId)
     await waitFor(async () => currentLeaderNode.currentLeader() === currentLeaderId)
+    await waitFor(async () => {
+      const status = await currentLeaderNode.getReplicationStatus()
+      return nodes
+        .filter((node) => node.options.identity.publicKeyId !== currentLeaderId)
+        .every((node) => status.peerReplication[node.options.identity.publicKeyId]?.alive === true)
+    })
 
     await currentLeaderNode.put("hash:degraded-snapshot", { phase: "before-snapshot" })
     await currentLeaderNode.put("hash:degraded-delete", { phase: "before-delete" })
