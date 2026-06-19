@@ -3078,13 +3078,120 @@ async function waitForDurableWriteFrom(node, key, value, description, options = 
 
 async function assertClusterInvariants(cluster) {
   const statuses = await collectReplicationStatus(cluster.nodes)
+  const statusList = Object.values(statuses)
+  const voterStatuses = statusList.filter((status) => status.role === "voter")
+  const learnerStatuses = statusList.filter((status) => status.role === "learner")
+  const expectedVoterIds = selectEffectiveVoterIds(voterStatuses)
+  const expectedMajority = expectedVoterIds.length === 0 ? 0 : Math.floor(expectedVoterIds.length / 2) + 1
 
-  for (const status of Object.values(statuses)) {
+  assertLeaderTermInvariant(voterStatuses)
+  assertMembershipQuorumInvariant(statusList, expectedVoterIds, expectedMajority)
+  assertLearnerRoleInvariant(learnerStatuses, expectedVoterIds, expectedMajority)
+  assertMonotonicConsensusInvariant(cluster, statusList)
+  await assertCommittedLogPrefixInvariant(cluster, voterStatuses)
+
+  for (const status of statusList) {
+    assert.ok(status.consensus.lastApplied <= status.consensus.commitIndex)
+    assert.equal(status.authoritativeLog.commitIndex, status.consensus.commitIndex)
+    assert.equal(status.authoritativeLog.lastAppliedIndex, status.consensus.lastApplied)
+
     for (const feed of Object.values(status.peerReplication)) {
       assert.ok(feed.applied <= feed.length)
       assert.ok(feed.lag >= 0)
     }
   }
+}
+
+function assertLeaderTermInvariant(voterStatuses) {
+  const leadersByTerm = new Map()
+
+  for (const status of voterStatuses) {
+    const leaderId = status.leader ?? status.consensus.knownLeader ?? null
+    if (!leaderId) continue
+    const current = leadersByTerm.get(status.consensus.currentTerm)
+    if (!current) {
+      leadersByTerm.set(status.consensus.currentTerm, leaderId)
+      continue
+    }
+    assert.equal(current, leaderId)
+  }
+}
+
+function assertMembershipQuorumInvariant(statusList, expectedVoterIds, expectedMajority) {
+  for (const status of statusList) {
+    const voterIds = status.membership.voters.map((entry) => entry.nodeId).sort()
+    for (const expectedVoterId of expectedVoterIds) {
+      assert.equal(voterIds.includes(expectedVoterId), true)
+    }
+    assert.equal(status.quorum.majority, expectedMajority)
+    assert.equal(status.membership.localRole, status.role)
+  }
+}
+
+function assertLearnerRoleInvariant(learnerStatuses, expectedVoterIds, expectedMajority) {
+  for (const status of learnerStatuses) {
+    assert.equal(status.membership.voters.some((entry) => entry.nodeId === status.nodeId), false)
+    assert.equal(status.membership.learners.some((entry) => entry.nodeId === status.nodeId), true)
+    assert.equal(status.quorum.majority, expectedMajority)
+    assert.equal(status.reelection.allowed, false)
+  }
+
+  if (expectedVoterIds.length === 0) {
+    assert.equal(learnerStatuses.length, 0)
+  }
+}
+
+function assertMonotonicConsensusInvariant(cluster, statusList) {
+  const previous = cluster.__invariantSnapshot ?? {}
+  const next = {}
+
+  for (const status of statusList) {
+    const prior = previous[status.nodeId]
+    if (prior) {
+      assert.ok(status.consensus.commitIndex >= prior.commitIndex)
+      assert.ok(status.consensus.lastApplied >= prior.lastApplied)
+      assert.ok(status.consensus.currentTerm >= prior.currentTerm)
+    }
+
+    next[status.nodeId] = {
+      commitIndex: status.consensus.commitIndex,
+      lastApplied: status.consensus.lastApplied,
+      currentTerm: status.consensus.currentTerm
+    }
+  }
+
+  cluster.__invariantSnapshot = next
+}
+
+async function assertCommittedLogPrefixInvariant(cluster, voterStatuses) {
+  if (voterStatuses.length === 0) return
+
+  const committedIndex = Math.min(...voterStatuses.map((status) => status.consensus.commitIndex))
+  if (committedIndex < 0) return
+
+  const voters = voterStatuses
+    .map((status) => cluster.record(status.nodeId).node)
+    .sort((left, right) => left.options.identity.publicKeyId.localeCompare(right.options.identity.publicKeyId))
+  const referenceNode = voters[0]
+
+  for (let index = 0; index <= committedIndex; index += 1) {
+    const reference = await referenceNode.authoritativeLogCore.get(index)
+
+    for (const node of voters.slice(1)) {
+      const candidate = await node.authoritativeLogCore.get(index)
+      assert.equal(candidate.opId, reference.opId)
+      assert.equal(candidate.entryHash, reference.entryHash)
+      assert.equal(candidate.term, reference.term)
+    }
+  }
+}
+
+function selectEffectiveVoterIds(voterStatuses) {
+  if (voterStatuses.length === 0) return []
+
+  return voterStatuses
+    .map((status) => status.membership.voters.map((entry) => entry.nodeId).sort())
+    .sort((left, right) => left.length - right.length || left.join(":").localeCompare(right.join(":")))[0]
 }
 
 async function assertFeedChainValid(node, sourceNodeId) {
