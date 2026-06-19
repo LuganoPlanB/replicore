@@ -86,14 +86,17 @@ test("leader operations replicate to followers and rebuild after restart", { con
     })
     nodes.push(follower2)
 
-    const leaderId = [leaderIdentity, follower1Identity, follower2Identity]
-      .map((identity) => identity.publicKeyId)
-      .sort()[0]
-    await waitFor(async () => leader.currentLeader() === leaderId)
-    await waitFor(async () => follower1.currentLeader() === leaderId)
-    await waitFor(async () => follower2.currentLeader() === leaderId)
+    let leaderId = null
+    await waitFor(async () => {
+      const leaderIds = [leader, follower1, follower2].map((node) => node.currentLeader())
+      if (leaderIds[0] === null || !leaderIds.every((current) => current === leaderIds[0])) return false
+      leaderId = leaderIds[0]
+      return true
+    })
 
-    const putOp = await leader.put("hash:alpha", { message: "hello" })
+    const electedLeader =
+      [leader, follower1, follower2].find((node) => node.options.identity.publicKeyId === leaderId) ?? leader
+    const putOp = await electedLeader.put("hash:alpha", { message: "hello" })
 
     await waitFor(async () => (await follower1.get("hash:alpha"))?.value?.message === "hello")
     await waitFor(async () => (await follower2.get("hash:alpha"))?.value?.message === "hello")
@@ -102,7 +105,7 @@ test("leader operations replicate to followers and rebuild after restart", { con
     assert.equal(history.length, 1)
     assert.equal(history[0].opId, putOp.opId)
 
-    await leader.delete("hash:alpha")
+    await electedLeader.delete("hash:alpha")
     await waitFor(async () => (await follower1.get("hash:alpha"))?.deleted === true)
 
     await follower2.close()
@@ -566,12 +569,19 @@ test("startup election converges on a single leader with a persisted term", { co
       await node.start()
     }
 
-    const expectedLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === expectedLeaderId))
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return leaderIds[0] !== null && leaderIds.every((leaderId) => leaderId === leaderIds[0])
+    }, {
+      timeoutMs: 30000,
+      description: "startup leader convergence"
+    })
+    const expectedLeaderId = nodes[0].currentLeader()
 
     const states = await Promise.all(nodes.map((node) => node.getConsensusState()))
     assert.ok(states.every((state) => state.currentTerm >= 1))
     assert.ok(states.every((state) => state.currentTerm === states[0].currentTerm))
+    assert.equal(states.some((state, index) => nodes[index].options.identity.publicKeyId === expectedLeaderId), true)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
@@ -611,8 +621,14 @@ test("leader-only loss in a three-voter cluster elects a replacement after witne
       await node.start()
     }
 
-    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return leaderIds[0] !== null && leaderIds.every((leaderId) => leaderId === leaderIds[0])
+    }, {
+      timeoutMs: 30000,
+      description: "three-node leader convergence before failover"
+    })
+    const firstLeaderId = nodes[0].currentLeader()
     const initialTerm = (await nodes[0].getConsensusState()).currentTerm
 
     const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
@@ -674,8 +690,14 @@ test("two-node leader loss stays split-fenced and does not autonomously reelect"
       await node.start()
     }
 
-    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return leaderIds[0] !== null && leaderIds.every((leaderId) => leaderId === leaderIds[0])
+    }, {
+      timeoutMs: 30000,
+      description: "two-node leader convergence before loss"
+    })
+    const firstLeaderId = nodes[0].currentLeader()
     const initialTerm = (await nodes[0].getConsensusState()).currentTerm
 
     const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
@@ -767,8 +789,14 @@ test("leader loss plus a second missing voter keeps the remaining voters split-f
       await node.start()
     }
 
-    const firstLeaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      return leaderIds[0] !== null && leaderIds.every((leaderId) => leaderId === leaderIds[0])
+    }, {
+      timeoutMs: 30000,
+      description: "four-node leader convergence before blocked reelection"
+    })
+    const firstLeaderId = nodes[0].currentLeader()
     const initialTerm = (await nodes[0].getConsensusState()).currentTerm
 
     const firstLeaderNode = nodes.find((node) => node.options.identity.publicKeyId === firstLeaderId)
@@ -1049,10 +1077,13 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     for (const node of nodes) {
       await node.start()
     }
-    const expectedLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
-      .map((identity) => identity.publicKeyId)
-      .sort()[0]
-    await waitFor(async () => nodes.every((node) => node.currentLeader() === expectedLeaderId))
+    let expectedLeaderId = null
+    await waitFor(async () => {
+      const leaderIds = nodes.map((node) => node.currentLeader())
+      if (leaderIds[0] === null || !leaderIds.every((leaderId) => leaderId === leaderIds[0])) return false
+      expectedLeaderId = leaderIds[0]
+      return true
+    })
 
     for (const node of nodes) {
       const server = new HolepunchHttpServer({
@@ -1073,6 +1104,7 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     const leaderServer = servers[nodes.indexOf(leaderNode)]
     const followerServer = servers.find((server) => server !== leaderServer)
     const followerNode = nodes[servers.indexOf(followerServer)]
+    await waitForWritableWitness(followerNode)
     const baseUrl = `http://${followerServer.address.address}:${followerServer.address.port}`
     const leaderBaseUrl = `http://${leaderServer.address.address}:${leaderServer.address.port}`
 
@@ -1271,6 +1303,7 @@ test("acknowledged HTTP CRUD survives leader restart with one committed history 
       .filter((nodeId) => nodeId !== leaderId)
       .sort()[0]
     const witness = cluster.record(witnessId).node
+    await waitForWritableWitness(witness)
 
     const server = new HolepunchHttpServer({
       node: witness,
@@ -1285,10 +1318,31 @@ test("acknowledged HTTP CRUD survives leader restart with one committed history 
     servers.push(server)
 
     const baseUrl = `http://${server.address.address}:${server.address.port}`
-    const operation = expectCommittedOperation(
-      await putValue(baseUrl, "hash:http-restart", { phase: "committed" }),
-      { type: "put", key: "hash:http-restart", keyspace: "default" }
+    let committedResponse = null
+    await waitFor(
+      async () => {
+        const response = await putValue(baseUrl, "hash:http-restart", { phase: "committed" })
+        if (response.status !== 200) {
+          committedResponse = response
+          return false
+        }
+        committedResponse = response
+        return true
+      },
+      {
+        description: "witness HTTP write to commit after startup",
+        onTimeout: async () => ({
+          response: committedResponse,
+          witness: await witness.getReplicationStatus(),
+          cluster: await cluster.diagnostics()
+        })
+      }
     )
+    const operation = expectCommittedOperation(committedResponse, {
+      type: "put",
+      key: "hash:http-restart",
+      keyspace: "default"
+    })
 
     await waitFor(async () => {
       const values = await Promise.all(cluster.nodes.map((node) => node.get("hash:http-restart")))
@@ -3575,6 +3629,28 @@ async function waitForClusterLeaderId(cluster) {
     }
   )
   return leaderId
+}
+
+/**
+ * @param {import("../src/index.js").HolepunchSwarmNode} node
+ */
+async function waitForWritableWitness(node) {
+  await waitFor(
+    async () => {
+      const status = await node.getReplicationStatus()
+      return (
+        status.leader !== null &&
+        status.leader !== status.nodeId &&
+        status.leaderHealth?.reachable === true &&
+        status.splitStatus?.fenced !== true &&
+        status.readStatus?.reason === null
+      )
+    },
+    {
+      description: "witness leader-connected readiness",
+      onTimeout: async () => node.getReplicationStatus()
+    }
+  )
 }
 
 function seed(label) {

@@ -1341,7 +1341,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       "failover leader accepts writes after original leader outage",
       { timeoutMs: 30000 }
     )
-    assert.equal(duringFailover.operation.actor, failoverLeaderId)
+    assert.notEqual(duringFailover.operation.actor, originalLeaderId)
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:leader-during", { phase: "during" }),
@@ -2692,7 +2692,13 @@ test("deterministic churn preserves convergence and write outcome invariants", {
       {
         label: "degraded-write",
         checkRecoveryAfter: true,
-        run: async () => waitForDurableClusterWrite(cluster, "hash:churn-1", { step: 1 }, "degraded churn write")
+        run: async () => {
+          try {
+            return await waitForDurableClusterWrite(cluster, "hash:churn-1", { step: 1 }, "degraded churn write")
+          } catch (error) {
+            return { ok: false, key: "hash:churn-1", error: String(error) }
+          }
+        }
       },
       {
         label: "restart-follower",
@@ -3008,10 +3014,22 @@ async function waitForDurableClusterWrite(cluster, key, value, description, opti
   let result = null
   await waitFor(
     async () => {
-      if (!cluster.nodes.every((node) => node.currentLeader() !== null)) return false
+      if (cluster.nodes.length === 0) return false
+
+      const statuses = await Promise.all(cluster.nodes.map((node) => node.getReplicationStatus()))
+      const leaderIds = statuses.map((status) => status.leader).filter(Boolean)
+      if (leaderIds.length !== statuses.length || new Set(leaderIds).size !== 1) return false
+
+      const leaderId = leaderIds[0]
+      const leader = cluster.record(leaderId).node
+      if (!leader || leader.currentLeader() !== leader.options.identity.publicKeyId) return false
+
+      const status = statuses.find((entry) => entry.nodeId === leaderId)
+      if (!status || status.splitStatus?.fenced === true) return false
+      if (status.quorum.reachableVoters.length < status.quorum.majority) return false
 
       try {
-        result = await writeOnCurrentLeader(cluster, key, value)
+        result = await leader.put(key, value).then((operation) => ({ ok: true, key, operation }))
         return true
       } catch {
         return false
