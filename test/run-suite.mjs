@@ -16,7 +16,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "leader operations replicate|new and restarted followers|reconnected follower truncates|followers forward writes|history keeps actor audit|startup election converges|leader-only loss|two-node leader loss|leader loss plus a second|leader writes require|follower heartbeat diagnostics|consensus state persists|authorized HTTP API",
+      "leader operations replicate|new and restarted followers|reconnected follower truncates|followers forward writes|history keeps actor audit|startup election converges|leader-only loss|two-node leader loss|leader loss plus a second|leader writes require|follower heartbeat diagnostics|consensus state persists|authorized HTTP API|HTTP CRUD failure|acknowledged HTTP CRUD",
       "test/swarm-node.test.js"
     ]
   },
@@ -26,7 +26,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "same-secret unknown peers|init-cluster voter can admit|independently initialized clusters|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion",
+      "same-secret unknown peers|init-cluster voter can admit|independently initialized clusters|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion|learner HTTP CRUD|wrong-secret nodes do not discover",
       "test/swarm-node.test.js"
     ]
   },
@@ -84,7 +84,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "follower write forwarding|concurrent writes|HTTP writes fail|deterministic churn|full-cluster cold restart",
+      "follower write forwarding|concurrent writes|HTTP witness CRUD|deterministic churn|full-cluster cold restart",
       "test/network-perturbation.test.js"
     ]
   }
