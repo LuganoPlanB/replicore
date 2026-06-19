@@ -14,7 +14,9 @@ import {
   expectCommittedOperation,
   expectCommittedValue,
   expectDeleted,
+  expectHistoryOps,
   expectWriteRefusal,
+  getHistory,
   getValue,
   putValue,
   requestJson
@@ -2637,6 +2639,50 @@ test("HTTP witness CRUD keeps writes on the leader-connected side during a split
     for (const node of majorityNodes) {
       assert.equal(await node.get("hash:http-blocked"), null)
     }
+
+    await cluster.healPartition()
+    await waitForClusterConvergence(cluster)
+
+    await waitFor(
+      async () => {
+        const status = await minorityWitness.getReplicationStatus()
+        return status.splitStatus?.fenced === false && status.readStatus?.staleReadsPossible === false
+      },
+      {
+        description: "healed minority witness clears stale split-fenced read state",
+        onTimeout: () => minorityWitness.getReplicationStatus()
+      }
+    )
+
+    await waitFor(
+      async () => {
+        const current = await minorityWitness.get("hash:http-baseline")
+        const duringSplit = await minorityWitness.get("hash:http-majority")
+        return current?.deleted === true && duringSplit?.value?.side === "majority"
+      },
+      {
+        description: "healed minority witness catches up with majority CRUD outcomes",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
+    for (const node of cluster.nodes) {
+      const baseline = await node.get("hash:http-baseline")
+      const duringSplit = await node.get("hash:http-majority")
+      assert.equal(baseline?.deleted, true)
+      assert.deepEqual(duringSplit?.value, { side: "majority" })
+      assert.equal(await node.get("hash:http-blocked"), null)
+    }
+
+    expectDeleted(await getValue(minorityBaseUrl, "hash:http-baseline"))
+    expectCommittedValue(await getValue(minorityBaseUrl, "hash:http-majority"), { side: "majority" })
+    expectHistoryOps(await getHistory(minorityBaseUrl, "hash:http-baseline"), [
+      { type: "put", opId: baselineOperation.opId },
+      { type: "delete", opId: majorityDelete.opId }
+    ])
+    expectHistoryOps(await getHistory(majorityBaseUrl, "hash:http-majority"), [
+      { type: "put", opId: majorityDuringSplit.opId }
+    ])
   } finally {
     await Promise.allSettled(servers.map((server) => server.close()))
     await cluster.closeAll()
