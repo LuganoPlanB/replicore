@@ -2931,7 +2931,10 @@ test("a fresh node can restore current state from a snapshot", { concurrency: fa
       const status = await currentLeaderNode.getReplicationStatus()
       return nodes
         .filter((node) => node.options.identity.publicKeyId !== currentLeaderId)
-        .every((node) => status.peerReplication[node.options.identity.publicKeyId]?.alive === true)
+        .every((node) => {
+          const peer = status.peerReplication[node.options.identity.publicKeyId]
+          return peer?.alive === true && peer?.connectedPeers > 0
+        })
     })
 
     await currentLeaderNode.put("hash:snapshot", { state: "present" })
