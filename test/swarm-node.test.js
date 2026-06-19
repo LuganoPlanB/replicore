@@ -17,6 +17,17 @@ import {
   validateOperation
 } from "../src/index.js"
 import { waitFor } from "./helpers/eventual.js"
+import {
+  expectCommittedOperation,
+  expectCommittedValue,
+  expectHistoryOps,
+  expectRedirectHints,
+  expectWriteRefusal,
+  getHistory,
+  getValue,
+  putValue,
+  requestJson
+} from "./helpers/http-crud.js"
 
 test("leader operations replicate to followers and rebuild after restart", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
@@ -1061,61 +1072,43 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     const baseUrl = `http://${followerServer.address.address}:${followerServer.address.port}`
     const leaderBaseUrl = `http://${leaderServer.address.address}:${leaderServer.address.port}`
 
-    const putResponse = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
-      method: "PUT",
-      headers: {
-        authorization: "Bearer writer",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ value: { through: "http" } })
-    })
-    assert.equal(putResponse.status, 200)
-    const operation = await putResponse.json()
-    assert.equal(typeof operation.opId, "string")
+    const operation = expectCommittedOperation(
+      await putValue(baseUrl, "hash:http", { through: "http" }),
+      { type: "put", key: "hash:http", keyspace: "default" }
+    )
 
     await waitFor(async () => {
-      const response = await fetch(`${leaderBaseUrl}/kv/hash:http-direct?keyspace=default`, {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer writer",
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({ value: { through: "leader" } })
-      })
-      if (response.status !== 503) return false
-      const payload = await response.json()
-      return (
-        payload.code === "not-witness-entrypoint" &&
-        payload.reconnectHints?.witnesses?.some((hint) => hint.httpAddress?.port === followerServer.address.port)
+      const payload = expectWriteRefusal(
+        await putValue(leaderBaseUrl, "hash:http-direct", { through: "leader" }),
+        { status: 503, code: "not-witness-entrypoint" }
       )
+      expectRedirectHints(payload)
+      return true
     })
 
-    const unauthorized = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
-      headers: { authorization: "Bearer missing" }
-    })
-    assert.equal(unauthorized.status, 401)
-
-    await waitFor(async () => {
-      const response = await fetch(`${baseUrl}/kv/hash:http?keyspace=default`, {
-        headers: { authorization: "Bearer reader" }
-      })
-      if (response.status !== 200) return false
-      const current = await response.json()
-      return current.value?.through === "http"
-    })
+    assert.equal((await getValue(baseUrl, "hash:http", { token: "missing" })).status, 401)
 
     await waitFor(async () => {
-      const response = await fetch(`${baseUrl}/kv/hash:http/history?keyspace=default`, {
-        headers: { authorization: "Bearer reader" }
-      })
-      if (response.status !== 200) return false
-      const history = await response.json()
-      return history.history.length === 1
+      try {
+        expectCommittedValue(await getValue(baseUrl, "hash:http"), { through: "http" })
+        return true
+      } catch {
+        return false
+      }
     })
 
-    const replicationResponse = await fetch(`${baseUrl}/status/replication`)
+    await waitFor(async () => {
+      try {
+        expectHistoryOps(await getHistory(baseUrl, "hash:http"), [{ type: "put", opId: operation.opId }])
+        return true
+      } catch {
+        return false
+      }
+    })
+
+    const replicationResponse = await requestJson(`${baseUrl}/status/replication`)
     assert.equal(replicationResponse.status, 200)
-    const replication = await replicationResponse.json()
+    const replication = replicationResponse.payload
     assert.equal(replication.nodeId, followerNode.options.identity.publicKeyId)
     assert.equal(typeof replication.lastDurableSequence, "number")
     assert.equal(typeof replication.knownPeerNodeIds.length, "number")
@@ -1131,34 +1124,29 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     assert.equal(replication.recentRefusal.reason, null)
     assert.equal(typeof replication.reelection.allowed, "boolean")
 
-    const writersResponse = await fetch(`${baseUrl}/status/writers`)
+    const writersResponse = await requestJson(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)
-    const writers = await writersResponse.json()
+    const writers = writersResponse.payload
     assert.equal(writers.authorizedNodes.length, 3)
     assert.equal(typeof writers.currentTerm, "number")
     assert.equal(typeof writers.membershipVersion, "number")
     assert.equal(typeof writers.quorum.majority, "number")
     assert.equal(typeof writers.peerCache.total, "number")
 
-    const leaderResponse = await fetch(`${baseUrl}/status/leader`)
+    const leaderResponse = await requestJson(`${baseUrl}/status/leader`)
     assert.equal(leaderResponse.status, 200)
-    const leader = await leaderResponse.json()
+    const leader = leaderResponse.payload
     assert.equal(typeof leader.currentLeader, "string")
     assert.equal(typeof leader.currentTerm, "number")
     assert.equal(typeof leader.membershipVersion, "number")
     assert.equal(typeof leader.witnessHealth.quorum, "number")
     assert.equal(typeof leader.reelection.allowed, "boolean")
 
-    const snapshotForbidden = await fetch(`${baseUrl}/admin/snapshot`, {
-      headers: { authorization: "Bearer writer" }
-    })
-    assert.equal(snapshotForbidden.status, 403)
+    assert.equal((await requestJson(`${baseUrl}/admin/snapshot`, { token: "writer" })).status, 403)
 
-    const snapshotResponse = await fetch(`${baseUrl}/admin/snapshot`, {
-      headers: { authorization: "Bearer admin" }
-    })
+    const snapshotResponse = await requestJson(`${baseUrl}/admin/snapshot`, { token: "admin" })
     assert.equal(snapshotResponse.status, 200)
-    const snapshot = await snapshotResponse.json()
+    const snapshot = snapshotResponse.payload
     assert.equal(snapshot.version, 1)
   } finally {
     await Promise.allSettled(servers.map((server) => server.close()))
