@@ -9,6 +9,16 @@ import {
   waitFor,
   waitForNoChange
 } from "./helpers/eventual.js"
+import {
+  deleteValue,
+  expectCommittedOperation,
+  expectCommittedValue,
+  expectDeleted,
+  expectWriteRefusal,
+  getValue,
+  putValue,
+  requestJson
+} from "./helpers/http-crud.js"
 import { createIdentities, createSwarmCluster } from "./helpers/swarm-cluster.js"
 
 test("five-node static membership supports forwarding, replication, and deletes", { concurrency: false }, async () => {
@@ -2482,9 +2492,9 @@ test("concurrent writes during split fencing do not create accepted operations b
   }
 })
 
-test("HTTP witness writes fail while leader connectivity is unsafe and recover after heal", { concurrency: false }, async () => {
+test("HTTP witness CRUD keeps writes on the leader-connected side during a split", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
-    size: 3,
+    size: 5,
     heartbeatIntervalMs: 100,
     heartbeatTtlMs: 800
   })
@@ -2502,9 +2512,11 @@ test("HTTP witness writes fail while leader connectivity is unsafe and recover a
     )
 
     const leaderId = currentLeaderId(cluster)
-    const leader = cluster.record(leaderId).node
-    const [witnessId, passiveFollowerId] = liveFollowerIds(cluster, leaderId)
-    const witness = cluster.record(witnessId).node
+    const [minorityWitnessId, majorityWitnessId, ...majorityFollowerIds] = liveFollowerIds(cluster, leaderId)
+    const minorityWitness = cluster.record(minorityWitnessId).node
+    const majorityWitness = cluster.record(majorityWitnessId).node
+    const majorityNodeIds = [leaderId, majorityWitnessId, ...majorityFollowerIds]
+    const majorityNodes = majorityNodeIds.map((nodeId) => cluster.record(nodeId).node)
 
     await waitFor(
       async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
@@ -2514,93 +2526,117 @@ test("HTTP witness writes fail while leader connectivity is unsafe and recover a
       }
     )
 
-    const server = new HolepunchHttpServer({
-      node: witness,
-      auth: {
-        tokens: {
-          admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
-          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+    for (const node of [majorityWitness, minorityWitness]) {
+      const server = new HolepunchHttpServer({
+        node,
+        auth: {
+          tokens: {
+            admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
+            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          }
         }
-      }
-    })
-    await server.start()
-    servers.push(server)
+      })
+      await server.start()
+      servers.push(server)
+    }
 
-    const baseUrl = `http://${server.address.address}:${server.address.port}`
-    const baselinePut = await fetch(`${baseUrl}/kv/hash:http-baseline?keyspace=default`, {
-      method: "PUT",
-      headers: {
-        authorization: "Bearer writer",
-        "content-type": "application/json"
+    const majorityServer = servers.find(
+      (server) => server.options.node.options.identity.publicKeyId === majorityWitnessId
+    )
+    const minorityServer = servers.find(
+      (server) => server.options.node.options.identity.publicKeyId === minorityWitnessId
+    )
+    const majorityBaseUrl = `http://${majorityServer.address.address}:${majorityServer.address.port}`
+    const minorityBaseUrl = `http://${minorityServer.address.address}:${minorityServer.address.port}`
+
+    const baselineOperation = expectCommittedOperation(
+      await putValue(majorityBaseUrl, "hash:http-baseline", { baseline: true }),
+      { type: "put", key: "hash:http-baseline", keyspace: "default" }
+    )
+    assert.ok(baselineOperation.opId)
+
+    await waitFor(
+      async () => hasClusterValue(cluster.nodes, "hash:http-baseline", { baseline: true }),
+      {
+        description: "baseline HTTP CRUD value converges before partition",
+        onTimeout: () => collectClusterDiagnostics(cluster)
       },
-      body: JSON.stringify({ value: { baseline: true } })
-    })
-    assert.equal(baselinePut.status, 200)
+    )
 
-    await cluster.partitionGroups([[witnessId], [leaderId, passiveFollowerId]])
+    await cluster.partitionGroups([[minorityWitnessId], majorityNodeIds])
 
     await waitFor(
       async () => {
-        const status = await witness.getReplicationStatus()
+        const status = await minorityWitness.getReplicationStatus()
         return status.splitStatus?.fenced === true && status.readStatus.reason === "split-fenced"
       },
       {
         description: "HTTP witness becomes split-fenced when leader connectivity is lost",
-        onTimeout: () => witness.getReplicationStatus()
+        onTimeout: () => minorityWitness.getReplicationStatus()
       }
     )
 
-    const blockedPut = await fetch(`${baseUrl}/kv/hash:http-blocked?keyspace=default`, {
-      method: "PUT",
-      headers: {
-        authorization: "Bearer writer",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ value: { blocked: true } })
-    })
-    assert.equal(blockedPut.status, 503)
-    assert.match((await blockedPut.json()).code, /split-fenced|leader-unreachable/)
-
-    const blockedDelete = await fetch(`${baseUrl}/kv/hash:http-baseline?keyspace=default`, {
-      method: "DELETE",
-      headers: {
-        authorization: "Bearer writer"
-      }
-    })
-    assert.equal(blockedDelete.status, 503)
-    assert.match((await blockedDelete.json()).code, /split-fenced|leader-unreachable/)
-
-    await cluster.healPartition()
+    const majorityDuringSplit = expectCommittedOperation(
+      await putValue(majorityBaseUrl, "hash:http-majority", { side: "majority" }),
+      { type: "put", key: "hash:http-majority", keyspace: "default" }
+    )
+    assert.ok(majorityDuringSplit.opId)
 
     await waitFor(
       async () => {
-        const status = await witness.getReplicationStatus()
-        return status.splitStatus?.fenced === false && status.readStatus.staleReadsPossible === false
+        const values = await Promise.all(majorityNodes.map((node) => node.get("hash:http-majority")))
+        return values.every((value) => value?.value?.side === "majority")
       },
       {
-        description: "HTTP witness clears split fencing after heal",
-        onTimeout: () => witness.getReplicationStatus()
+        description: "majority-side HTTP write stays available during split",
+        onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
       }
     )
 
-    const recoveredPut = await fetch(`${baseUrl}/kv/hash:http-blocked?keyspace=default`, {
-      method: "PUT",
-      headers: {
-        authorization: "Bearer writer",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ value: { blocked: false } })
-    })
-    assert.equal(recoveredPut.status, 200)
+    const majorityDelete = expectCommittedOperation(
+      await deleteValue(majorityBaseUrl, "hash:http-baseline"),
+      { type: "delete", key: "hash:http-baseline", keyspace: "default" }
+    )
+    assert.ok(majorityDelete.opId)
 
     await waitFor(
-      async () => hasClusterValue(cluster.nodes, "hash:http-blocked", { blocked: false }),
+      async () => {
+        const values = await Promise.all(majorityNodes.map((node) => node.get("hash:http-baseline")))
+        return values.every((value) => value?.deleted === true)
+      },
       {
-        description: "recovered HTTP witness write converges after heal",
-        onTimeout: () => collectClusterDiagnostics(cluster)
+        description: "majority-side HTTP delete converges within the leader-connected partition",
+        onTimeout: () => collectClusterDiagnostics(cluster, majorityNodes)
       }
     )
+
+    const blockedPut = expectWriteRefusal(
+      await putValue(minorityBaseUrl, "hash:http-blocked", { blocked: true }),
+      { status: 503, code: /split-fenced|leader-unreachable/ }
+    )
+    assert.equal(blockedPut.retryable, true)
+
+    const blockedDelete = expectWriteRefusal(
+      await deleteValue(minorityBaseUrl, "hash:http-baseline"),
+      { status: 503, code: /split-fenced|leader-unreachable/ }
+    )
+    assert.equal(blockedDelete.retryable, true)
+
+    expectCommittedValue(await getValue(minorityBaseUrl, "hash:http-baseline"), { baseline: true })
+    expectCommittedValue(await getValue(majorityBaseUrl, "hash:http-majority"), { side: "majority" })
+    expectDeleted(await getValue(majorityBaseUrl, "hash:http-baseline"))
+
+    const minorityStatus = await requestJson(`${minorityBaseUrl}/status/replication`)
+    assert.equal(minorityStatus.status, 200)
+    assert.equal(minorityStatus.payload.splitStatus?.fenced, true)
+    assert.equal(minorityStatus.payload.readStatus?.staleReadsPossible, true)
+    assert.equal(minorityStatus.payload.readStatus?.reason, "split-fenced")
+
+    assert.equal(await minorityWitness.get("hash:http-blocked"), null)
+    for (const node of majorityNodes) {
+      assert.equal(await node.get("hash:http-blocked"), null)
+    }
   } finally {
     await Promise.allSettled(servers.map((server) => server.close()))
     await cluster.closeAll()
