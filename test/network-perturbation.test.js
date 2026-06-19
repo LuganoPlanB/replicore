@@ -1181,7 +1181,7 @@ test("mismatched membership config blocks degraded writes conservatively", { con
     } else {
       assert.match(
         recoveredWriteError?.message ?? "",
-        /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request|split-fenced)/
+        /(No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request|split-fenced|This node is not the current leader)/
       )
       await waitFor(
         async () => {
