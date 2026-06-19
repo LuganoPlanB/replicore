@@ -16,7 +16,7 @@ import {
   validateLogLink,
   validateOperation
 } from "../src/index.js"
-import { waitFor } from "./helpers/eventual.js"
+import { waitFor, waitForNoChange } from "./helpers/eventual.js"
 import {
   expectAbsent,
   deleteValue,
@@ -1697,6 +1697,102 @@ test("an init-cluster voter can admit and replicate to a secret-first learner", 
       const value = await learner.get("hash:init-cluster-after")
       return value?.value?.value === "after-join"
     })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("a duplicate machine identity is rejected during learner admission", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "5757575757575757575757575757575757575757575757575757575757575757",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const voterIdentity = generateIdentity(seed("duplicate-machine-voter"))
+    const learnerAIdentity = generateIdentity(seed("duplicate-machine-learner-a"))
+    const learnerBIdentity = generateIdentity(seed("duplicate-machine-learner-b"))
+
+    const voter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "duplicate-machine-id-cluster",
+      clusterSecret,
+      machineId: "duplicate-machine-voter-id",
+      identity: voterIdentity,
+      authorizedNodes: [
+        {
+          nodeId: voterIdentity.publicKeyId,
+          publicKey: voterIdentity.publicKey,
+          feedKey: voterIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await voter.start()
+    nodes.push(voter)
+
+    await waitFor(async () => voter.currentLeader() === voterIdentity.publicKeyId)
+    await voter.put("hash:duplicate-machine-before", { value: "before-join" })
+
+    const learnerA = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "duplicate-machine-id-cluster",
+      clusterSecret,
+      role: "learner",
+      machineId: "duplicate-machine-shared-id",
+      identity: learnerAIdentity,
+      authorizedNodes: [],
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learnerA.start()
+    nodes.push(learnerA)
+
+    await waitFor(async () => {
+      const value = await learnerA.get("hash:duplicate-machine-before")
+      return value?.value?.value === "before-join"
+    })
+    assert.equal(learnerA.joinState.accepted, true)
+
+    const learnerB = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "duplicate-machine-id-cluster",
+      clusterSecret,
+      role: "learner",
+      machineId: "duplicate-machine-shared-id",
+      identity: learnerBIdentity,
+      authorizedNodes: [],
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learnerB.start()
+    nodes.push(learnerB)
+
+    await waitForNoChange(
+      async () => voter.getWritersStatus().authorizedNodes.map((entry) => entry.nodeId).sort(),
+      { stableMs: 1000, timeoutMs: 4000 }
+    )
+    await waitForNoChange(async () => learnerB.joinState.accepted, { stableMs: 1000, timeoutMs: 4000 })
+
+    const voterStatus = await voter.getReplicationStatus()
+    assert.equal(
+      voter.getWritersStatus().authorizedNodes.some((entry) => entry.nodeId === learnerBIdentity.publicKeyId),
+      false
+    )
+    assert.equal(
+      voterStatus.membership.learners.some((entry) => entry.nodeId === learnerBIdentity.publicKeyId),
+      false
+    )
+    assert.equal(learnerB.joinState.accepted, false)
+    assert.equal((await learnerB.get("hash:duplicate-machine-before"))?.value?.value ?? null, null)
   } finally {
     await Promise.allSettled(nodes.map((node) => node.close()))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))

@@ -2505,6 +2505,24 @@ export class HolepunchSwarmNode {
     return hint
   }
 
+  /**
+   * Return the most recent peer hint currently bound to a machine ID.
+   *
+   * Machine IDs are cluster-scoped identity anchors for join admission. A
+   * second live node must not claim a machine ID that is already associated to
+   * another node ID.
+   *
+   * @param {string} machineId
+   */
+  #peerHintByMachineId(machineId) {
+    if (typeof machineId !== "string" || machineId.length === 0) return null
+    for (const hint of this.peerHints.values()) {
+      const current = this.#peerHint(hint.nodeId)
+      if (current?.machineId === machineId) return current
+    }
+    return null
+  }
+
   async #recordPeerHint(nodeId, patch) {
     const existing = this.#peerHint(nodeId)
     const now = Date.now()
@@ -3531,6 +3549,28 @@ export class HolepunchSwarmNode {
     }
 
     const nodeId = keyIdFromPublicKey(identityPublicKey)
+    const existingPeerHint = this.#peerHint(nodeId)
+    if (existingPeerHint?.machineId && existingPeerHint.machineId !== message.machineId) {
+      throw this.#createJoinError(
+        "join-rejected",
+        "Join request machineId does not match the existing node identity"
+      )
+    }
+    if (existingPeerHint?.peerPublicKey && existingPeerHint.peerPublicKey !== message.noisePublicKey) {
+      throw this.#createJoinError(
+        "join-rejected",
+        "Join request noisePublicKey does not match the existing node identity"
+      )
+    }
+
+    const existingMachineBinding = this.#peerHintByMachineId(message.machineId)
+    if (existingMachineBinding && existingMachineBinding.nodeId !== nodeId) {
+      throw this.#createJoinError(
+        "join-rejected",
+        `Machine identity ${message.machineId} is already bound to node ${existingMachineBinding.nodeId}`
+      )
+    }
+
     if (this.#currentMembershipRole(nodeId) === "removed" || this.#isRevokedNode(nodeId)) {
       throw this.#createJoinError(
         "join-rejected",
