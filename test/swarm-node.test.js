@@ -18,6 +18,7 @@ import {
 } from "../src/index.js"
 import { waitFor } from "./helpers/eventual.js"
 import {
+  expectAbsent,
   deleteValue,
   expectDeleted,
   expectCommittedOperation,
@@ -30,6 +31,7 @@ import {
   putValue,
   requestJson
 } from "./helpers/http-crud.js"
+import { createSwarmCluster } from "./helpers/swarm-cluster.js"
 
 test("leader operations replicate to followers and rebuild after restart", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
@@ -1180,6 +1182,138 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     await Promise.allSettled(nodes.map((node) => node.close()))
     await testnet.destroy()
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
+test("HTTP CRUD failure before commit stays absent after leader restart", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 800,
+    ackDelayMsByNodeId: {},
+    durability: {
+      requiredFollowerAcks: 1,
+      timeoutMs: 300
+    }
+  })
+  const servers = []
+
+  try {
+    await cluster.startAll()
+
+    const leaderId = await waitForClusterLeaderId(cluster)
+    const followerIds = cluster.records
+      .map((record) => record.identity.publicKeyId)
+      .filter((nodeId) => nodeId !== leaderId)
+      .sort()
+    cluster.options.ackDelayMsByNodeId = Object.fromEntries(followerIds.map((nodeId) => [nodeId, 1000]))
+    await Promise.all(followerIds.map((nodeId) => cluster.restartNode(nodeId)))
+    await waitForClusterLeaderId(cluster)
+
+    const witness = cluster.record(followerIds[0]).node
+    const leader = cluster.record(leaderId).node
+    const server = new HolepunchHttpServer({
+      node: witness,
+      auth: {
+        tokens: {
+          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        }
+      }
+    })
+    await server.start()
+    servers.push(server)
+
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const refused = expectWriteRefusal(
+      await putValue(baseUrl, "hash:http-timeout", { phase: "timed-out" }),
+      { status: [500, 503] }
+    )
+    if (refused.retryable !== undefined) {
+      assert.equal(refused.retryable, true)
+    }
+
+    await waitFor(
+      async () => (await leader.getReplicationStatus()).authoritativeLog.stagedTail.count === 0,
+      {
+        description: "timed-out HTTP write clears the staged authoritative tail",
+        onTimeout: () => cluster.diagnostics()
+      }
+    )
+
+    assert.equal(await leader.get("hash:http-timeout"), null)
+    assert.deepEqual(await leader.getHistory("hash:http-timeout"), [])
+
+    const restartedLeader = await cluster.restartNode(leaderId)
+    await waitForClusterLeaderId(cluster)
+    assert.equal(await restartedLeader.get("hash:http-timeout"), null)
+    assert.deepEqual(await restartedLeader.getHistory("hash:http-timeout"), [])
+    expectAbsent(await getValue(baseUrl, "hash:http-timeout"))
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
+    await cluster.closeAll()
+  }
+})
+
+test("acknowledged HTTP CRUD survives leader restart with one committed history entry", { concurrency: false }, async () => {
+  const cluster = await createSwarmCluster({
+    size: 3,
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 800
+  })
+  const servers = []
+
+  try {
+    await cluster.startAll()
+    const leaderId = await waitForClusterLeaderId(cluster)
+    const witnessId = cluster.records
+      .map((record) => record.identity.publicKeyId)
+      .filter((nodeId) => nodeId !== leaderId)
+      .sort()[0]
+    const witness = cluster.record(witnessId).node
+
+    const server = new HolepunchHttpServer({
+      node: witness,
+      auth: {
+        tokens: {
+          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        }
+      }
+    })
+    await server.start()
+    servers.push(server)
+
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const operation = expectCommittedOperation(
+      await putValue(baseUrl, "hash:http-restart", { phase: "committed" }),
+      { type: "put", key: "hash:http-restart", keyspace: "default" }
+    )
+
+    await waitFor(async () => {
+      const values = await Promise.all(cluster.nodes.map((node) => node.get("hash:http-restart")))
+      return values.every((value) => value?.value?.phase === "committed")
+    })
+
+    await cluster.restartNode(leaderId)
+    await waitForClusterLeaderId(cluster)
+
+    await waitFor(async () => {
+      const values = await Promise.all(cluster.nodes.map((node) => node.get("hash:http-restart")))
+      return values.every((value) => value?.value?.phase === "committed")
+    })
+
+    expectCommittedValue(await getValue(baseUrl, "hash:http-restart"), { phase: "committed" })
+    expectHistoryOps(await getHistory(baseUrl, "hash:http-restart"), [{ type: "put", opId: operation.opId }])
+
+    for (const node of cluster.nodes) {
+      const history = await node.getHistory("hash:http-restart")
+      assert.equal(history.length, 1)
+      assert.equal(history[0].opId, operation.opId)
+    }
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
+    await cluster.closeAll()
   }
 })
 
@@ -3122,6 +3256,26 @@ async function withStandaloneNode(identitySeed, run) {
     await Promise.allSettled([node?.close()].filter(Boolean))
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
+}
+
+/**
+ * Wait until every running cluster node agrees on one live leader.
+ *
+ * @param {Awaited<ReturnType<typeof createSwarmCluster>>} cluster
+ */
+async function waitForClusterLeaderId(cluster) {
+  let leaderId = null
+  await waitFor(
+    async () => {
+      leaderId = cluster.nodes[0]?.currentLeader() ?? null
+      return leaderId !== null && cluster.nodes.every((node) => node.currentLeader() === leaderId)
+    },
+    {
+      description: "cluster leader convergence",
+      onTimeout: () => cluster.diagnostics()
+    }
+  )
+  return leaderId
 }
 
 function seed(label) {
