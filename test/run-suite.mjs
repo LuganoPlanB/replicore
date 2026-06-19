@@ -3,12 +3,50 @@ import { spawn } from "node:child_process"
 const timeoutMs = Number(process.env.REPLICORE_TEST_STEP_TIMEOUT_MS ?? "180000")
 const steps = [
   {
+    label: "raft-engine",
+    args: ["--test", "--test-concurrency=1", "test/raft-engine.test.js"]
+  },
+  {
     label: "config-loader",
     args: ["--test", "--test-concurrency=1", "test/config-loader.test.js"]
   },
   {
-    label: "swarm-node",
-    args: ["--test", "--test-concurrency=1", "test/swarm-node.test.js"]
+    label: "swarm-node-a",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "leader operations replicate|new and restarted followers|reconnected follower truncates|followers forward writes|history keeps actor audit|startup election converges|leader-only loss|two-node leader loss|leader loss plus a second|leader writes require|follower heartbeat diagnostics|consensus state persists|authorized HTTP API|HTTP CRUD failure|acknowledged HTTP CRUD",
+      "test/swarm-node.test.js"
+    ]
+  },
+  {
+    label: "swarm-node-b",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "same-secret unknown peers|init-cluster voter can admit|independently initialized clusters|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion|learner HTTP CRUD|wrong-secret nodes do not discover",
+      "test/swarm-node.test.js"
+    ]
+  },
+  {
+    label: "swarm-node-removed",
+    args: ["test/swarm-node-removed-membership.run.mjs"]
+  },
+  {
+    label: "swarm-node-replacement",
+    args: ["test/swarm-node-replacement-membership.run.mjs"]
+  },
+  {
+    label: "swarm-node-c",
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "--test-name-pattern",
+      "snapshot restore rejects tampered|operation validation rejects mismatched|operation validation rejects inconsistent|operation validation rejects revoked|logical log link validation|sync rejects a feed entry with a bad|sync rejects a feed entry with a corrupted|encryption rotation preserves|fresh node can restore current state|restored node can serve snapshot reads|replication status exposes staged|concurrent leader appends|follower keeps a replicated write staged|committed feed progress survives|staged delete stays out|closing a leader rejects",
+      "test/swarm-node.test.js"
+    ]
   },
   {
     label: "perturbation-a",
@@ -36,7 +74,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "node replacement|mismatched membership|offline follower|offline leader|isolated leader|isolated follower|bootstrap outage|restarted follower stays disconnected|rolling restarts|subgroup partition",
+      "node replacement|mismatched membership|offline follower|offline leader|isolated leader|isolated follower|bootstrap outage|restarted follower keeps cached peer hints|rolling restarts|subgroup partition",
       "test/network-perturbation.test.js"
     ]
   },
@@ -46,14 +84,15 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "follower write forwarding|concurrent writes|HTTP writes fail|deterministic churn|full-cluster cold restart",
+      "follower write forwarding|concurrent writes|HTTP witness CRUD|deterministic churn|full-cluster cold restart",
       "test/network-perturbation.test.js"
     ]
   }
 ]
 
 for (const step of steps) {
-  process.stdout.write(`step ${step.label}: ${process.execPath} ${step.args.join(" ")}\n`)
+  const command = step.cmd ?? process.execPath
+  process.stdout.write(`step ${step.label}: ${command} ${step.args.join(" ")}\n`)
   const exitCode = await runStep(step)
   if (exitCode !== 0) {
     process.exit(exitCode)
@@ -61,7 +100,8 @@ for (const step of steps) {
 }
 
 async function runStep(step) {
-  const child = spawn(process.execPath, step.args, {
+  const command = step.cmd ?? process.execPath
+  const child = spawn(command, step.args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: process.env
   })
@@ -75,7 +115,7 @@ async function runStep(step) {
 
   const timer = setTimeout(() => {
     process.stderr.write(
-      `[${step.label} ERR] timed out after ${timeoutMs}ms: ${process.execPath} ${step.args.join(" ")}\n`
+      `[${step.label} ERR] timed out after ${timeoutMs}ms: ${command} ${step.args.join(" ")}\n`
     )
     child.kill("SIGTERM")
     setTimeout(() => child.kill("SIGKILL"), 5000).unref()

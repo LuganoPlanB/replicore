@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "corestore": "^7.10.1",
+    "hash-wasm": "^4.12.0",
     "hyperbee": "^2.27.3",
     "hypercore": "^11.33.2",
     "hypercore-crypto": "^3.4.2",

@@ -13,7 +13,10 @@ const config = await loadRuntimeConfig(configPath)
 const node = new HolepunchSwarmNode({
   dataDir: config.dataDir,
   clusterId: config.clusterId,
-  topicSalt: config.topicSalt,
+  clusterSecret: config.clusterSecret,
+  role: config.role,
+  machineId: config.machineId,
+  nodeIdentitySeed: config.nodeIdentitySeed,
   identity: config.identity,
   authorizedNodes: config.authorizedNodes,
   revokedNodeIds: config.revokedNodeIds,

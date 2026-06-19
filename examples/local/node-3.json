@@ -1,7 +1,9 @@
 {
   "dataDir": "../../data/node-3",
+  "compatibilityMode": "legacy-static-membership",
   "clusterId": "local-demo",
-  "topicSalt": "local-demo-salt",
+  "clusterSecret": "9999999999999999999999999999999999999999999999999999999999999999",
+  "machineIdentity": "local-demo-node-3",
   "identitySeed": "3333333333333333333333333333333333333333333333333333333333333333",
   "authorizedNodeSeeds": [
     "1111111111111111111111111111111111111111111111111111111111111111",

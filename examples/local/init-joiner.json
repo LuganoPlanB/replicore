@@ -1,0 +1,36 @@
+{
+  "dataDir": "../../data/init-joiner",
+  "clusterId": "local-demo-fresh",
+  "clusterSecret": "8888888888888888888888888888888888888888888888888888888888888888",
+  "role": "learner",
+  "machineIdentity": "local-demo-init-joiner",
+  "identitySeed": "6666666666666666666666666666666666666666666666666666666666666666",
+  "encryptionKey": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "bootstrap": [
+    {
+      "host": "127.0.0.1",
+      "port": 49737
+    }
+  ],
+  "http": {
+    "host": "127.0.0.1",
+    "port": 3011
+  },
+  "auth": {
+    "tokens": {
+      "admin": {
+        "admin": true,
+        "readKeyspaces": ["*"],
+        "writeKeyspaces": ["*"]
+      },
+      "writer": {
+        "readKeyspaces": ["default"],
+        "writeKeyspaces": ["default"]
+      },
+      "reader": {
+        "readKeyspaces": ["default"],
+        "writeKeyspaces": []
+      }
+    }
+  }
+}

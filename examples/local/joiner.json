@@ -1,15 +1,10 @@
 {
-  "dataDir": "../../data/node-2",
-  "compatibilityMode": "legacy-static-membership",
+  "dataDir": "../../data/node-4",
   "clusterId": "local-demo",
   "clusterSecret": "9999999999999999999999999999999999999999999999999999999999999999",
-  "machineIdentity": "local-demo-node-2",
-  "identitySeed": "2222222222222222222222222222222222222222222222222222222222222222",
-  "authorizedNodeSeeds": [
-    "1111111111111111111111111111111111111111111111111111111111111111",
-    "2222222222222222222222222222222222222222222222222222222222222222",
-    "3333333333333333333333333333333333333333333333333333333333333333"
-  ],
+  "role": "learner",
+  "machineIdentity": "local-demo-node-4",
+  "identitySeed": "4444444444444444444444444444444444444444444444444444444444444444",
   "encryptionKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "bootstrap": [
     {
@@ -19,7 +14,7 @@
   ],
   "http": {
     "host": "127.0.0.1",
-    "port": 3002
+    "port": 3004
   },
   "auth": {
     "tokens": {

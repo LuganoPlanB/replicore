@@ -38,6 +38,7 @@ export class HolepunchHttpServer {
     await new Promise((resolve) => {
       this.server.listen(this.options.port, this.options.host, resolve)
     })
+    await this.options.node.setHttpAddress(this.address)
   }
 
   async close() {
@@ -46,6 +47,7 @@ export class HolepunchHttpServer {
       this.server.close((error) => (error ? reject(error) : resolve()))
     })
     this.server = null
+    await this.options.node.setHttpAddress(null)
   }
 
   get address() {
@@ -81,6 +83,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "PUT") {
           this.#authorize(req, keyspace, "write")
+          await this.options.node.qualifyClientWriteEntrypoint()
           const body = await this.#readJson(req)
           const operation = await this.options.node.put(key, body.value, { keyspace })
           return this.#json(res, 200, operation)
@@ -88,6 +91,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "DELETE") {
           this.#authorize(req, keyspace, "write")
+          await this.options.node.qualifyClientWriteEntrypoint()
           const operation = await this.options.node.delete(key, { keyspace })
           return this.#json(res, 200, operation)
         }
@@ -129,9 +133,7 @@ export class HolepunchHttpServer {
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
-      return this.#json(res, status, {
-        error: error instanceof Error ? error.message : String(error)
-      })
+      return this.#json(res, status, this.#errorPayload(error))
     }
   }
 
@@ -139,6 +141,7 @@ export class HolepunchHttpServer {
     const grants = this.#tokenGrants(req)
     if (!grants) {
       const error = new Error("Unauthorized")
+      error.code = "UNAUTHORIZED"
       error.statusCode = 401
       throw error
     }
@@ -146,6 +149,7 @@ export class HolepunchHttpServer {
     const allowed = mode === "read" ? grants.readKeyspaces ?? [] : grants.writeKeyspaces ?? []
     if (!(allowed.includes("*") || allowed.includes(keyspace))) {
       const error = new Error("Forbidden")
+      error.code = "FORBIDDEN"
       error.statusCode = 403
       throw error
     }
@@ -155,12 +159,14 @@ export class HolepunchHttpServer {
     const grants = this.#tokenGrants(req)
     if (!grants) {
       const error = new Error("Unauthorized")
+      error.code = "UNAUTHORIZED"
       error.statusCode = 401
       throw error
     }
 
     if (grants.admin !== true) {
       const error = new Error("Forbidden")
+      error.code = "FORBIDDEN"
       error.statusCode = 403
       throw error
     }
@@ -177,6 +183,29 @@ export class HolepunchHttpServer {
     for await (const chunk of req) chunks.push(chunk)
     if (chunks.length === 0) return {}
     return JSON.parse(Buffer.concat(chunks).toString("utf8"))
+  }
+
+  #errorPayload(error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const payload = {
+      error: message
+    }
+    if (error?.code) payload.code = error.code
+    if (error?.refusal) {
+      payload.refusal = error.refusal
+      payload.code = error.refusal.code
+      payload.message = error.refusal.message
+      payload.retryable = error.refusal.retryable
+      payload.currentTerm = error.refusal.currentTerm
+      payload.knownLeaderId = error.refusal.knownLeaderId
+      payload.leaderReachable = error.refusal.leaderReachable
+      payload.splitStatus = error.refusal.splitStatus
+      payload.commitIndex = error.refusal.commitIndex
+      payload.membershipVersion = error.refusal.membershipVersion
+      payload.role = error.refusal.role
+      payload.reconnectHints = error.refusal.reconnectHints
+    }
+    return payload
   }
 
   #json(res, statusCode, payload) {

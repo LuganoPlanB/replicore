@@ -20,13 +20,17 @@ const RESOURCE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_RESOURCE_TIMEOUT_M
  *   identities?: Array<{ publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string }>,
  *   authorizedNodes?: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
  *   authorizedNodesByNodeId?: Record<string, Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>>,
+ *   membership?: { version?: number, voters?: string[], learners?: string[], removed?: string[] },
  *   dataDirs?: string[],
  *   clusterId?: string,
+ *   clusterSecret?: Buffer,
+ *   machineIds?: string[],
  *   topicSalt?: string,
  *   encryptionKey?: Buffer,
  *   heartbeatIntervalMs?: number,
  *   heartbeatTtlMs?: number,
  *   forwarding?: boolean,
+ *   ackDelayMsByNodeId?: Record<string, number>,
  *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number },
  *   revokedNodeIds?: string[],
  *   identityLabels?: string[],
@@ -53,10 +57,12 @@ export async function createSwarmCluster(options = {}) {
 
   for (const [index, identity] of identities.entries()) {
     const label = options.identityLabels?.[index] ?? defaultNodeLabel(index)
+    const dataDir = options.dataDirs?.[index] ?? (await tempDir(dirs))
     records.set(identity.publicKeyId, {
       label,
       identity,
-      dataDir: options.dataDirs?.[index] ?? (await tempDir(dirs)),
+      dataDir,
+      machineId: options.machineIds?.[index] ?? `test-machine:${dataDir}`,
       node: null
     })
   }
@@ -70,10 +76,17 @@ export async function createSwarmCluster(options = {}) {
     trace,
     options: {
       clusterId: options.clusterId ?? "test-cluster",
+      clusterSecret:
+        options.clusterSecret ??
+        Buffer.from(
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "hex"
+        ),
       topicSalt: options.topicSalt ?? "test-salt",
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? 500,
       heartbeatTtlMs: options.heartbeatTtlMs ?? 3000,
       forwarding: options.forwarding ?? true,
+      ackDelayMsByNodeId: options.ackDelayMsByNodeId ?? {},
       durability: options.durability,
       revokedNodeIds: options.revokedNodeIds ?? []
     },
@@ -164,14 +177,18 @@ export async function createSwarmCluster(options = {}) {
       const nodeOptions = {
         dataDir: record.dataDir,
         clusterId: this.options.clusterId,
+        clusterSecret: this.options.clusterSecret,
+        machineId: record.machineId,
         topicSalt: this.options.topicSalt,
         identity: record.identity,
         authorizedNodes: options.authorizedNodesByNodeId?.[record.identity.publicKeyId] ?? this.authorizedNodes,
+        membership: options.membership,
         encryptionKey: this.encryptionKey,
         bootstrap: options.bootstrap ?? this.testnet?.bootstrap ?? [],
         heartbeatIntervalMs: this.options.heartbeatIntervalMs,
         heartbeatTtlMs: this.options.heartbeatTtlMs,
         forwarding: this.options.forwarding,
+        ackDelayMs: this.options.ackDelayMsByNodeId[record.identity.publicKeyId],
         revokedNodeIds: this.options.revokedNodeIds
       }
       if (this.options.durability) {

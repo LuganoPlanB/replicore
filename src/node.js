@@ -1,43 +1,71 @@
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 
 import Corestore from "corestore"
 import Hyperbee from "hyperbee"
-import Hyperswarm from "hyperswarm"
+import Hypercore from "hypercore"
+import crypto from "hypercore-crypto"
 
 import { canonicalize } from "./canonical.js"
-import { deriveTopic } from "./config.js"
+import { deriveClusterLogSeed } from "./cluster-secret.js"
+import { ConsensusStateStore } from "./consensus-state.js"
+import { keyIdFromPublicKey, signPayload, verifyPayload } from "./crypto.js"
+import { DurabilityWaiter } from "./durability-waiter.js"
+import { JoinControl } from "./join-control.js"
 import {
   createSignedOperation,
   decryptOperationValue,
+  validateLogLink,
   validateOperation,
   verifySignedOperation
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
+import { NodeRpcRouter } from "./node-rpc.js"
+import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
+import { validatePromotionCredential } from "./promotion-credential.js"
+import { ConsensusEngine, majoritySize } from "./raft-engine.js"
+import { SwarmNetwork } from "./swarm-network.js"
+import { deriveTopic } from "./config.js"
+import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
 
-const RPC_EXTENSION = "planb-cleard-rpc-v1"
+const JOIN_REQUEST_MAX_SKEW_MS = 5 * 60 * 1000
+const PEER_HINT_TTL_MS = 15 * 60 * 1000
 
 /**
- * Minimal multi-node swarm with one feed per node and leader-only writes.
+ * Minimal multi-node swarm whose committed cluster history is represented by
+ * one authoritative leader log.
+ *
+ * During the storage transition, that authoritative log is modeled as the
+ * current leader's Hypercore feed. Other per-node feeds still exist as
+ * replication scaffolding, but they are not the authoritative CRUD history.
  */
 export class HolepunchSwarmNode {
   /**
    * @param {{
- *   dataDir: string,
- *   clusterId: string,
- *   topicSalt: string,
- *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
- *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
- *   revokedNodeIds?: string[],
- *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
- *   encryptionKey?: Buffer,
- *   bootstrap?: Array<string | { host: string, port: number }>,
- *   heartbeatIntervalMs?: number,
- *   heartbeatTtlMs?: number,
- *   forwarding?: boolean,
- *   ackDelayMs?: number,
- *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
+   *   dataDir: string,
+   *   clusterId: string,
+   *   clusterSecret?: Buffer,
+   *   role?: "voter" | "learner",
+   *   machineId?: string,
+   *   topicSalt?: string,
+   *   identity: { publicKeyId: string, publicKey: Buffer, secretKey: Buffer, feedKey: string },
+   *   authorizedNodes: Array<{ nodeId: string, publicKey: Buffer, feedKey: string }>,
+   *   membership?: { version?: number, voters?: string[], learners?: string[], removed?: string[] },
+   *   revokedNodeIds?: string[],
+   *   encryption?: { currentKeyId: string, keys: Record<string, Buffer> },
+   *   encryptionKey?: Buffer,
+   *   bootstrap?: Array<string | { host: string, port: number }>,
+   *   heartbeatIntervalMs?: number,
+   *   heartbeatTtlMs?: number,
+   *   electionTimeoutMinMs?: number,
+   *   electionTimeoutMaxMs?: number,
+   *   requestTimeoutMs?: number,
+   *   maxInflightReplication?: number,
+   *   electionTimeoutSeed?: string | null,
+   *   forwarding?: boolean,
+   *   ackDelayMs?: number,
+   *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
    *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
    * }} options
    */
@@ -45,13 +73,23 @@ export class HolepunchSwarmNode {
     this.options = {
       heartbeatIntervalMs: 500,
       heartbeatTtlMs: 3000,
+      electionTimeoutMinMs: 900,
+      electionTimeoutMaxMs: 1500,
+      requestTimeoutMs: options.durability?.timeoutMs ?? 5000,
+      maxInflightReplication: 16,
+      electionTimeoutSeed: null,
       forwarding: true,
       durability: {
         requiredFollowerAcks: 1,
         timeoutMs: 5000,
         ...options.durability
       },
-      ...options
+      ...options,
+      authorizedNodes: (options.authorizedNodes ?? []).map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: Buffer.from(node.publicKey),
+        feedKey: node.feedKey
+      }))
     }
     this.revokedNodeIds = new Set(this.options.revokedNodeIds ?? [])
     this.encryption = this.options.encryption ?? {
@@ -59,66 +97,126 @@ export class HolepunchSwarmNode {
       keys: { default: this.options.encryptionKey }
     }
     this.store = null
-    this.swarm = null
+    this.consensusBee = null
+    this.consensusStateStore = null
+    this.consensusState = null
+    this.membershipState = null
+    this.network = null
+    this.rpc = null
+    this.joinControl = null
+    this.transportIdentity = null
     this.viewBee = null
     this.view = null
-    this.discovery = null
+    this.authoritativeLogIdentity = null
+    this.authoritativeLogCore = null
     this.feedCores = new Map()
+    this.peerHints = new Map()
+    this.localHttpAddress = null
     this.heartbeatTimer = null
     this.heartbeatPromise = null
+    this.authoritativeSyncTimer = null
+    this.peerMaintenanceTimer = null
+    this.electionTimer = null
     this.syncPromises = new Map()
+    this.authoritativeSyncPromise = null
+    this.authoritativeSyncPending = false
     this.pendingSync = new Set()
-    this.rpcExtensions = new Map()
-    this.requestId = 0
-    this.inflightRequests = new Map()
-    this.ackWaiters = new Map()
+    this.localAppendLock = Promise.resolve()
+    this.durabilityWaiter = new DurabilityWaiter({
+      feedKey: this.options.identity.feedKey,
+      timeoutMs: this.options.durability.timeoutMs,
+      requiredFollowerAcks: this.options.durability.requiredFollowerAcks
+    })
+    this.joinState = {
+      accepted: false,
+      leaderNodeId: null,
+      recovery: null
+    }
+    this.sentJoinRequestKeys = new Set()
+    this.seenJoinRequestNonces = new Set()
     this.lastHeartbeatByNode = new Map()
-    this.connections = new Set()
-    this.remoteNodeIdsByConnectionKey = new Map()
-    this.networkPolicy = this.options.networkPolicy ?? null
+    this.splitState = {
+      fenced: false,
+      reason: null,
+      leaderNodeId: null,
+      since: null
+    }
+    this.diagnosticState = {
+      lastTruncationAt: null,
+      lastTruncationReason: null,
+      lastRejectedWriteAt: null,
+      lastRejectedWriteReason: null,
+      reconciliation: {
+        state: "idle",
+        at: null,
+        detail: null
+      }
+    }
+    this.consensusEngine = new ConsensusEngine({
+      localNodeId: this.options.identity.publicKeyId
+    })
+    this.electionState = this.consensusEngine.state
     this.closing = false
-    this.lastDurableSequence = -1
   }
 
   async start() {
     await mkdir(this.options.dataDir, { recursive: true })
     await mkdir(join(this.options.dataDir, "corestore"), { recursive: true })
+    this.transportIdentity = await resolveTransportIdentity({
+      dataDir: this.options.dataDir,
+      clusterSecret: this.options.clusterSecret,
+      machineId: this.options.machineId
+    })
 
     this.store = new Corestore(join(this.options.dataDir, "corestore"))
     await this.store.ready()
+    this.authoritativeLogIdentity = await this.#resolveAuthoritativeLogIdentity()
 
     const viewCore = this.store.get({ name: "derived-view" })
     this.viewBee = new Hyperbee(viewCore, { keyEncoding: "utf-8", valueEncoding: "json" })
     this.view = new MaterializedView(this.viewBee)
     await this.viewBee.ready()
+    const consensusCore = this.store.get({ name: "consensus-state" })
+    this.consensusBee = new Hyperbee(consensusCore, { keyEncoding: "utf-8", valueEncoding: "json" })
+    await this.consensusBee.ready()
+    this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
+    this.consensusState = await this.consensusStateStore.load()
+    await this.#loadPeerHints()
+    this.splitState = {
+      fenced: this.consensusState.splitFenced === true,
+      reason: this.consensusState.splitReason ?? null,
+      leaderNodeId: this.consensusState.splitLeaderNodeId ?? null,
+      since: null
+    }
+    this.membershipState = await this.#loadMembershipState()
+    await this.#seedKnownLeaderFromPersistedHeartbeats()
+    this.rpc = new NodeRpcRouter({
+      localNodeId: this.options.identity.publicKeyId,
+      timeoutMs: this.options.requestTimeoutMs,
+      ackDelayMs: this.options.ackDelayMs,
+      onPeerIdentity: (nodeId, peer) => this.network?.observePeerIdentity(nodeId, peer),
+      onWriteRequest: async (message) => {
+        if (this.currentLeader() !== this.options.identity.publicKeyId) {
+          throw new Error("This node is not the current leader")
+        }
+        if (this.#membershipRole(message.from) !== "voter") {
+          throw this.#createLearnerWriteError()
+        }
+
+        return message.request.action === "put"
+          ? this.#appendKvOperation("put", message.request.key, message.request.value, message.request.options ?? {})
+          : this.#appendKvOperation("delete", message.request.key, undefined, message.request.options ?? {})
+      },
+      onVoteRequest: async (message) => this.#handleVoteRequest(message),
+      onAppendEntries: async (message) => this.#handleAppendEntries(message),
+      onWriteAck: (nodeId, seq) => this.#recordAck(nodeId, seq)
+    })
+    this.authoritativeLogCore = await this.#ensureAuthoritativeLogCore()
+    await this.#ensureFeedCore(this.#localNodeRecord())
 
     for (const node of this.options.authorizedNodes) {
-      if (this.#isRevokedNode(node.nodeId)) continue
-      const isLocal = node.nodeId === this.options.identity.publicKeyId
-      const core = isLocal
-        ? this.store.get({
-            keyPair: {
-              publicKey: this.options.identity.publicKey,
-              secretKey: this.options.identity.secretKey
-            },
-            valueEncoding: "json"
-          })
-        : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
-
-      await core.ready()
-      if (!isLocal) {
-        core.on("peer-add", (peer) => this.#onCorePeerUpdate(true, node.nodeId, peer))
-        core.on("peer-remove", (peer) => this.#onCorePeerUpdate(false, node.nodeId, peer))
-      }
-      core.on("append", () => {
-        void this.syncFeed(node.nodeId).catch((error) => {
-          if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
-            throw error
-          }
-        })
-      })
-      this.feedCores.set(node.nodeId, core)
-      this.rpcExtensions.set(node.nodeId, this.#registerRpcExtension(core))
+      if (this.#isRevokedNode(node.nodeId) || node.nodeId === this.options.identity.publicKeyId) continue
+      await this.#ensureFeedCore(node)
     }
 
     await this.#startNetworking()
@@ -136,16 +234,17 @@ export class HolepunchSwarmNode {
         }
       })
     }
+    if (this.#usesSharedAuthoritativeLog()) {
+      await this.syncAuthoritativeLog()
+      this.#scheduleAuthoritativeSyncTimer()
+    }
 
-    await this.#runHeartbeat()
-    this.heartbeatTimer = setInterval(() => {
-      void this.#runHeartbeat().catch((error) => {
-        if (!this.closing && error?.code !== "SESSION_CLOSED") {
-          throw error
-        }
-      })
-    }, this.options.heartbeatIntervalMs)
-    this.heartbeatTimer.unref?.()
+    if (!this.#isLearner()) {
+      this.#scheduleElectionTimer()
+    }
+    if (this.#shouldEmitHeartbeats()) {
+      await this.#ensureHeartbeatLoopStarted()
+    }
   }
 
   /**
@@ -153,30 +252,19 @@ export class HolepunchSwarmNode {
    * Intended for diagnostics and tests that need live isolation.
    */
   async suspendNetworking() {
-    if (!this.swarm) return
-
-    for (const conn of this.connections) {
-      conn.destroy()
-    }
-    this.connections.clear()
-
-    if (this.discovery) {
-      await this.discovery.destroy()
-      this.discovery = null
-    }
-
-    await this.swarm.destroy()
-    this.swarm = null
+    await this.network?.suspend()
   }
 
   /**
    * Rejoin the swarm after a temporary networking suspension.
    */
   async resumeNetworking() {
-    if (this.closing || this.swarm) return
+    if (this.closing) return
 
-    await this.#startNetworking()
-    await this.#runHeartbeat()
+    await this.network?.resume()
+    if (this.#shouldEmitHeartbeats()) {
+      await this.#runHeartbeat()
+    }
   }
 
   /**
@@ -185,35 +273,29 @@ export class HolepunchSwarmNode {
    * @param {{ allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean } | null} networkPolicy
    */
   async setNetworkPolicy(networkPolicy = null) {
-    this.networkPolicy = networkPolicy
-    this.#enforceConnectionPolicy()
+    this.options.networkPolicy = networkPolicy
+    this.network?.setPolicy(networkPolicy)
   }
 
   get status() {
-    return {
+    return buildNodeStatus({
       nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
       leader: this.currentLeader(),
       knownHeartbeats: [...this.lastHeartbeatByNode.keys()],
-      connections: this.connections.size,
+      connections: this.network?.connectionCount ?? 0,
       encryptionKeyId: this.encryption.currentKeyId,
       feeds: Object.fromEntries(
         [...this.feedCores.entries()].map(([nodeId, core]) => [nodeId, core.length])
       )
-    }
+    })
   }
 
   currentLeader() {
-    const now = Date.now()
-    return this.options.authorizedNodes
-      .filter((node) => {
-        if (this.#isRevokedNode(node.nodeId)) return false
-        if (node.nodeId === this.options.identity.publicKeyId) return true
-        const heartbeat = this.lastHeartbeatByNode.get(node.nodeId)
-        if (!heartbeat) return false
-        return now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs
-      })
-      .map((node) => node.nodeId)
-      .sort()[0] ?? null
+    return this.consensusEngine.currentLeader({
+      isLearner: this.#isLearner(),
+      heartbeatTtlMs: this.options.heartbeatTtlMs
+    })
   }
 
   /**
@@ -222,6 +304,16 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async put(key, value, options = {}) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
+    await this.#refreshAuthoritativeMembership()
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
+    }
+    if (await this.#shouldBlockForMembershipMismatch()) {
+      throw this.#createMembershipChangingError()
+    }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "put", key, value, options })
     }
@@ -234,11 +326,37 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async delete(key, options = {}) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
+    await this.#refreshAuthoritativeMembership()
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
+    }
+    if (await this.#shouldBlockForMembershipMismatch()) {
+      throw this.#createMembershipChangingError()
+    }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "delete", key, options })
     }
 
     return this.#appendKvOperation("delete", key, undefined, options)
+  }
+
+  async qualifyClientWriteEntrypoint() {
+    await this.#refreshAuthoritativeMembership()
+    if (this.currentLeader() === this.options.identity.publicKeyId) {
+      throw this.#createNotWitnessEntrypointError()
+    }
+  }
+
+  async setHttpAddress(address) {
+    this.localHttpAddress = this.#normalizeHttpAddress(address)
+    await this.#recordPeerHint(this.options.identity.publicKeyId, {
+      httpAddress: this.localHttpAddress,
+      peerPublicKey: this.transportIdentity?.publicKeyHex ?? null,
+      role: this.#role()
+    })
   }
 
   /**
@@ -272,75 +390,486 @@ export class HolepunchSwarmNode {
 
   async getReplicationStatus() {
     const heartbeats = await this.view.getHeartbeats()
-    const feeds = {}
+    const peerReplication = {}
     const now = Date.now()
 
     for (const node of this.options.authorizedNodes) {
-      const core = this.feedCores.get(node.nodeId)
-      if (!core) continue
-      const applied = await this.view.getApplied(node.feedKey)
-      const heartbeat = heartbeats[node.nodeId] ?? null
-      feeds[node.nodeId] = {
-        feedKey: node.feedKey,
-        length: core.length,
-        applied,
-        lag: core.length - applied,
-        connectedPeers: core.peers.length,
-        alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
-        heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null
-      }
+      if (this.#isRevokedNode(node.nodeId)) continue
+      const status = await this.#feedReplicationStatus(node.nodeId, heartbeats, now)
+      if (!status) continue
+      peerReplication[node.nodeId] = status
     }
 
-    return {
-      nodeId: this.options.identity.publicKeyId,
-      leader: this.currentLeader(),
-      connections: this.connections.size,
-      lastDurableSequence: this.lastDurableSequence,
-      encryptionKeyId: this.encryption.currentKeyId,
-      knownPeerNodeIds: [...this.connections].map((conn) => conn.remotePublicKey.toString("hex")),
-      membership: this.#membershipStatus(heartbeats),
-      network: this.#networkStatus(),
-      readStatus: this.#readStatus(),
-      feeds,
-      heartbeats
+    const authoritativeLogNodeId = this.#authoritativeLogNodeId()
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const authoritativeReplication = await this.#authoritativeReplicationStatus()
+    const leaderFeedStatus =
+      peerReplication[authoritativeLogNodeId] ??
+      (await this.#feedReplicationStatus(authoritativeLogNodeId, heartbeats, now))
+    const knownLeader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    const witnessHealth = this.#witnessLivenessSummary(heartbeats, knownLeader)
+    const uncommittedTailLength = Math.max(0, authoritativeLog.length - authoritativeReplication.applied)
+    const reconciliationState = uncommittedTailLength > 0 ? "reconciling" : "in-sync"
+    const antiEntropy = {
+      state: reconciliationState,
+      at: this.diagnosticState.reconciliation.at,
+      detail: this.diagnosticState.reconciliation.detail,
+      uncommittedTailLength,
+      stagedTail: authoritativeReplication.staged
     }
+
+    return buildReplicationStatus({
+      nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
+      leader: this.currentLeader(),
+      consensus: {
+        currentTerm: this.consensusState.currentTerm,
+        commitIndex: this.consensusState.commitIndex,
+        lastApplied: this.consensusState.lastApplied,
+        lastLogIndex: authoritativeLog.lastLogIndex,
+        lastLogTerm: authoritativeLog.lastLogTerm,
+        membershipVersion: this.membershipState.current.version,
+        knownLeader
+      },
+      leaderHealth: this.#leaderHealth(heartbeats, knownLeader, leaderFeedStatus),
+      witnessHealth,
+      quorum: this.#quorumStatus(witnessHealth),
+      authoritativeLog: {
+        ...authoritativeLog,
+        commitIndex: this.consensusState.commitIndex,
+        lastAppliedIndex: this.consensusState.lastApplied,
+        snapshotWatermark: authoritativeReplication.applied - 1,
+        uncommittedTailLength,
+        stagedTail: authoritativeReplication.staged,
+        lastTruncationAt: this.diagnosticState.lastTruncationAt,
+        lastTruncationReason: this.diagnosticState.lastTruncationReason,
+        lastRejectedWriteAt: this.diagnosticState.lastRejectedWriteAt,
+        lastRejectedWriteReason: this.diagnosticState.lastRejectedWriteReason,
+        reconciliation: antiEntropy,
+        connectedPeers: leaderFeedStatus?.connectedPeers ?? 0,
+        alive: leaderFeedStatus?.alive ?? false,
+        heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? null
+      },
+      peerReplication,
+      splitStatus: { ...this.splitState },
+      connections: this.network?.connectionCount ?? 0,
+      lastDurableSequence: this.durabilityWaiter.status().lastDurableSequence,
+      encryptionKeyId: this.encryption.currentKeyId,
+      knownPeerNodeIds: this.network?.knownPeerPublicKeys ?? [],
+      membership: this.#membershipStatus(heartbeats),
+      promotion: await this.#promotionStatus(),
+      peerCache: this.#peerCacheSummary(),
+      antiEntropy,
+      recentRefusal: {
+        at: this.diagnosticState.lastRejectedWriteAt,
+        reason: this.diagnosticState.lastRejectedWriteReason
+      },
+      reelection: await this.#reelectionStatus(heartbeats, knownLeader),
+      network: this.network?.networkStatus() ?? { policyActive: false, allowedNodeIds: [], peers: {} },
+      readStatus: this.#readStatus(),
+      heartbeatByNode: heartbeats
+    })
   }
 
   getWritersStatus() {
-    return {
+    return buildWritersStatus({
+      role: this.#role(),
       currentLeader: this.currentLeader(),
+      currentTerm: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
       membershipFingerprint: this.#membershipFingerprint(),
+      membership: this.#membershipEntries(),
+      quorum: this.#quorumStatus(),
+      peerCache: this.#peerCacheSummary(),
+      recentRefusal: {
+        at: this.diagnosticState.lastRejectedWriteAt,
+        reason: this.diagnosticState.lastRejectedWriteReason
+      },
       authorizedNodes: this.options.authorizedNodes.map((node) => ({
         nodeId: node.nodeId,
         feedKey: node.feedKey,
+        role: this.#membershipRole(node.nodeId),
         revoked: this.#isRevokedNode(node.nodeId)
       }))
-    }
+    })
   }
 
   async getLeaderStatus() {
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     const heartbeats = await this.view.getHeartbeats()
+    const witnessHealth = this.#witnessLivenessSummary(heartbeats, leader)
 
-    return {
+    return buildLeaderStatus({
       nodeId: this.options.identity.publicKeyId,
+      role: this.#role(),
       currentLeader: leader,
       reachable: leader ? this.#isLeaderReachable(leader) : false,
-      heartbeat: leader ? (heartbeats[leader] ?? null) : null
+      heartbeat: leader ? (heartbeats[leader] ?? null) : null,
+      currentTerm: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
+      splitStatus: { ...this.splitState },
+      witnessHealth,
+      reelection: await this.#reelectionStatus(heartbeats, leader)
+    })
+  }
+
+  async getConsensusState() {
+    return { ...this.consensusState }
+  }
+
+  /**
+   * Return the single authoritative Raft log descriptor that this node is
+   * currently following.
+   */
+  async getAuthoritativeLogStatus() {
+    const node = this.#authoritativeLogRecord()
+    const core = this.#authoritativeLogCore()
+    const tail = []
+    const start = Math.max(0, (core?.length ?? 0) - 3)
+    for (let index = start; index < (core?.length ?? 0); index += 1) {
+      const operation = await core.get(index)
+      tail.push({
+        seq: operation.seq,
+        kind: operation.kind,
+        type: operation.type,
+        actor: operation.actor,
+        term: operation.term,
+        membershipPhase: operation.membership?.phase ?? null,
+        membershipChangeType: operation.membership?.changeType ?? null,
+        membershipTargetNodeId: operation.membership?.targetNodeId ?? null
+      })
+    }
+
+    const lastOperation = (core?.length ?? 0) > 0 ? await core.get(core.length - 1) : null
+
+    return {
+      nodeId: node.nodeId,
+      feedKey: node.feedKey,
+      length: core?.length ?? 0,
+      term: this.consensusState.currentTerm,
+      lastLogIndex: lastOperation?.index ?? -1,
+      lastLogTerm: lastOperation?.term ?? -1,
+      lastLogHash: lastOperation?.entryHash ?? null,
+      tail
     }
   }
 
+  async submitPromotionCredential(credential) {
+    if (!this.#isLearner()) {
+      throw new Error("Only learners may accept promotion credentials")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.membershipState.current.version,
+      learnerNodeId: this.options.identity.publicKeyId,
+      learnerNoisePublicKey: this.transportIdentity?.publicKeyHex ?? "",
+      authorizedNodes: this.options.authorizedNodes,
+      seenCredentialHashes: await this.#seenPromotionCredentialHashes(),
+      seenNonces: await this.#seenPromotionNonces(),
+      isCaughtUp: await this.#isPromotionEligible()
+    })
+
+    const batch = this.consensusBee.batch()
+    await batch.put(`promotion/seen/hash/${summary.credentialHash}`, true)
+    await batch.put(`promotion/seen/nonce/${credential.payload.nonce}`, true)
+    await batch.put("promotion/current", {
+      credentialHash: summary.credentialHash,
+      targetRole: summary.targetRole,
+      signerNodeId: summary.signerNodeId,
+      learnerNodeId: summary.learnerNodeId,
+      learnerNoisePublicKey: summary.learnerNoisePublicKey,
+      expiresAt: summary.expiresAt,
+      eligible: true,
+      accepted: false
+    })
+    await batch.flush()
+
+    return await this.#promotionStatus()
+  }
+
+  async commitPromotionCredential(credential) {
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      throw new Error("Only the current leader may commit membership promotions")
+    }
+
+    const learnerNodeId = credential?.payload?.learnerNodeId
+    const joint = this.#jointMembership()
+    if (joint) {
+      if (joint.changeType !== "promotion" || joint.targetNodeId !== learnerNodeId) {
+        throw new Error("Another membership change is already in progress")
+      }
+      return this.#completeJointPromotion(credential, joint)
+    }
+
+    const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
+    if (!learnerRecord) {
+      throw new Error("Promotion target must be a known learner")
+    }
+    if (this.#membershipRole(learnerNodeId) !== "learner") {
+      throw new Error("Promotion target is not currently a learner")
+    }
+
+    const learnerNoisePublicKey = this.network?.peerPublicKeyForNodeId(learnerNodeId)
+    if (!learnerNoisePublicKey) {
+      throw new Error("Promotion target must be connected before promotion")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.membershipState.current.version,
+      learnerNodeId,
+      learnerNoisePublicKey,
+      authorizedNodes: this.#voterNodes().map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: node.publicKey
+      })),
+      seenCredentialHashes: await this.#seenPromotionCredentialHashes(),
+      seenNonces: await this.#seenPromotionNonces(),
+      isCaughtUp: await this.#isLearnerPromotionReady()
+    })
+
+    const oldVoters = this.membershipState.current.voters
+    const newVoters = [...new Set([...oldVoters, learnerNodeId])].sort()
+    const learners = this.membershipState.current.learners.filter((nodeId) => nodeId !== learnerNodeId).sort()
+    const removed = this.membershipState.current.removed.filter((nodeId) => nodeId !== learnerNodeId).sort()
+
+    await this.#commitMembershipChange({
+      changeType: "promotion",
+      targetNodeId: learnerNodeId,
+      newVoters,
+      learners,
+      removed,
+      promotion: {
+        credentialHash: summary.credentialHash,
+        targetRole: summary.targetRole,
+        signerNodeId: summary.signerNodeId,
+        learnerNodeId: summary.learnerNodeId,
+        learnerNoisePublicKey: summary.learnerNoisePublicKey,
+        expiresAt: summary.expiresAt,
+        eligible: true,
+        accepted: true
+      }
+    })
+
+    return await this.#membershipStatusSnapshot()
+  }
+
+  async #completeJointPromotion(credential, joint) {
+    const learnerNodeId = credential?.payload?.learnerNodeId
+    const learnerRecord = this.options.authorizedNodes.find((node) => node.nodeId === learnerNodeId)
+    if (!learnerRecord) {
+      throw new Error("Promotion target must be a known learner")
+    }
+
+    const learnerNoisePublicKey = this.network?.peerPublicKeyForNodeId(learnerNodeId)
+    if (!learnerNoisePublicKey) {
+      throw new Error("Promotion target must be connected before promotion")
+    }
+
+    const summary = validatePromotionCredential(credential, {
+      clusterId: this.options.clusterId,
+      membershipVersion: this.membershipState.current.version,
+      learnerNodeId,
+      learnerNoisePublicKey,
+      authorizedNodes: this.#voterNodes().map((node) => ({
+        nodeId: node.nodeId,
+        publicKey: node.publicKey
+      })),
+      seenCredentialHashes: new Set(),
+      seenNonces: new Set(),
+      isCaughtUp: await this.#isLearnerPromotionReady()
+    })
+    const learners = this.membershipState.current.learners.filter((nodeId) => nodeId !== learnerNodeId).sort()
+    const removed = this.membershipState.current.removed.filter((nodeId) => nodeId !== learnerNodeId).sort()
+
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType: "promotion",
+      targetNodeId: learnerNodeId,
+      targetPublicKey: learnerRecord.publicKey?.toString("hex") ?? null,
+      targetFeedKey: learnerRecord.feedKey,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners,
+      removed,
+      quorumGroups: this.#jointQuorumGroups(joint)
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
+    await this.consensusBee.put("promotion/current", {
+      credentialHash: summary.credentialHash,
+      targetRole: summary.targetRole,
+      signerNodeId: summary.signerNodeId,
+      learnerNodeId: summary.learnerNodeId,
+      learnerNoisePublicKey: summary.learnerNoisePublicKey,
+      expiresAt: summary.expiresAt,
+      eligible: true,
+      accepted: true
+    })
+    await this.#runHeartbeat({ fresh: true })
+    return await this.#membershipStatusSnapshot()
+  }
+
+  async removeVoter(nodeId) {
+    if (this.currentLeader() !== this.options.identity.publicKeyId) {
+      throw new Error("Only the current leader may remove voters")
+    }
+    const joint = this.#jointMembership()
+    if (joint) {
+      if (joint.changeType !== "removal" || joint.targetNodeId !== nodeId) {
+        throw new Error("Another membership change is already in progress")
+      }
+      return this.#completeJointRemoval(nodeId, joint)
+    }
+    if (nodeId === this.options.identity.publicKeyId) {
+      throw new Error("Self-removal is not supported in this implementation")
+    }
+    if (this.#currentMembershipRole(nodeId) === "removed") {
+      return await this.#membershipStatusSnapshot()
+    }
+    if (this.#currentMembershipRole(nodeId) !== "voter") {
+      throw new Error("Removal target is not currently a voter")
+    }
+
+    const newVoters = this.membershipState.current.voters.filter((entry) => entry !== nodeId).sort()
+    const learners = this.membershipState.current.learners.filter((entry) => entry !== nodeId).sort()
+    const removed = [...new Set([...this.membershipState.current.removed, nodeId])].sort()
+
+    await this.#commitMembershipChange({
+      changeType: "removal",
+      targetNodeId: nodeId,
+      newVoters,
+      learners,
+      removed
+    })
+
+    return await this.#membershipStatusSnapshot()
+  }
+
+  async #completeJointRemoval(nodeId, joint) {
+    if (nodeId === this.options.identity.publicKeyId) {
+      throw new Error("Self-removal is not supported in this implementation")
+    }
+
+    const targetRecord = this.options.authorizedNodes.find((node) => node.nodeId === nodeId)
+    if (!targetRecord) {
+      throw new Error("Removal target must be a known voter")
+    }
+
+    const learners = this.membershipState.current.learners.filter((entry) => entry !== nodeId).sort()
+    const removed = [...new Set([...this.membershipState.current.removed, nodeId])].sort()
+
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType: "removal",
+      targetNodeId: nodeId,
+      targetPublicKey: targetRecord.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetRecord.feedKey,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners,
+      removed,
+      quorumGroups: this.#jointQuorumGroups(joint)
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
+    await this.#runHeartbeat({ fresh: true })
+    return await this.#membershipStatusSnapshot()
+  }
+
+  /**
+   * Transitional hook for consensus implementation and restart-safety tests.
+   *
+   * @param {Partial<{ currentTerm: number, votedFor: string | null, commitIndex: number, lastApplied: number, membershipVersion: number }>} patch
+   */
+  async setConsensusState(patch) {
+    this.consensusState = await this.consensusStateStore.save(patch)
+    return this.getConsensusState()
+  }
+
   async createSnapshot() {
-    return this.view.exportSnapshot()
+    const content = await this.view.exportSnapshot()
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return content
+    }
+
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const snapshot = {
+      version: 2,
+      createdAt: new Date().toISOString(),
+      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId(),
+      membershipVersion: this.membershipState.current.version,
+      lastIncludedIndex: this.consensusState.lastApplied,
+      lastIncludedTerm: authoritativeLog.lastLogTerm,
+      content
+    }
+    return {
+      ...snapshot,
+      contentHash: this.#snapshotContentHash(snapshot)
+    }
   }
 
   /**
    * @param {{ version: number, entries: Array<{ key: string, value: unknown }> }} snapshot
    */
   async restoreSnapshot(snapshot) {
+    const envelope = this.#normalizeSnapshotEnvelope(snapshot)
+    if (envelope) {
+      const expectedHash = this.#snapshotContentHash({
+        version: envelope.version,
+        createdAt: envelope.createdAt,
+        leaderNodeId: envelope.leaderNodeId,
+        membershipVersion: envelope.membershipVersion,
+        lastIncludedIndex: envelope.lastIncludedIndex,
+        lastIncludedTerm: envelope.lastIncludedTerm,
+        content: envelope.content
+      })
+      if (expectedHash !== envelope.contentHash) {
+        throw new Error("Snapshot content hash mismatch")
+      }
+      if (this.currentLeader() && envelope.leaderNodeId && envelope.leaderNodeId !== this.currentLeader()) {
+        throw new Error("Snapshot leader identity does not match current leader")
+      }
+      await this.view.importSnapshot(envelope.content)
+      if (Number.isInteger(envelope.lastIncludedIndex)) {
+        this.consensusState = await this.consensusStateStore.save({
+          commitIndex: Math.max(this.consensusState.commitIndex, envelope.lastIncludedIndex),
+          lastApplied: Math.max(this.consensusState.lastApplied, envelope.lastIncludedIndex)
+        })
+      }
+      this.diagnosticState.reconciliation = {
+        state: "snapshot-installed",
+        at: new Date().toISOString(),
+        detail: envelope.leaderNodeId ?? "unknown-leader"
+      }
+      await this.syncAuthoritativeLog()
+      return
+    }
+
     await this.view.importSnapshot(snapshot)
+  }
+
+  #normalizeSnapshotEnvelope(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return null
+    if (snapshot.version !== 2) return null
+    if (!snapshot.content || typeof snapshot.content !== "object") return null
+    if (typeof snapshot.contentHash !== "string" || snapshot.contentHash.length === 0) return null
+    return snapshot
+  }
+
+  #snapshotContentHash(snapshot) {
+    return createHash("sha256").update(canonicalize(snapshot)).digest("hex")
   }
 
   /**
@@ -359,14 +888,37 @@ export class HolepunchSwarmNode {
   async close() {
     this.closing = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
-    await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
+    if (this.authoritativeSyncTimer) clearInterval(this.authoritativeSyncTimer)
+    if (this.peerMaintenanceTimer) clearInterval(this.peerMaintenanceTimer)
+    if (this.electionTimer) clearTimeout(this.electionTimer)
+    this.heartbeatTimer = null
+    this.authoritativeSyncTimer = null
+    this.peerMaintenanceTimer = null
+    this.electionTimer = null
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
+    this.authoritativeSyncPending = false
     await this.suspendNetworking()
-    for (const extension of this.rpcExtensions.values()) extension.destroy()
+    this.joinControl?.close()
+    this.rpc?.close(new Error("Node is closing"))
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
-    await Promise.allSettled(this.syncPromises.values())
-    this.remoteNodeIdsByConnectionKey.clear()
+    if (this.#usesSharedAuthoritativeLog() && this.authoritativeLogCore) await this.authoritativeLogCore.close()
+    const pendingHeartbeat = this.heartbeatPromise
+    if (pendingHeartbeat) {
+      void pendingHeartbeat.catch(() => {})
+      this.heartbeatPromise = null
+    }
+    const pendingAuthoritativeSync = this.authoritativeSyncPromise
+    if (pendingAuthoritativeSync) {
+      void pendingAuthoritativeSync.catch(() => {})
+      this.authoritativeSyncPromise = null
+    }
+    for (const pendingSync of this.syncPromises.values()) {
+      void pendingSync.catch(() => {})
+    }
+    this.syncPromises.clear()
+    this.network?.clear()
+    if (this.consensusBee) await this.consensusBee.close()
     if (this.viewBee) await this.viewBee.close()
     if (this.store) await this.store.close()
   }
@@ -390,7 +942,7 @@ export class HolepunchSwarmNode {
     try {
       await promise
     } catch (error) {
-      if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+      if (!this.closing && !this.#isIgnoredSyncError(error)) {
         throw error
       }
     } finally {
@@ -402,72 +954,282 @@ export class HolepunchSwarmNode {
     }
   }
 
+  async syncAuthoritativeLog() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.closing && !this.authoritativeSyncPromise) {
+      return
+    }
+
+    if (this.authoritativeSyncPromise) {
+      this.authoritativeSyncPending = true
+      return this.authoritativeSyncPromise
+    }
+
+    const promise = this.#syncAuthoritativeLogLoop()
+    this.authoritativeSyncPromise = promise
+
+    try {
+      await promise
+    } catch (error) {
+      if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+        throw error
+      }
+    } finally {
+      this.authoritativeSyncPromise = null
+      if (!this.closing && this.authoritativeSyncPending) {
+        this.authoritativeSyncPending = false
+        await this.syncAuthoritativeLog()
+      }
+    }
+  }
+
+  async #runAntiEntropyPull() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() === this.options.identity.publicKeyId) return
+
+    const leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
+    if (!leaderNodeId || !this.#isLeaderReachable(leaderNodeId)) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const localApplied = await this.view.getApplied(feedKey)
+    const advertisedCommitIndex = this.#advertisedLeaderCommitIndex(leaderNodeId)
+    const targetLength = advertisedCommitIndex + 1
+    if (targetLength <= localApplied && !this.#isSplitFenced()) return
+
+    this.diagnosticState.reconciliation = {
+      state: "anti-entropy-pull",
+      at: new Date().toISOString(),
+      detail: `leader:${leaderNodeId}`
+    }
+    await this.syncAuthoritativeLog()
+    await this.#advanceCommittedFeed(Math.max(localApplied, targetLength))
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "anti-entropy-pull"
+    }
+  }
+
+  #scheduleAuthoritativeSyncTimer() {
+    if (this.closing || !this.#usesSharedAuthoritativeLog() || this.authoritativeSyncTimer) return
+
+    this.authoritativeSyncTimer = setInterval(() => {
+      void this.#runAntiEntropyPull().catch((error) => {
+        if (!this.closing && !this.#isIgnoredSyncError(error)) {
+          throw error
+        }
+      })
+    }, this.options.heartbeatIntervalMs)
+    this.authoritativeSyncTimer.unref?.()
+  }
+
+  #advertisedLeaderCommitIndex(leaderNodeId) {
+    if (leaderNodeId === this.options.identity.publicKeyId) {
+      return this.consensusState.commitIndex
+    }
+    const heartbeat = this.lastHeartbeatByNode.get(leaderNodeId)
+    if (!heartbeat) return this.consensusState.commitIndex
+    const leaderCommitIndex = heartbeat.appliedFeeds?.[this.#authoritativeLogFeedKey()]
+    if (!Number.isInteger(leaderCommitIndex)) return this.consensusState.commitIndex
+    return Math.max(this.consensusState.commitIndex, leaderCommitIndex - 1)
+  }
+
   /**
    * @param {string} nodeId
    */
   async #syncFeedLoop(nodeId) {
     const node = this.#getAuthorizedNode(nodeId)
     const core = this.feedCores.get(nodeId)
-    let applied = await this.view.getApplied(node.feedKey)
+    let rawApplied = await this.view.getRawApplied(node.feedKey)
 
-    while (applied < core.length) {
+    while (rawApplied < core.length) {
       if (this.closing) return
 
-      const operation = await core.get(applied)
+      const operation = await core.get(rawApplied)
+      if (operation.seq !== rawApplied) {
+        throw new Error(`Operation sequence mismatch at feed slot ${rawApplied} for ${nodeId}`)
+      }
       validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
       if (!verifySignedOperation(operation, node.publicKey)) {
-        throw new Error(`Invalid operation at sequence ${applied} for ${nodeId}`)
+        throw new Error(`Invalid operation at sequence ${rawApplied} for ${nodeId}`)
       }
-      await this.view.apply(operation, node.feedKey)
+      const previousOperation = rawApplied === 0 ? null : await core.get(rawApplied - 1)
+      validateLogLink(operation, previousOperation, rawApplied)
       if (operation.kind === "heartbeat") {
+        await this.view.applyHeartbeat(operation, node.feedKey)
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+        await this.#applyRejectedFeedEntries(nodeId, operation.heartbeat?.rejectedFeeds?.[node.feedKey] ?? [])
+        await this.#reconcileAuthoritativeTailFromHeartbeat(nodeId, operation)
         this.lastHeartbeatByNode.set(operation.actor, {
           ts: operation.ts,
           feed: node.feedKey,
           seq: operation.seq,
           appliedFeeds: operation.heartbeat?.appliedFeeds ?? {},
+          rejectedFeeds: operation.heartbeat?.rejectedFeeds ?? {},
           membershipFingerprint: operation.heartbeat?.membershipFingerprint ?? null
         })
-      } else if (operation.kind === "kv" && nodeId !== this.options.identity.publicKeyId) {
-        void this.#sendAck(nodeId, operation.seq)
+        await this.#recordPeerHint(nodeId, {
+          httpAddress: operation.heartbeat?.httpAddress ?? null,
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? null,
+          role: this.#membershipRole(nodeId)
+        })
+        const watermark = this.#usesSharedAuthoritativeLog()
+          ? operation.heartbeat?.leaderCommitIndex
+          : operation.heartbeat?.appliedFeeds?.[node.feedKey]
+        if (Number.isInteger(watermark) && watermark >= (this.#usesSharedAuthoritativeLog() ? 0 : 1)) {
+          await this.#advanceCommittedFeed(
+            this.#usesSharedAuthoritativeLog() ? watermark + 1 : nodeId,
+            this.#usesSharedAuthoritativeLog() ? undefined : watermark
+          )
+        }
+        await this.#observeRemoteOperation(nodeId, operation)
+      } else if (!this.#usesSharedAuthoritativeLog() && operation.kind === "kv") {
+        await this.view.stageEntry(node.feedKey, {
+          nodeId,
+          source: nodeId === this.options.identity.publicKeyId ? "local" : "remote",
+          validation: "valid",
+          operation
+        })
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+        if (nodeId !== this.options.identity.publicKeyId) {
+          void this.#sendAck(nodeId, operation.seq)
+        }
+        await this.#observeRemoteOperation(nodeId, operation)
+      } else if (!this.#usesSharedAuthoritativeLog() && operation.kind === "membership") {
+        await this.view.setRawProgress(node.feedKey, {
+          applied: operation.seq + 1,
+          lastOpId: operation.opId
+        })
+        if (nodeId !== this.options.identity.publicKeyId) {
+          void this.#sendAck(nodeId, operation.seq)
+        }
+        await this.#observeRemoteOperation(nodeId, operation)
+      } else {
+        throw new Error(`Non-authoritative feed ${nodeId} may not carry ${operation.kind} entries`)
       }
-      applied += 1
+      rawApplied += 1
+    }
+  }
+
+  async #syncAuthoritativeLogLoop() {
+    const core = this.#authoritativeLogCore()
+    const feedKey = this.#authoritativeLogFeedKey()
+    let rawApplied = await this.view.getRawApplied(feedKey)
+
+    while (rawApplied < core.length) {
+      if (this.closing) return
+
+      const operation = await core.get(rawApplied)
+      if (operation.seq !== rawApplied) {
+        throw new Error(`Authoritative log sequence mismatch at slot ${rawApplied}`)
+      }
+      if (!this.#isKnownAuthoritativeActor(operation.actor)) {
+        return
+      }
+      this.#validateAuthoritativeOperation(operation)
+      if (!verifySignedOperation(operation, this.authoritativeLogIdentity.publicKey)) {
+        throw new Error(`Invalid authoritative operation at sequence ${rawApplied}`)
+      }
+      if (operation.actor !== this.options.identity.publicKeyId && !this.#canAcceptAuthoritativeActor(operation.actor)) {
+        return
+      }
+      const previousOperation = rawApplied === 0 ? null : await core.get(rawApplied - 1)
+      validateLogLink(operation, previousOperation, rawApplied)
+      if (operation.kind === "heartbeat") {
+        throw new Error("Heartbeat entries are not allowed in the authoritative log")
+      }
+      if (operation.kind === "kv") {
+        await this.view.stageEntry(feedKey, {
+          nodeId: operation.actor,
+          source: operation.actor === this.options.identity.publicKeyId ? "local" : "remote",
+          validation: "valid",
+          operation
+        })
+      }
+      await this.view.setRawProgress(feedKey, {
+        applied: operation.seq + 1,
+        lastOpId: operation.opId
+      })
+      if (operation.actor !== this.options.identity.publicKeyId) {
+        void this.#sendAck(operation.actor, operation.seq)
+      }
+      if (
+        operation.kind === "membership" &&
+        operation.membership?.phase === "final" &&
+        operation.membership?.removed?.includes(this.options.identity.publicKeyId)
+      ) {
+        await this.#advanceCommittedFeed(operation.seq + 1)
+      }
+      rawApplied += 1
     }
   }
 
   async #appendHeartbeat() {
     if (this.closing) return
+    if (this.#isLearner()) return
+    if (this.#usesSharedAuthoritativeLog()) {
+      await this.syncAuthoritativeLog()
+    }
 
-    const leader = this.currentLeader()
-    const operation = createSignedOperation({
-      kind: "heartbeat",
-      type: "put",
-      key: `heartbeat:${this.options.identity.publicKeyId}`,
-      keyspace: "system",
-      seq: this.#localCore().length,
-      feed: this.options.identity.feedKey,
-      actor: this.options.identity.publicKeyId,
-      secretKey: this.options.identity.secretKey,
-      encryptionKey: this.#currentEncryptionKey(),
-      encryptionKeyId: this.encryption.currentKeyId,
-      heartbeat: {
-        observedLeader: leader,
-        reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
-        appliedFeeds: await this.#appliedFeeds(),
-        membershipFingerprint: this.#membershipFingerprint()
-      }
-    })
-
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     if (this.closing) return
 
     try {
-      await this.#localCore().append(operation)
+      await this.#withLocalAppendLock(async () => {
+        const previousOperation = this.#usesSharedAuthoritativeLog()
+          ? await this.#previousAuthoritativeOperation()
+          : await this.#previousLocalOperation()
+        const previousHeartbeat = await this.#previousHeartbeatOperation()
+        const heartbeatCore = this.#localCore()
+      const heartbeat = {
+          leaderId: leader,
+          leaderCommitIndex: this.consensusState.commitIndex,
+          membershipVersion: this.membershipState.current.version,
+          prevLogIndex: previousOperation?.index ?? -1,
+          prevLogTerm: previousOperation?.term ?? -1,
+          prevLogHash: previousOperation?.entryHash ?? null,
+          observedLeader: leader,
+          reachableLeader: leader === null ? false : this.#isLeaderReachable(leader),
+          appliedFeeds: await this.#appliedFeeds(),
+          rejectedFeeds: await this.#rejectedFeeds(),
+          membershipFingerprint: this.#membershipFingerprint(),
+          httpAddress: this.localHttpAddress
+        }
+        const operation = createSignedOperation({
+          kind: "heartbeat",
+          type: "put",
+          key: `heartbeat:${this.options.identity.publicKeyId}`,
+          keyspace: "system",
+          seq: heartbeatCore.length,
+          term: Math.max(this.consensusState.currentTerm, previousHeartbeat?.term ?? -1),
+          index: heartbeatCore.length,
+          prevIndex: heartbeatCore.length === 0 ? -1 : heartbeatCore.length - 1,
+          prevHash: previousHeartbeat?.entryHash ?? null,
+          feed: this.options.identity.feedKey,
+          actor: this.options.identity.publicKeyId,
+          secretKey: this.options.identity.secretKey,
+          encryptionKey: this.#currentEncryptionKey(),
+          encryptionKeyId: this.encryption.currentKeyId,
+          heartbeat
+        })
+        await heartbeatCore.append(operation)
+      })
       await this.syncFeed(this.options.identity.publicKeyId)
     } catch (error) {
       if (!this.closing || error?.code !== "SESSION_CLOSED") throw error
     }
   }
 
-  async #runHeartbeat() {
+  async #runHeartbeat(options = {}) {
+    if (options.fresh && this.heartbeatPromise) {
+      await this.heartbeatPromise
+    }
     if (this.heartbeatPromise) return this.heartbeatPromise
 
     const heartbeatPromise = this.#appendHeartbeat().finally(() => {
@@ -479,143 +1241,425 @@ export class HolepunchSwarmNode {
     return heartbeatPromise
   }
 
-  async #startNetworking() {
-    this.swarm = new Hyperswarm(this.options.bootstrap ? { bootstrap: this.options.bootstrap } : {})
-    this.swarm.on("connection", (conn) => {
-      this.connections.add(conn)
-      conn.once("close", () => {
-        this.connections.delete(conn)
-      })
-      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
-      this.store.replicate(conn)
-    })
+  async #refreshAuthoritativeMembership() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    await this.syncAuthoritativeLog()
+  }
 
-    this.discovery = this.swarm.join(deriveTopic(this.options), { client: true, server: true })
-    await this.discovery.flushed()
+  #scheduleElectionTimer() {
+    if (this.closing || this.#isLearner() || this.consensusEngine.role === "leader") return
+    if (this.electionTimer) clearTimeout(this.electionTimer)
+
+    const { timeoutMs } = this.consensusEngine.planElectionTimeout({
+      minMs: this.options.electionTimeoutMinMs,
+      maxMs: this.options.electionTimeoutMaxMs,
+      voterNodeIds: this.membershipState.current.voters
+    })
+    this.electionTimer = setTimeout(() => {
+      void this.#handleElectionTimeout().catch((error) => {
+        if (!this.closing && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }, timeoutMs)
+    this.electionTimer.unref?.()
+  }
+
+  async #handleElectionTimeout() {
+    if (this.closing || this.#isLearner() || this.consensusEngine.role === "leader") return
+    const currentLeader = this.currentLeader()
+    if (currentLeader && (currentLeader === this.options.identity.publicKeyId || this.#isLeaderReachable(currentLeader))) {
+      this.#scheduleElectionTimer()
+      return
+    }
+
+    const lastKnownLeader = currentLeader ?? this.#lastKnownLeaderId()
+    if (lastKnownLeader) {
+      if (!this.#isSplitFenced()) {
+        this.#enterSplitFence("leader-heartbeat-expired", lastKnownLeader)
+        await this.#persistSplitState()
+        this.#scheduleElectionTimer()
+        return
+      }
+
+      const membership = await this.#membershipStatusSnapshot()
+      if (membership.mismatchedNodeIds.length > 0) {
+        this.#scheduleElectionTimer()
+        return
+      }
+
+      if (await this.#canTriggerWitnessReelection(lastKnownLeader)) {
+        await this.#startElection()
+        return
+      }
+
+      this.#scheduleElectionTimer()
+      return
+    }
+
+    await this.#startElection()
+  }
+
+  async #startElection() {
+    if (this.closing || this.#isLearner()) return
+
+    const voterNodeIds = this.membershipState.current.voters
+    const lastLog = await this.#localLastLogInfo()
+    const election = this.consensusEngine.startElection({
+      currentTerm: this.consensusState.currentTerm,
+      voterNodeIds,
+      lastLog,
+      membershipVersion: this.membershipState.current.version
+    })
+    const nextTerm = election.nextTerm
+    this.consensusState = await this.consensusStateStore.save(election.persistPatch)
+    const votes = new Set([this.options.identity.publicKeyId])
+    const requiredVotes = election.requiredVotes
+    const peers = voterNodeIds
+      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
+      .map((nodeId) => {
+        const peer = this.#peerForNodeId(nodeId)
+        return peer ? { nodeId, peer } : null
+      })
+      .filter(Boolean)
+
+    for (const { nodeId, peer } of peers) {
+      void this.rpc.requestVote({
+        targetNodeId: nodeId,
+        peer,
+        request: election.voteRequest
+      }).then(async (response) => {
+        if (!this.consensusEngine.isCandidateForTerm(nextTerm) || this.consensusState.currentTerm !== nextTerm) return
+        if (response?.term > this.consensusState.currentTerm) {
+          await this.#stepDown(response.term, response.leaderNodeId ?? null)
+          return
+        }
+        if (response?.voteGranted) {
+          votes.add(nodeId)
+          if (votes.size >= requiredVotes) {
+            await this.#becomeLeader(nextTerm)
+          }
+        }
+      }).catch(() => {})
+    }
+
+    if (votes.size >= requiredVotes) {
+      await this.#becomeLeader(nextTerm)
+      return
+    }
+
+    this.#scheduleElectionTimer()
+  }
+
+  async #handleVoteRequest(message) {
+    const decision = this.consensusEngine.evaluateVoteRequest({
+      consensusState: this.consensusState,
+      voterNodeIds: this.membershipState.current.voters,
+      isLearner: this.#isLearner(),
+      localLog: await this.#localLastLogInfo(),
+      localMembershipVersion: this.membershipState.current.version,
+      message
+    })
+    if (decision.persistPatch) {
+      this.consensusState = await this.consensusStateStore.save(decision.persistPatch)
+    }
+    this.#scheduleElectionTimer()
+    return {
+      ...decision.response,
+      term: this.consensusState.currentTerm,
+      leaderNodeId: this.currentLeader()
+    }
+  }
+
+  async #handleAppendEntries(message) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (message.from !== message.leaderNodeId) return
+    if (this.#membershipRole(message.leaderNodeId) !== "voter") return
+    if (!Number.isInteger(message.term) || message.term < this.consensusState.currentTerm) return
+
+    if (message.term > this.consensusState.currentTerm) {
+      await this.#stepDown(message.term, message.leaderNodeId)
+    }
+
+    await this.#reconcileAuthoritativeTailFromAppendEntries(message)
+    await this.syncAuthoritativeLog()
+  }
+
+  async #becomeLeader(term) {
+    if (this.closing) return
+    const transition = this.consensusEngine.becomeLeader({
+      term,
+      currentTerm: this.consensusState.currentTerm,
+      electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
+    })
+    if (!transition.becameLeader) return
+    if (this.electionTimer) {
+      clearTimeout(this.electionTimer)
+      this.electionTimer = null
+    }
+    this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    this.#clearSplitFence()
+    await this.#persistSplitState()
+    await this.#runHeartbeat()
+  }
+
+  async #stepDown(nextTerm, leaderNodeId = null) {
+    const transition = this.consensusEngine.stepDown({
+      nextTerm,
+      currentTerm: this.consensusState.currentTerm,
+      leaderNodeId
+    })
+    this.consensusState = await this.consensusStateStore.save(transition.persistPatch)
+    this.#rejectPendingWrites(new Error("Leadership changed while write was in flight"))
+    if (leaderNodeId && leaderNodeId !== this.options.identity.publicKeyId) {
+      this.#clearSplitFence()
+      await this.#persistSplitState()
+    }
+    this.#scheduleElectionTimer()
+  }
+
+  async #observeRemoteOperation(nodeId, operation) {
+    const previousOperation = operation?.kind === "heartbeat" && this.#usesSharedAuthoritativeLog()
+      ? await this.#previousAuthoritativeOperation()
+      : operation?.seq > 0
+        ? await this.feedCores.get(nodeId)?.get(operation.seq - 1)
+        : null
+    const observation = this.consensusEngine.observeRemoteOperation({
+      nodeId,
+      voterNodeIds: this.membershipState.current.voters,
+      consensusState: this.consensusState,
+      localMembershipVersion: this.membershipState.current.version,
+      operation,
+      previousOperation,
+      electionTimeoutMaxMs: this.options.electionTimeoutMaxMs
+    })
+    if (
+      !observation.acceptedLeader &&
+      observation.refusalReason === "not-elected-leader" &&
+      operation?.kind === "heartbeat" &&
+      operation.heartbeat?.leaderId === nodeId &&
+      operation.heartbeat?.observedLeader === nodeId &&
+      await this.#hasWitnessLeaderMajority(nodeId, operation.term)
+    ) {
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId: nodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+      observation.acceptedLeader = true
+      observation.refusalReason = null
+    }
+    if (observation.persistPatch) {
+      this.consensusState = await this.consensusStateStore.save(observation.persistPatch)
+    }
+    if (observation.acceptedLeader) {
+      this.#clearSplitFence()
+      await this.#persistSplitState()
+    }
+    if (observation.acceptedLeader || observation.persistPatch) {
+      this.#scheduleElectionTimer()
+    }
+  }
+
+  async #localLastLogInfo() {
+    const core = this.#usesSharedAuthoritativeLog()
+      ? this.#authoritativeLogCore()
+      : this.#localCore()
+    for (let index = core.length - 1; index >= 0; index -= 1) {
+      const operation = await core.get(index)
+      if (this.#usesSharedAuthoritativeLog() || this.#countsForElectionLog(operation)) {
+        return {
+          index: operation.index ?? index,
+          term: operation.term ?? -1
+        }
+      }
+    }
+
+    return {
+      index: -1,
+      term: -1
+    }
+  }
+
+  #countsForElectionLog(operation) {
+    if (!operation || typeof operation !== "object") return false
+    if (operation.kind !== "heartbeat") return true
+    return operation.heartbeat?.observedLeader === operation.actor
+  }
+
+  async #startNetworking() {
+    const topic = await deriveTopic(this.options)
+    this.joinControl ??= new JoinControl({
+      onChannelOpen: (session) => {
+        this.#maybeSendJoinRequest(session)
+        this.#maybeSendRecoveryWatermarkRequest(session)
+      },
+      onJoinRequest: (session, message) => {
+        void this.#handleJoinRequest(session, message).catch((error) => {
+          if (!this.closing) {
+            throw error
+          }
+        })
+      },
+      onJoinResponse: (session, message) => {
+        void this.#handleJoinResponse(session, message).catch((error) => {
+          if (!this.closing) {
+            throw error
+          }
+        })
+      }
+    })
+    this.network ??= new SwarmNetwork({
+      bootstrap: this.options.bootstrap,
+      topic,
+      keyPair: this.transportIdentity?.keyPair,
+      localNodeId: this.options.identity.publicKeyId,
+      authorizedNodes: this.options.authorizedNodes,
+      isRevokedNode: (nodeId) => this.#isRevokedNode(nodeId),
+      isConnectionAccepted: (nodeId) => this.#acceptsPeerConnection(nodeId),
+      replicateConnection: (conn) => {
+        this.joinControl?.attachConnection(conn)
+        this.store.replicate(conn)
+      },
+      networkPolicy: this.options.networkPolicy ?? null
+    })
+    await this.network.start()
+    this.#refreshDirectPeerConnections()
+    this.#schedulePeerMaintenanceTimer()
   }
 
   async #appendKvOperation(type, key, value, options) {
-    const followerRequirement = this.options.durability.requiredFollowerAcks
-    if (this.#aliveFollowers().length < followerRequirement) {
-      throw new Error("Durability requirement not met: no reachable follower available")
+    const quorumGroups = this.#writeQuorumGroups()
+    if (!this.#hasReachableQuorum(quorumGroups)) {
+      throw this.#createDurabilityUnavailableError()
     }
 
-    const operation = createSignedOperation({
-      kind: "kv",
-      type,
-      key,
-      keyspace: options.keyspace,
-      value,
-      seq: this.#localCore().length,
-      feed: this.options.identity.feedKey,
-      actor: this.options.identity.publicKeyId,
-      secretKey: this.options.identity.secretKey,
-      encryptionKey: this.#currentEncryptionKey(),
-      encryptionKeyId: this.encryption.currentKeyId,
-      ttlMs: options.ttlMs
-    })
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#appendLegacyKvOperation(type, key, value, options, quorumGroups)
+    }
 
-    const ackPromise = this.#waitForFollowerAck(operation.seq, followerRequirement)
-    await this.#localCore().append(operation)
+    try {
+      const operation = await this.#withLocalAppendLock(async () => {
+        const previousOperation = await this.#previousAuthoritativeOperation()
+        const authoritativeCore = this.#authoritativeLogCore()
+        const operation = createSignedOperation({
+          kind: "kv",
+          type,
+          key,
+          keyspace: options.keyspace,
+          value,
+          seq: authoritativeCore.length,
+          term: this.consensusState.currentTerm,
+          index: authoritativeCore.length,
+          prevIndex: previousOperation?.index ?? -1,
+          prevHash: previousOperation?.entryHash ?? null,
+          feed: this.#authoritativeLogFeedKey(),
+          actor: this.options.identity.publicKeyId,
+          secretKey: this.authoritativeLogIdentity.secretKey,
+          encryptionKey: this.#currentEncryptionKey(),
+          encryptionKeyId: this.encryption.currentKeyId,
+          ttlMs: options.ttlMs
+        })
+        const ackPromise = this.durabilityWaiter.waitForGroups(
+          operation.seq,
+          quorumGroups,
+          [this.options.identity.publicKeyId]
+        )
+        ackPromise.catch(() => {})
+        await authoritativeCore.append(operation)
+        void this.#notifyAuthoritativeAppend(operation).catch(() => {})
+        await this.syncAuthoritativeLog()
+        try {
+          await ackPromise
+        } catch (error) {
+          if (this.closing) {
+            throw new Error("Node is closing")
+          }
+          const normalizedError = this.#normalizeDurabilityWaitError(error)
+          this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
+          this.diagnosticState.lastRejectedWriteReason = normalizedError instanceof Error ? normalizedError.message : String(normalizedError)
+          await this.#truncateUncommittedAuthoritativeTail()
+          throw normalizedError
+        }
+        await this.#advanceCommittedFeed(operation.seq + 1)
+        return operation
+      })
+      await this.#runHeartbeat()
+      return operation
+    } catch (error) {
+      await this.#runHeartbeat()
+      throw error
+    }
+  }
+
+  async #appendLegacyKvOperation(type, key, value, options, quorumGroups) {
+    let operation = null
+    let ackPromise = null
+    await this.#withLocalAppendLock(async () => {
+      const previousOperation = await this.#previousLocalOperation()
+      operation = createSignedOperation({
+        kind: "kv",
+        type,
+        key,
+        keyspace: options.keyspace,
+        value,
+        seq: this.#localCore().length,
+        term: this.consensusState.currentTerm,
+        index: this.#localCore().length,
+        prevIndex: previousOperation?.index ?? -1,
+        prevHash: previousOperation?.entryHash ?? null,
+        feed: this.options.identity.feedKey,
+        actor: this.options.identity.publicKeyId,
+        secretKey: this.options.identity.secretKey,
+        encryptionKey: this.#currentEncryptionKey(),
+        encryptionKeyId: this.encryption.currentKeyId,
+        ttlMs: options.ttlMs
+      })
+      ackPromise = this.durabilityWaiter.waitForGroups(
+        operation.seq,
+        quorumGroups,
+        [this.options.identity.publicKeyId]
+      )
+      ackPromise.catch(() => {})
+      await this.#localCore().append(operation)
+    })
     await this.syncFeed(this.options.identity.publicKeyId)
-    await ackPromise
+    try {
+      await ackPromise
+    } catch (error) {
+      if (this.closing) {
+        throw new Error("Node is closing")
+      }
+      const normalizedError = this.#normalizeDurabilityWaitError(error)
+      await this.view.markSkippedEntry(this.options.identity.feedKey, operation.seq)
+      await this.view.setStagedEntryResolution(this.options.identity.feedKey, operation.seq, "rejected")
+      await this.#runHeartbeat()
+      throw normalizedError
+    }
+    await this.#advanceCommittedFeed(this.options.identity.publicKeyId, operation.seq + 1)
+    await this.#runHeartbeat()
     return operation
   }
 
   async #forwardWrite(request) {
+    if (this.#isLearner()) {
+      throw this.#createLearnerWriteError()
+    }
+    if (this.#isSplitFenced()) {
+      throw this.#createSplitFencedError()
+    }
     if (!this.options.forwarding) {
       throw new Error("Write forwarding is disabled on this node")
     }
 
-    const leader = this.currentLeader()
-    if (!leader) throw new Error("No current leader is available")
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    if (!leader) throw this.#createLeaderUnavailableError()
 
-    const leaderCore = this.feedCores.get(leader)
-    const extension = this.rpcExtensions.get(leader)
-    const peer = leaderCore.peers[0]
+    const peer = this.#peerForNodeId(leader)
     if (!peer) {
-      throw new Error(`Current leader ${leader} is not reachable`)
+      throw this.#createLeaderUnavailableError(`Current leader ${leader} is not reachable`, leader)
     }
 
-    const requestId = `${this.options.identity.publicKeyId}-${++this.requestId}`
-    const response = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.inflightRequests.delete(requestId)
-        reject(new Error(`Timed out forwarding write request ${requestId}`))
-      }, this.options.durability.timeoutMs)
-      this.inflightRequests.set(requestId, {
-        resolve,
-        reject,
-        timer
-      })
-    })
-    response.catch(() => {})
-
-    extension.send(
-      {
-        type: "write-request",
-        requestId,
-        from: this.options.identity.publicKeyId,
-        request
-      },
-      peer
-    )
-
-    return response
-  }
-
-  /**
-   * @param {number} seq
-   * @param {number} required
-   */
-  async #waitForFollowerAck(seq, required) {
-    const key = `${this.options.identity.feedKey}:${seq}`
-    const existing = this.ackWaiters.get(key) ?? {
-      nodes: new Set(),
-      resolve: null,
-      reject: null,
-      timer: null,
-      promise: null
-    }
-
-    if (!existing.promise) {
-      existing.promise = new Promise((resolve, reject) => {
-        existing.resolve = resolve
-        existing.reject = reject
-        existing.timer = setTimeout(() => {
-          this.ackWaiters.delete(key)
-          reject(new Error(`Timed out waiting for follower acknowledgement for sequence ${seq}`))
-        }, this.options.durability.timeoutMs)
-      })
-      this.ackWaiters.set(key, existing)
-    }
-
-    if (existing.nodes.size >= required) {
-      clearTimeout(existing.timer)
-      this.ackWaiters.delete(key)
-      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
-      return
-    }
-
-    return existing.promise
-  }
-
-  /**
-   * @param {string} nodeId
-   * @param {number} seq
-   */
-  #recordAck(nodeId, seq) {
-    const key = `${this.options.identity.feedKey}:${seq}`
-    const waiter = this.ackWaiters.get(key)
-    if (!waiter) return
-
-    waiter.nodes.add(nodeId)
-    if (waiter.nodes.size >= this.options.durability.requiredFollowerAcks) {
-      clearTimeout(waiter.timer)
-      this.ackWaiters.delete(key)
-      this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
-      waiter.resolve()
-    }
+    return this.rpc.forwardWrite({ targetNodeId: leader, peer, request })
   }
 
   /**
@@ -624,17 +1668,7 @@ export class HolepunchSwarmNode {
    * @param {Error} error
    */
   #rejectPendingWrites(error) {
-    for (const pending of this.inflightRequests.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(error)
-    }
-    this.inflightRequests.clear()
-
-    for (const waiter of this.ackWaiters.values()) {
-      clearTimeout(waiter.timer)
-      waiter.reject(error)
-    }
-    this.ackWaiters.clear()
+    this.durabilityWaiter.rejectAll(error)
   }
 
   /**
@@ -642,98 +1676,400 @@ export class HolepunchSwarmNode {
    * @param {number} seq
    */
   async #sendAck(nodeId, seq) {
-    if (this.options.ackDelayMs) {
-      await new Promise((resolve) => setTimeout(resolve, this.options.ackDelayMs))
-    }
-    if (this.closing) return
-
-    const core = this.feedCores.get(nodeId)
-    const extension = this.rpcExtensions.get(nodeId)
-    const peer = core.peers[0]
+    const peer = this.#peerForNodeId(nodeId)
     if (!peer) return
 
-    extension.send(
-      {
-        type: "write-ack",
-        from: this.options.identity.publicKeyId,
-        feedKey: nodeId,
-        seq
-      },
-      peer
-    )
+    await this.rpc.sendAck({ targetNodeId: nodeId, peer, seq })
   }
 
   /**
-   * @param {import("hypercore")} core
+   * @param {string} nodeId
+   * @param {number} seq
    */
-  #registerRpcExtension(core) {
-    return core.registerExtension(RPC_EXTENSION, {
-      encoding: "json",
-      onmessage: async (message, peer) => {
-        try {
-          if (message.type === "write-request") {
-            if (this.currentLeader() !== this.options.identity.publicKeyId) {
-              throw new Error("This node is not the current leader")
-            }
-            const result =
-              message.request.action === "put"
-                ? await this.#appendKvOperation(
-                    "put",
-                    message.request.key,
-                    message.request.value,
-                    message.request.options ?? {}
-                  )
-                : await this.#appendKvOperation(
-                    "delete",
-                    message.request.key,
-                    undefined,
-                    message.request.options ?? {}
-                  )
+  #recordAck(nodeId, seq) {
+    if (nodeId === this.options.identity.publicKeyId) return
+    this.durabilityWaiter.record(nodeId, seq)
+  }
 
-            const responseExtension = this.rpcExtensions.get(message.from)
-            responseExtension?.send(
-              { type: "write-response", requestId: message.requestId, ok: true, result },
-              peer
-            )
-            return
-          }
+  async #notifyCurrentAuthoritativeTail(nodeId) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() !== this.options.identity.publicKeyId) return
+    if (!nodeId || nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(nodeId)) return
 
-          if (message.type === "write-response") {
-            const pending = this.inflightRequests.get(message.requestId)
-            if (!pending) return
-            clearTimeout(pending.timer)
-            this.inflightRequests.delete(message.requestId)
-            if (message.ok) pending.resolve(message.result)
-            else pending.reject(new Error(message.error))
-            return
-          }
+    const operation = await this.#previousAuthoritativeOperation()
+    if (!operation) return
+    await this.#notifyAuthoritativeAppend(operation, [nodeId])
+  }
 
-          if (message.type === "write-ack") {
-            this.#recordAck(message.from, message.seq)
-          }
-        } catch (error) {
-          if (message.type === "write-request") {
-            const responseExtension = this.rpcExtensions.get(message.from)
-            responseExtension?.send(
-              {
-                type: "write-response",
-                requestId: message.requestId,
-                ok: false,
-                error: error instanceof Error ? error.message : String(error)
-              },
-              peer
-            )
-          }
-        }
-      }
-    })
+  async #notifyAuthoritativeAppend(operation, targetNodeIds = null) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() !== this.options.identity.publicKeyId) return
+
+    const previousOperation = operation.prevIndex >= 0
+      ? await this.#authoritativeLogCore().get(operation.prevIndex)
+      : null
+
+    const request = {
+      term: operation.term,
+      leaderNodeId: this.options.identity.publicKeyId,
+      prevLogIndex: operation.prevIndex,
+      prevLogTerm: previousOperation?.term ?? -1,
+      prevLogHash: operation.prevHash,
+      logLength: operation.seq + 1,
+      entryHash: operation.entryHash,
+      leaderCommitIndex: this.consensusState.commitIndex
+    }
+
+    const targets = targetNodeIds
+      ? this.options.authorizedNodes.filter((node) => targetNodeIds.includes(node.nodeId))
+      : this.options.authorizedNodes
+
+    for (const node of targets) {
+      if (node.nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(node.nodeId)) continue
+      const peer = this.#peerForNodeId(node.nodeId)
+      if (!peer) continue
+      this.rpc.sendAppendEntries({
+        targetNodeId: node.nodeId,
+        peer,
+        request
+      })
+    }
   }
 
   #localCore() {
     return this.feedCores.get(this.options.identity.publicKeyId)
   }
 
+  #usesSharedAuthoritativeLog() {
+    return Boolean(this.options.clusterSecret)
+  }
+
+  #authoritativeLogFeedKey() {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#getAuthorizedNode(this.#authoritativeLogNodeId()).feedKey
+    }
+    return this.authoritativeLogIdentity.feedKey
+  }
+
+  /**
+   * Return the tracked Hypercore for one authorized node ID.
+   *
+   * @param {string} nodeId
+   */
+  #nodeCore(nodeId) {
+    return this.feedCores.get(nodeId) ?? null
+  }
+
+  /**
+   * Return the first live replication peer currently backing one node feed.
+   *
+   * This remains transport scaffolding only; leader-log authority is decided by
+   * consensus and the authoritative log helpers, not by the presence of a feed
+   * peer in a particular slot.
+   *
+   * @param {string} nodeId
+   */
+  #peerForNodeId(nodeId) {
+    return this.#nodeCore(nodeId)?.peers?.[0] ?? null
+  }
+
+  /**
+   * Resolve the authoritative cluster log node for the current storage model.
+   *
+   * The leader feed stays authoritative even while a disconnected node is
+   * split-fenced; in that case the last known leader remains the only log this
+   * node should treat as cluster authority.
+   */
+  #authoritativeLogNodeId() {
+    return this.currentLeader() ?? this.#lastKnownLeaderId() ?? this.options.identity.publicKeyId
+  }
+
+  #authoritativeLogRecord() {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      return this.#getAuthorizedNode(this.#authoritativeLogNodeId())
+    }
+    return {
+      nodeId: this.#authoritativeLogNodeId(),
+      feedKey: this.#authoritativeLogFeedKey()
+    }
+  }
+
+  #authoritativeLogCore() {
+    return this.#usesSharedAuthoritativeLog()
+      ? this.authoritativeLogCore
+      : this.#nodeCore(this.#authoritativeLogNodeId())
+  }
+
+  /**
+   * Build one node/feed replication summary for diagnostics.
+   *
+   * @param {string} nodeId
+   * @param {Record<string, any>} heartbeats
+   * @param {number} now
+   */
+  async #feedReplicationStatus(nodeId, heartbeats, now) {
+    const node = this.#getAuthorizedNode(nodeId)
+    const core = this.#nodeCore(nodeId)
+    if (!core) return null
+
+    const applied = await this.view.getApplied(node.feedKey)
+    const staged = await this.view.getStagedSummary(node.feedKey)
+    const heartbeat = heartbeats[nodeId] ?? null
+
+    return {
+      feedKey: node.feedKey,
+      length: core.length,
+      applied,
+      lag: core.length - applied,
+      staged,
+      connectedPeers: core.peers.length,
+      alive: heartbeat ? now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs : false,
+      heartbeatAgeMs: heartbeat ? now - new Date(heartbeat.ts).getTime() : null
+    }
+  }
+
+  async #authoritativeReplicationStatus() {
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const applied = await this.view.getApplied(feedKey)
+    const staged = await this.view.getStagedSummary(feedKey)
+
+    return {
+      feedKey,
+      length: core.length,
+      applied,
+      lag: core.length - applied,
+      staged
+    }
+  }
+
+  #localNodeRecord() {
+    return {
+      nodeId: this.options.identity.publicKeyId,
+      publicKey: this.options.identity.publicKey,
+      feedKey: this.options.identity.feedKey
+    }
+  }
+
+  async #resolveAuthoritativeLogIdentity() {
+    if (!this.options.clusterSecret) {
+      return {
+        publicKey: this.options.identity.publicKey,
+        secretKey: this.options.identity.secretKey,
+        feedKey: this.options.identity.feedKey
+      }
+    }
+
+    const seed = await deriveClusterLogSeed({
+      clusterSecret: this.options.clusterSecret,
+      clusterId: this.options.clusterId
+    })
+    const keyPair = crypto.keyPair(seed)
+
+    return {
+      publicKey: keyPair.publicKey,
+      secretKey: keyPair.secretKey,
+      feedKey: Hypercore.key(keyPair.publicKey).toString("hex")
+    }
+  }
+
+  async #ensureAuthoritativeLogCore() {
+    if (this.authoritativeLogCore) {
+      return this.authoritativeLogCore
+    }
+
+    const core = this.store.get({
+      keyPair: {
+        publicKey: this.authoritativeLogIdentity.publicKey,
+        secretKey: this.authoritativeLogIdentity.secretKey
+      },
+      valueEncoding: "json"
+    })
+    await core.ready()
+    core.on("append", () => {
+      void this.syncAuthoritativeLog().catch((error) => {
+        if (!this.closing && !this.#isIgnoredSyncError(error)) {
+          throw error
+        }
+      })
+    })
+    this.authoritativeLogCore = core
+    return core
+  }
+
+  async #truncateUncommittedAuthoritativeTail() {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const keepLength = await this.view.getApplied(feedKey)
+    await this.#truncateAuthoritativeTail(keepLength, "write-rejected")
+  }
+
+  async #truncateAuthoritativeTail(keepLength, reason = "reconcile") {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const core = this.#authoritativeLogCore()
+    const feedKey = this.#authoritativeLogFeedKey()
+    if (core.length > keepLength) {
+      await core.truncate(keepLength)
+    }
+    await this.view.discardUncommittedSuffix(feedKey, keepLength)
+    if (this.consensusState.commitIndex >= keepLength || this.consensusState.lastApplied >= keepLength) {
+      this.consensusState = await this.consensusStateStore.save({
+        commitIndex: keepLength - 1,
+        lastApplied: keepLength - 1
+      })
+    }
+    this.diagnosticState.lastTruncationAt = new Date().toISOString()
+    this.diagnosticState.lastTruncationReason = reason
+  }
+
+  /**
+   * Follow the leader's advertised authoritative log boundary by discarding
+   * only local uncommitted suffix entries beyond that boundary.
+   *
+   * @param {string} nodeId
+   * @param {Record<string, unknown>} operation
+   */
+  async #reconcileAuthoritativeTailFromHeartbeat(nodeId, operation) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (operation.kind !== "heartbeat") return
+    if (operation.heartbeat?.leaderId !== nodeId) return
+    if (operation.heartbeat?.observedLeader !== nodeId) return
+
+    const leaderLength = (operation.heartbeat?.prevLogIndex ?? -1) + 1
+    if (!Number.isInteger(leaderLength) || leaderLength < 0) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const keepLength = Math.max(committedApplied, this.consensusState.commitIndex + 1, leaderLength)
+    const core = this.#authoritativeLogCore()
+    if (core.length <= keepLength) return
+
+    const firstSuffixOperation = await core.get(keepLength)
+    const heartbeatTime = Date.parse(operation.ts)
+    const suffixTime = Date.parse(firstSuffixOperation?.ts)
+    if (Number.isFinite(heartbeatTime) && Number.isFinite(suffixTime) && heartbeatTime <= suffixTime) {
+      return
+    }
+
+    this.diagnosticState.reconciliation = {
+      state: "truncating-tail",
+      at: new Date().toISOString(),
+      detail: "heartbeat-boundary"
+    }
+    await this.#truncateAuthoritativeTail(keepLength, "heartbeat-boundary")
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "heartbeat-boundary-applied"
+    }
+  }
+
+  async #reconcileAuthoritativeTailFromAppendEntries(message) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const leaderLength = Math.max(0, message.logLength ?? 0)
+
+    if (leaderLength < committedApplied) {
+      throw new Error("Leader append request cannot roll back the committed authoritative prefix")
+    }
+    if (core.length > leaderLength && leaderLength >= committedApplied) {
+      this.diagnosticState.reconciliation = {
+        state: "truncating-tail",
+        at: new Date().toISOString(),
+        detail: "append-entries-length"
+      }
+      await this.#truncateAuthoritativeTail(leaderLength, "append-entries-length")
+    }
+
+    if (message.prevLogIndex >= 0 && core.length > message.prevLogIndex) {
+      const previousOperation = await core.get(message.prevLogIndex)
+      const previousMismatch =
+        previousOperation.term !== message.prevLogTerm ||
+        previousOperation.entryHash !== message.prevLogHash
+      if (previousMismatch) {
+        if (message.prevLogIndex < committedApplied) {
+          throw new Error("AppendEntries mismatch reached the committed authoritative prefix")
+        }
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "append-entries-prev-mismatch"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "append-entries-prev-mismatch")
+      }
+    }
+
+    if (leaderLength > 0 && typeof message.entryHash === "string" && core.length >= leaderLength) {
+      const tailOperation = await core.get(leaderLength - 1)
+      if (tailOperation.entryHash !== message.entryHash) {
+        if (leaderLength - 1 < committedApplied) {
+          throw new Error("AppendEntries tail mismatch reached the committed authoritative prefix")
+        }
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "append-entries-tail-mismatch"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "append-entries-tail-mismatch")
+      }
+    }
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "append-entries"
+    }
+  }
+
+  /**
+   * Serialize local Hypercore appends so the signed operation sequence always
+   * matches the physical feed slot.
+   *
+   * @template T
+   * @param {() => Promise<T>} run
+   * @returns {Promise<T>}
+   */
+  async #withLocalAppendLock(run) {
+    const previous = this.localAppendLock
+    let release = null
+    this.localAppendLock = new Promise((resolve) => {
+      release = resolve
+    })
+
+    await previous
+    try {
+      return await run()
+    } finally {
+      release()
+    }
+  }
+
+  async #previousHeartbeatOperation() {
+    const core = this.#localCore()
+    if (core.length === 0) return null
+    return core.get(core.length - 1)
+  }
+
+  async #previousLocalOperation() {
+    return this.#previousHeartbeatOperation()
+  }
+
+  async #previousAuthoritativeOperation() {
+    const core = this.#usesSharedAuthoritativeLog()
+      ? this.#authoritativeLogCore()
+      : this.#localCore()
+    if (core.length === 0) return null
+    return core.get(core.length - 1)
+  }
+
   #getAuthorizedNode(nodeId) {
+    if (nodeId === this.options.identity.publicKeyId) {
+      return this.#localNodeRecord()
+    }
     const node = this.options.authorizedNodes.find((entry) => entry.nodeId === nodeId)
     if (!node) throw new Error(`Unknown authorized node ${nodeId}`)
     if (this.#isRevokedNode(nodeId)) {
@@ -742,137 +2078,761 @@ export class HolepunchSwarmNode {
     return node
   }
 
-  /**
-   * @param {boolean} added
-   * @param {string} nodeId
-   * @param {{ remotePublicKey?: Buffer, stream?: { remotePublicKey?: Buffer } }} peer
-   */
-  #onCorePeerUpdate(added, nodeId, peer) {
-    const connectionKey = this.#connectionKey(peer.stream?.remotePublicKey ?? peer.remotePublicKey)
-    if (!connectionKey) return
-
-    if (!added) return
-
-    const existing = this.remoteNodeIdsByConnectionKey.get(connectionKey)
-    if (!existing) {
-      this.remoteNodeIdsByConnectionKey.set(connectionKey, nodeId)
-    }
-
-    this.#enforceConnectionPolicyForKey(connectionKey)
+  #reachableVotingNodeIds() {
+    return this.#effectiveVoterNodeIds().filter((nodeId) => this.#isLeaderReachable(nodeId))
   }
 
-  #networkStatus() {
-    const connectedNodeIds = new Set(
-      [...this.connections]
-        .map((conn) => this.remoteNodeIdsByConnectionKey.get(this.#connectionKey(conn.remotePublicKey)))
-        .filter(Boolean)
-    )
+  #writeQuorumGroups() {
+    const joint = this.#jointMembership()
+    if (joint) {
+      return this.#jointQuorumGroups(joint)
+    }
+    return [
+      {
+        eligibleNodeIds: this.membershipState.current.voters,
+        requiredCount: this.#majoritySize(this.membershipState.current.voters.length)
+      }
+    ]
+  }
 
-    const peers = {}
-    for (const node of this.options.authorizedNodes) {
-      if (node.nodeId === this.options.identity.publicKeyId || this.#isRevokedNode(node.nodeId)) continue
-      peers[node.nodeId] = {
-        allowed: this.#isConnectionAllowed(node.nodeId),
-        connected: connectedNodeIds.has(node.nodeId)
+  #hasReachableQuorum(groups) {
+    return groups.every((group) => {
+      if (group.requiredCount <= 0) return true
+      const eligibleNodeIds = group.eligibleNodeIds ?? this.#effectiveVoterNodeIds()
+      const matchedCount = eligibleNodeIds.filter((nodeId) => this.#isLeaderReachable(nodeId)).length
+      return matchedCount >= group.requiredCount
+    })
+  }
+
+  #role() {
+    const role = this.#membershipRole(this.options.identity.publicKeyId)
+    return role ?? "learner"
+  }
+
+  #isLearner() {
+    return this.#role() !== "voter"
+  }
+
+  #isSplitFenced() {
+    return this.splitState.fenced
+  }
+
+  #lastKnownLeaderId() {
+    return this.splitState.leaderNodeId ?? this.consensusEngine.state.leaderNodeId ?? null
+  }
+
+  #enterSplitFence(reason, leaderNodeId = this.#lastKnownLeaderId()) {
+    if (this.consensusEngine.role === "leader") return
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return
+    if (this.splitState.fenced && this.splitState.leaderNodeId === leaderNodeId && this.splitState.reason === reason) {
+      return
+    }
+
+    this.splitState = {
+      fenced: true,
+      reason,
+      leaderNodeId,
+      since: new Date().toISOString()
+    }
+    this.network?.refreshConnectionPermissions()
+    this.#rejectPendingWrites(new Error("Leader is unreachable while node is split-fenced"))
+  }
+
+  #clearSplitFence() {
+    if (!this.splitState.fenced) return
+    this.splitState = {
+      fenced: false,
+      reason: null,
+      leaderNodeId: null,
+      since: null
+    }
+    this.network?.refreshConnectionPermissions()
+  }
+
+  #acceptsPeerConnection(nodeId) {
+    if (!this.#isSplitFenced()) return true
+    if (nodeId === this.#lastKnownLeaderId()) return true
+    return this.#acceptsWitnessPeerConnection(nodeId)
+  }
+
+  /**
+   * Keep witness traffic alive only for the narrow reelection path where the
+   * cluster is proving that only the leader disappeared.
+   *
+   * @param {string} nodeId
+   */
+  #acceptsWitnessPeerConnection(nodeId) {
+    if (this.splitState.reason !== "leader-heartbeat-expired") return false
+    if (this.#effectiveVoterNodeIds().length < 3) return false
+    if (nodeId === this.options.identity.publicKeyId) return false
+    if (nodeId === this.#lastKnownLeaderId()) return false
+    return this.#effectiveVoterNodeIds().includes(nodeId)
+  }
+
+  /**
+   * Allow autonomous reelection only when recent witness evidence shows the
+   * established leader disappeared and every other voter is still live.
+   *
+   * @param {string} leaderNodeId
+   */
+  async #canTriggerWitnessReelection(leaderNodeId) {
+    const voterNodeIds = this.#effectiveVoterNodeIds()
+    if (voterNodeIds.length < 3) return false
+    if (!voterNodeIds.includes(this.options.identity.publicKeyId)) return false
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return false
+
+    const witnessNodeIds = voterNodeIds.filter((nodeId) => nodeId !== leaderNodeId)
+    for (const nodeId of witnessNodeIds) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      if (!this.#isLeaderReachable(nodeId)) return false
+    }
+
+    const heartbeats = await this.view.getHeartbeats()
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    for (const nodeId of witnessNodeIds) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) return false
+      if (new Date(heartbeat.ts).getTime() < freshnessCutoff) return false
+      if (heartbeat.observedLeader !== leaderNodeId) return false
+      if (heartbeat.reachableLeader !== false) return false
+      if (
+        Number.isInteger(heartbeat.membershipVersion) &&
+        heartbeat.membershipVersion !== this.membershipState.current.version
+      ) {
+        return false
       }
     }
+
+    return true
+  }
+
+  /**
+   * Late joiners may not have cast a vote in the leader's current term. In
+   * that case, allow leader adoption only after a fresh majority of voter
+   * heartbeats already agrees on the same reachable leader.
+   *
+   * @param {string} leaderNodeId
+   * @param {number} term
+   */
+  async #hasWitnessLeaderMajority(leaderNodeId, term) {
+    const heartbeats = await this.view.getHeartbeats()
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    let matchingCount = 0
+
+    for (const nodeId of this.membershipState.current.voters) {
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) continue
+      if (new Date(heartbeat.ts).getTime() < freshnessCutoff) continue
+      if (heartbeat.observedLeader !== leaderNodeId) continue
+      if (heartbeat.reachableLeader !== true) continue
+      if (Number.isInteger(heartbeat.term) && heartbeat.term !== term) continue
+      matchingCount += 1
+    }
+
+    return matchingCount >= this.#majoritySize(this.membershipState.current.voters.length)
+  }
+
+  async #persistSplitState() {
+    this.consensusState = await this.consensusStateStore.save({
+      splitFenced: this.splitState.fenced,
+      splitLeaderNodeId: this.splitState.leaderNodeId,
+      splitReason: this.splitState.reason
+    })
+  }
+
+  #createLearnerWriteError() {
+    return this.#createRefusalError({
+      code: "read-only-learner",
+      internalCode: "READ_ONLY_LEARNER",
+      statusCode: 403,
+      retryable: false,
+      message: "This node is a read-only learner and cannot accept or proxy writes"
+    })
+  }
+
+  #createSplitFencedError() {
+    return this.#createRefusalError({
+      code: "split-fenced",
+      internalCode: "SPLIT_FENCED",
+      statusCode: 503,
+      retryable: true,
+      message: "This node is split-fenced and is waiting to reconnect to the current leader",
+      leaderNodeId: this.#lastKnownLeaderId()
+    })
+  }
+
+  #createLeaderUnavailableError(
+    message = "No current leader is available",
+    leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
+  ) {
+    return this.#createRefusalError({
+      code: "leader-unreachable",
+      internalCode: "LEADER_UNREACHABLE",
+      statusCode: 503,
+      retryable: true,
+      message,
+      leaderNodeId
+    })
+  }
+
+  #createNotWitnessEntrypointError() {
+    return this.#createRefusalError({
+      code: "not-witness-entrypoint",
+      internalCode: "NOT_WITNESS_ENTRYPOINT",
+      statusCode: 503,
+      retryable: true,
+      message: "Direct leader-facing CRUD is not supported; send writes to a witness node",
+      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId()
+    })
+  }
+
+  #createMembershipChangingError(message = "Durability requirement not met: membership mismatch blocks degraded writes") {
+    return this.#createRefusalError({
+      code: "membership-changing",
+      internalCode: "MEMBERSHIP_CHANGING",
+      statusCode: 503,
+      retryable: true,
+      message
+    })
+  }
+
+  #createDurabilityUnavailableError(message = "Durability requirement not met: no reachable quorum available") {
+    return this.#createRefusalError({
+      code: "leader-unreachable",
+      internalCode: "DURABILITY_UNAVAILABLE",
+      statusCode: 503,
+      retryable: true,
+      message
+    })
+  }
+
+  #normalizeDurabilityWaitError(error) {
+    if (
+      typeof error?.message === "string" &&
+      error.message.startsWith("Timed out waiting for follower acknowledgement")
+    ) {
+      return this.#createDurabilityUnavailableError()
+    }
+    return error
+  }
+
+  #createJoinError(code, message, options = {}) {
+    return this.#createRefusalError({
+      code,
+      internalCode: options.internalCode ?? code.replace(/-/g, "_").toUpperCase(),
+      statusCode: options.statusCode ?? 400,
+      retryable: options.retryable ?? false,
+      message,
+      leaderNodeId: options.leaderNodeId ?? this.currentLeader() ?? this.#lastKnownLeaderId()
+    })
+  }
+
+  #createRefusalError({ code, internalCode, statusCode, retryable, message, leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId() }) {
+    const error = new Error(message)
+    const refusal = {
+      code,
+      message,
+      retryable,
+      currentTerm: this.consensusState.currentTerm,
+      knownLeaderId: leaderNodeId ?? null,
+      leaderReachable: leaderNodeId ? this.#isLeaderReachable(leaderNodeId) : false,
+      splitStatus: { ...this.splitState },
+      commitIndex: this.consensusState.commitIndex,
+      membershipVersion: this.membershipState.current.version,
+      role: this.#role(),
+      reconnectHints: this.#refusalReconnectHints(leaderNodeId)
+    }
+    error.code = internalCode
+    error.statusCode = statusCode
+    error.leader = leaderNodeId ?? null
+    error.splitStatus = { ...this.splitState }
+    error.refusal = refusal
+    return error
+  }
+
+  #refusalReconnectHints(leaderNodeId) {
+    const recoveryLeaderHints = this.joinState.recovery?.leaderHints ?? null
+    const persistedLeaderHint = leaderNodeId ? this.#peerHint(leaderNodeId) : null
+    const leaderHint = leaderNodeId
+      ? {
+          nodeId: leaderNodeId,
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(leaderNodeId)
+            ?? persistedLeaderHint?.peerPublicKey
+            ?? recoveryLeaderHints?.peerPublicKey
+            ?? null,
+          httpAddress: persistedLeaderHint?.httpAddress ?? recoveryLeaderHints?.httpAddress ?? null
+        }
+      : null
+    const witnesses = this.#witnessHintEntries(leaderNodeId)
 
     return {
-      policyActive: Boolean(this.networkPolicy),
-      allowedNodeIds: this.#allowedNodeIds(),
-      peers
+      leader: leaderHint,
+      witnesses
     }
   }
 
-  #allowedNodeIds() {
-    return this.options.authorizedNodes
-      .map((node) => node.nodeId)
-      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId)
-      .filter((nodeId) => !this.#isRevokedNode(nodeId))
-      .filter((nodeId) => this.#isConnectionAllowed(nodeId))
-      .sort()
+  #witnessHintEntries(leaderNodeId) {
+    return this.#effectiveVoterNodeIds()
+      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId && nodeId !== leaderNodeId)
+      .map((nodeId) => {
+        const hint = this.#peerHint(nodeId)
+        return {
+          nodeId,
+          peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? hint?.peerPublicKey ?? null,
+          httpAddress: hint?.httpAddress ?? null,
+          reachable: this.#isLeaderReachable(nodeId)
+        }
+      })
+      .filter((hint) => hint.peerPublicKey || hint.httpAddress)
+      .sort((left, right) => left.nodeId.localeCompare(right.nodeId))
   }
 
-  /**
-   * @param {string | null} nodeId
-   */
-  #isConnectionAllowed(nodeId) {
-    if (!nodeId) return true
-    if (!this.networkPolicy?.allowConnection) return true
-    return this.networkPolicy.allowConnection(this.options.identity.publicKeyId, nodeId) !== false
-  }
-
-  #enforceConnectionPolicy() {
-    for (const conn of this.connections) {
-      this.#enforceConnectionPolicyForKey(this.#connectionKey(conn.remotePublicKey))
+  async #loadPeerHints() {
+    const now = Date.now()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "peer-hints/",
+      lt: "peer-hints/~"
+    })) {
+      const hint = entry.value
+      if (!hint?.nodeId) continue
+      if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= now) continue
+      this.peerHints.set(hint.nodeId, hint)
     }
   }
 
-  /**
-   * @param {string | null} connectionKey
-   */
-  #enforceConnectionPolicyForKey(connectionKey) {
-    if (!connectionKey) return
-    const remoteNodeId = this.remoteNodeIdsByConnectionKey.get(connectionKey)
-    if (!remoteNodeId || this.#isConnectionAllowed(remoteNodeId)) return
+  #refreshDirectPeerConnections() {
+    if (!this.network) return
 
-    for (const conn of this.connections) {
-      if (this.#connectionKey(conn.remotePublicKey) === connectionKey) {
-        conn.destroy()
+    const prioritizedKeys = []
+    const seen = new Set()
+    const pushPeerKey = (peerPublicKey) => {
+      if (
+        typeof peerPublicKey !== "string" ||
+        peerPublicKey.length === 0 ||
+        peerPublicKey === this.transportIdentity?.publicKeyHex ||
+        seen.has(peerPublicKey)
+      ) {
+        return
+      }
+      seen.add(peerPublicKey)
+      prioritizedKeys.push(peerPublicKey)
+    }
+    const pushNodeIdPeerKey = (nodeId) => {
+      if (!nodeId || nodeId === this.options.identity.publicKeyId) return
+      const hint = this.#peerHint(nodeId)
+      pushPeerKey(
+        this.network.peerPublicKeyForNodeId(nodeId)
+        ?? hint?.peerPublicKey
+        ?? (nodeId === this.joinState.recovery?.leaderNodeId ? this.joinState.recovery?.leaderHints?.peerPublicKey ?? null : null)
+      )
+    }
+
+    const leaderNodeId =
+      this.currentLeader()
+      ?? this.#lastKnownLeaderId()
+      ?? this.joinState.leaderNodeId
+      ?? this.joinState.recovery?.leaderNodeId
+      ?? null
+
+    if (this.currentLeader() === this.options.identity.publicKeyId) {
+      for (const nodeId of this.#effectiveVoterNodeIds()) {
+        pushNodeIdPeerKey(nodeId)
+      }
+    } else {
+      pushNodeIdPeerKey(leaderNodeId)
+      for (const witness of this.#witnessHintEntries(leaderNodeId)) {
+        pushPeerKey(witness.peerPublicKey)
+      }
+      for (const nodeId of this.#effectiveVoterNodeIds()) {
+        pushNodeIdPeerKey(nodeId)
       }
     }
+
+    const cachedHints = [...this.peerHints.values()]
+      .filter((hint) => hint?.peerPublicKey && hint.role !== "removed")
+      .sort((left, right) => {
+        const leftRank = left.nodeId === leaderNodeId ? 0 : (left.role === "voter" ? 1 : 2)
+        const rightRank = right.nodeId === leaderNodeId ? 0 : (right.role === "voter" ? 1 : 2)
+        if (leftRank !== rightRank) return leftRank - rightRank
+        return String(right.seenAt ?? "").localeCompare(String(left.seenAt ?? ""))
+      })
+    for (const hint of cachedHints) {
+      pushPeerKey(hint.peerPublicKey)
+    }
+
+    this.network.setExplicitPeerPublicKeys(prioritizedKeys.slice(0, 8))
+  }
+
+  async #seedKnownLeaderFromPersistedHeartbeats() {
+    const heartbeats = await this.view.getHeartbeats()
+    let freshestLeader = null
+    let freshestTimestamp = ""
+
+    for (const [nodeId, heartbeat] of Object.entries(heartbeats)) {
+      if (this.#membershipRole(nodeId) !== "voter") continue
+      const leaderNodeId = heartbeat?.observedLeader ?? heartbeat?.leaderId ?? null
+      if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) continue
+      if (this.#membershipRole(leaderNodeId) !== "voter") continue
+      if (String(heartbeat?.ts ?? "") <= freshestTimestamp) continue
+      freshestLeader = leaderNodeId
+      freshestTimestamp = String(heartbeat?.ts ?? "")
+    }
+
+    if (!freshestLeader) return
+    this.consensusEngine.noteKnownLeader({
+      leaderNodeId: freshestLeader,
+      electionTimeoutMs: this.options.electionTimeoutMaxMs
+    })
+  }
+
+  #schedulePeerMaintenanceTimer() {
+    if (this.closing || this.peerMaintenanceTimer) return
+
+    this.peerMaintenanceTimer = setInterval(() => {
+      this.#refreshDirectPeerConnections()
+    }, this.options.heartbeatIntervalMs)
+    this.peerMaintenanceTimer.unref?.()
+  }
+
+  #peerHint(nodeId) {
+    const hint = this.peerHints.get(nodeId) ?? null
+    if (!hint) return null
+    if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= Date.now()) {
+      this.peerHints.delete(nodeId)
+      return null
+    }
+    return hint
   }
 
   /**
-   * @param {Buffer | null | undefined} publicKey
+   * Return the most recent peer hint currently bound to a machine ID.
+   *
+   * Machine IDs are cluster-scoped identity anchors for join admission. A
+   * second live node must not claim a machine ID that is already associated to
+   * another node ID.
+   *
+   * @param {string} machineId
    */
-  #connectionKey(publicKey) {
-    return publicKey ? publicKey.toString("hex") : null
+  #peerHintByMachineId(machineId) {
+    if (typeof machineId !== "string" || machineId.length === 0) return null
+    for (const hint of this.peerHints.values()) {
+      const current = this.#peerHint(hint.nodeId)
+      if (current?.machineId === machineId) return current
+    }
+    return null
   }
 
-  #aliveFollowers() {
-    const leader = this.options.identity.publicKeyId
+  async #recordPeerHint(nodeId, patch) {
+    const existing = this.#peerHint(nodeId)
     const now = Date.now()
-    return [...this.lastHeartbeatByNode.entries()]
-      .filter(([nodeId]) => nodeId !== leader)
-      .filter(([nodeId]) => !this.#isRevokedNode(nodeId))
-      .filter(([, heartbeat]) => now - new Date(heartbeat.ts).getTime() <= this.options.heartbeatTtlMs)
-      .filter(([nodeId]) => this.#isLeaderReachable(nodeId))
-      .map(([nodeId]) => nodeId)
+    const nextHttpAddress = patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress
+    const nextPeerPublicKey = patch.peerPublicKey ?? existing?.peerPublicKey ?? null
+    const nextMachineId = patch.machineId ?? existing?.machineId ?? null
+    const nextRole = patch.role ?? existing?.role ?? null
+    if (
+      existing &&
+      existing.peerPublicKey === nextPeerPublicKey &&
+      existing.machineId === nextMachineId &&
+      JSON.stringify(existing.httpAddress) === JSON.stringify(nextHttpAddress) &&
+      existing.role === nextRole &&
+      Number.isInteger(existing.expiresAt) &&
+      existing.expiresAt > now + Math.floor(PEER_HINT_TTL_MS / 2)
+    ) {
+      return
+    }
+    const next = {
+      nodeId,
+      peerPublicKey: nextPeerPublicKey,
+      machineId: nextMachineId,
+      httpAddress: nextHttpAddress,
+      role: nextRole,
+      seenAt: new Date().toISOString(),
+      lastSuccessfulAt: new Date(now).toISOString(),
+      expiresAt: now + PEER_HINT_TTL_MS
+    }
+    this.peerHints.set(nodeId, next)
+    await this.consensusBee.put(`peer-hints/${nodeId}`, next)
+    this.#refreshDirectPeerConnections()
+  }
+
+  #normalizeHttpAddress(address) {
+    if (!address || typeof address !== "object") return null
+    if (typeof address.address !== "string" || !Number.isInteger(address.port)) return null
+    return {
+      host: address.address,
+      port: address.port
+    }
+  }
+
+  async #promotionStatus() {
+    const entry = await this.consensusBee.get("promotion/current")
+    return entry?.value ?? null
+  }
+
+  async #shouldBlockForMembershipMismatch() {
+    const heartbeats = await this.view.getHeartbeats()
+    const membership = this.#membershipStatus(heartbeats)
+    const reachableVotingNodeIds = this.#reachableVotingNodeIds()
+    const effectiveVoters = new Set(this.#effectiveVoterNodeIds())
+    const reachableMismatches = membership.mismatchedNodeIds.filter((nodeId) =>
+      effectiveVoters.has(nodeId) && this.#isLeaderReachable(nodeId)
+    )
+    if (reachableMismatches.length === 0) return false
+    return reachableVotingNodeIds.length < this.membershipState.current.voters.length
+  }
+
+  async #seenPromotionCredentialHashes() {
+    const seen = new Set()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "promotion/seen/hash/",
+      lt: "promotion/seen/hash/~"
+    })) {
+      seen.add(entry.key.slice("promotion/seen/hash/".length))
+    }
+    return seen
+  }
+
+  async #seenPromotionNonces() {
+    const seen = new Set()
+    for await (const entry of this.consensusBee.createReadStream({
+      gt: "promotion/seen/nonce/",
+      lt: "promotion/seen/nonce/~"
+    })) {
+      seen.add(entry.key.slice("promotion/seen/nonce/".length))
+    }
+    return seen
+  }
+
+  async #isPromotionEligible() {
+    if (!this.#isLearner()) return false
+    return this.currentLeader() !== null
+  }
+
+  async #isLearnerPromotionReady(feedKey = this.#authoritativeLogFeedKey()) {
+    if (this.#usesSharedAuthoritativeLog()) {
+      return (await this.view.getApplied(this.#authoritativeLogFeedKey())) === this.#authoritativeLogCore().length
+    }
+
+    const learnerNode = this.options.authorizedNodes.find((node) => node.feedKey === feedKey)
+    if (!learnerNode) return false
+    return (await this.view.getApplied(feedKey)) === this.feedCores.get(learnerNode.nodeId)?.length
   }
 
   #isLeaderReachable(nodeId) {
     if (this.#isRevokedNode(nodeId)) return false
     if (nodeId === this.options.identity.publicKeyId) return true
-    const core = this.feedCores.get(nodeId)
-    return !!core?.peers?.length
+    return this.network?.isNodeConnected(nodeId) ?? false
   }
 
   async #appliedFeeds() {
-    const applied = {}
-    for (const node of this.options.authorizedNodes) {
-      if (this.#isRevokedNode(node.nodeId)) continue
-      applied[node.feedKey] = await this.view.getApplied(node.feedKey)
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const applied = {}
+      for (const node of this.#voterNodes()) {
+        if (node.nodeId === this.options.identity.publicKeyId) {
+          const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
+          applied[node.feedKey] = Math.max(await this.view.getApplied(node.feedKey), durableApplied)
+          continue
+        }
+
+        applied[node.feedKey] = await this.view.getApplied(node.feedKey)
+      }
+      return applied
     }
+
+    const applied = {}
+    const durableApplied = this.durabilityWaiter.status().lastDurableSequence + 1
+    applied[this.#authoritativeLogFeedKey()] = Math.max(
+      await this.view.getApplied(this.#authoritativeLogFeedKey()),
+      durableApplied
+    )
     return applied
   }
 
+  async #rejectedFeeds() {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const rejected = {}
+
+      for (const node of this.#voterNodes()) {
+        if (node.nodeId !== this.options.identity.publicKeyId) continue
+
+        const rejectedSeqs = await this.view.getSkippedEntries(node.feedKey)
+
+        if (rejectedSeqs.length > 0) {
+          rejected[node.feedKey] = rejectedSeqs
+        }
+      }
+
+      return rejected
+    }
+
+    const rejected = {}
+    const rejectedSeqs = await this.view.getSkippedEntries(this.#authoritativeLogFeedKey())
+    if (rejectedSeqs.length > 0) {
+      rejected[this.#authoritativeLogFeedKey()] = rejectedSeqs
+    }
+    return rejected
+  }
+
+  /**
+   * @param {string} nodeId
+   * @param {number[]} rejectedSeqs
+   */
+  async #applyRejectedFeedEntries(nodeId, rejectedSeqs) {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const node = this.#getAuthorizedNode(nodeId)
+      for (const seq of rejectedSeqs) {
+        await this.view.markSkippedEntry(node.feedKey, seq)
+        await this.view.setStagedEntryResolution(node.feedKey, seq, "rejected")
+      }
+      return
+    }
+
+    const feedKey = this.#authoritativeLogFeedKey()
+    for (const seq of rejectedSeqs) {
+      await this.view.markSkippedEntry(feedKey, seq)
+      await this.view.setStagedEntryResolution(feedKey, seq, "rejected")
+    }
+  }
+
+  /**
+   * Advance the committed prefix for a feed without exposing entries that only
+   * exist in the raw replicated suffix.
+   *
+   * @param {number} targetApplied
+   */
+  async #advanceCommittedFeed(targetOrNodeId, maybeTargetApplied = undefined) {
+    if (!this.#usesSharedAuthoritativeLog()) {
+      const nodeId = targetOrNodeId
+      const targetApplied = maybeTargetApplied
+      const node = this.#getAuthorizedNode(nodeId)
+      const core = this.feedCores.get(nodeId)
+      const rawApplied = await this.view.getRawApplied(node.feedKey)
+      let committedApplied = await this.view.getApplied(node.feedKey)
+      const cappedTarget = Math.min(targetApplied, rawApplied, core.length)
+
+      while (committedApplied < cappedTarget) {
+        const operation = await core.get(committedApplied)
+        if (operation.seq !== committedApplied) {
+          throw new Error(`Committed operation sequence mismatch at feed slot ${committedApplied} for ${nodeId}`)
+        }
+        validateOperation(operation, node, { revokedNodeIds: this.revokedNodeIds })
+        if (!verifySignedOperation(operation, node.publicKey)) {
+          throw new Error(`Invalid committed operation at sequence ${committedApplied} for ${nodeId}`)
+        }
+
+        const shouldSkip = operation.kind === "kv" && (
+          await this.view.isSkippedEntry(node.feedKey, operation.seq) ||
+          (await this.view.getStagedEntry(node.feedKey, operation.seq))?.resolution === "rejected"
+        )
+
+        if (shouldSkip) {
+          await this.view.skipCommitted(operation, node.feedKey)
+        } else {
+          await this.view.applyCommitted(operation, node.feedKey)
+          if (operation.kind === "membership") {
+            await this.#applyCommittedMembershipOperation(operation)
+          }
+        }
+        if (nodeId === this.options.identity.publicKeyId) {
+          this.consensusState = await this.consensusStateStore.save({
+            commitIndex: operation.seq,
+            lastApplied: operation.seq
+          })
+        }
+        committedApplied += 1
+      }
+      return
+    }
+
+    const targetApplied = targetOrNodeId
+    const feedKey = this.#authoritativeLogFeedKey()
+    const core = this.#authoritativeLogCore()
+    const rawApplied = await this.view.getRawApplied(feedKey)
+    let committedApplied = await this.view.getApplied(feedKey)
+    const cappedTarget = Math.min(targetApplied, rawApplied, core.length)
+
+    while (committedApplied < cappedTarget) {
+      const operation = await core.get(committedApplied)
+      if (operation.seq !== committedApplied) {
+        throw new Error(`Committed authoritative operation sequence mismatch at slot ${committedApplied}`)
+      }
+      this.#validateAuthoritativeOperation(operation)
+      if (!verifySignedOperation(operation, this.authoritativeLogIdentity.publicKey)) {
+        throw new Error(`Invalid committed authoritative operation at sequence ${committedApplied}`)
+      }
+
+      const shouldSkip = operation.kind === "kv" && (
+        await this.view.isSkippedEntry(feedKey, operation.seq) ||
+        (await this.view.getStagedEntry(feedKey, operation.seq))?.resolution === "rejected"
+      )
+
+      if (shouldSkip) {
+        await this.view.skipCommitted(operation, feedKey)
+      } else {
+        await this.view.applyCommitted(operation, feedKey)
+        if (operation.kind === "membership") {
+          await this.#applyCommittedMembershipOperation(operation)
+        }
+      }
+      this.consensusState = await this.consensusStateStore.save({
+        commitIndex: operation.seq,
+        lastApplied: operation.seq
+      })
+      committedApplied += 1
+    }
+  }
+
+  #validateAuthoritativeOperation(operation) {
+    const actorNode = this.#getAuthorizedNode(operation.actor)
+    validateOperation(operation, {
+      nodeId: actorNode.nodeId,
+      feedKey: this.#authoritativeLogFeedKey()
+    }, { revokedNodeIds: this.revokedNodeIds })
+  }
+
+  #isKnownAuthoritativeActor(nodeId) {
+    if (nodeId === this.options.identity.publicKeyId) return true
+    return this.options.authorizedNodes.some((node) => node.nodeId === nodeId)
+  }
+
+  #canAcceptAuthoritativeActor(nodeId) {
+    return this.#membershipRole(nodeId) === "voter"
+  }
+
+  #isIgnoredSyncError(error) {
+    if (
+      error?.code === "REQUEST_CANCELLED"
+      || error?.code === "SESSION_CLOSED"
+      || error?.code === "SNAPSHOT_NOT_AVAILABLE"
+    ) {
+      return true
+    }
+    return typeof error?.message === "string" && error.message.startsWith("Unknown authorized node ")
+  }
+
   #membershipFingerprint() {
-    const membership = this.options.authorizedNodes.map((node) => ({
-      nodeId: node.nodeId,
-      feedKey: node.feedKey,
-      revoked: this.#isRevokedNode(node.nodeId)
-    }))
+    const membership = {
+      current: this.membershipState?.current ?? null,
+      joint: this.membershipState?.joint ?? null,
+      entries: this.options.authorizedNodes.map((node) => ({
+        nodeId: node.nodeId,
+        feedKey: node.feedKey,
+        role: this.#membershipRole(node.nodeId)
+      })).sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+    }
     return createHash("sha256").update(canonicalize(membership)).digest("hex")
   }
 
   #membershipStatus(heartbeats) {
     const localFingerprint = this.#membershipFingerprint()
+    const entries = this.#membershipEntries()
     const peerFingerprints = {}
     const mismatchedNodeIds = []
     const matchingNodeIds = []
 
-    for (const node of this.options.authorizedNodes) {
+    for (const node of this.#voterNodes()) {
+      if (this.#isRevokedNode(node.nodeId)) continue
       if (node.nodeId === this.options.identity.publicKeyId) continue
 
       const fingerprint = heartbeats[node.nodeId]?.membershipFingerprint ?? null
@@ -881,9 +2841,25 @@ export class HolepunchSwarmNode {
       if (fingerprint === localFingerprint) matchingNodeIds.push(node.nodeId)
       else mismatchedNodeIds.push(node.nodeId)
     }
+    for (const [nodeId, heartbeat] of Object.entries(heartbeats)) {
+      if (nodeId === this.options.identity.publicKeyId) continue
+      if (this.#isRevokedNode(nodeId)) continue
+      const fingerprint = heartbeat.membershipFingerprint ?? null
+      if (fingerprint === null || peerFingerprints[nodeId] !== undefined) continue
+      peerFingerprints[nodeId] = fingerprint
+      if (fingerprint === localFingerprint) matchingNodeIds.push(nodeId)
+      else mismatchedNodeIds.push(nodeId)
+    }
 
     return {
       localFingerprint,
+      localRole: this.#role(),
+      current: this.membershipState.current,
+      version: this.membershipState.current.version,
+      joint: this.membershipState.joint,
+      voters: entries.filter((entry) => entry.role === "voter"),
+      learners: entries.filter((entry) => entry.role === "learner"),
+      removed: entries.filter((entry) => entry.role === "removed"),
       peerFingerprints,
       mismatchedNodeIds: mismatchedNodeIds.sort(),
       matchingNodeIds: matchingNodeIds.sort()
@@ -891,7 +2867,15 @@ export class HolepunchSwarmNode {
   }
 
   #readStatus() {
-    const leader = this.currentLeader()
+    const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    if (this.#isSplitFenced()) {
+      return {
+        staleReadsPossible: true,
+        reason: "split-fenced",
+        leader
+      }
+    }
+
     if (leader && leader !== this.options.identity.publicKeyId && !this.#isLeaderReachable(leader)) {
       return {
         staleReadsPossible: true,
@@ -900,7 +2884,7 @@ export class HolepunchSwarmNode {
       }
     }
 
-    if (this.connections.size === 0 && this.options.authorizedNodes.length > 1) {
+    if ((this.network?.connectionCount ?? 0) === 0 && this.options.authorizedNodes.length > 1) {
       return {
         staleReadsPossible: true,
         reason: "no-live-peer-connections",
@@ -924,5 +2908,1126 @@ export class HolepunchSwarmNode {
    */
   #isRevokedNode(nodeId) {
     return this.revokedNodeIds.has(nodeId)
+  }
+
+  #currentMembershipRole(nodeId) {
+    if (this.membershipState.current.voters.includes(nodeId)) return "voter"
+    if (this.membershipState.current.learners.includes(nodeId)) return "learner"
+    if (this.membershipState.current.removed.includes(nodeId)) return "removed"
+    return null
+  }
+
+  #membershipRole(nodeId) {
+    if (this.#isRevokedNode(nodeId) || this.#currentMembershipRole(nodeId) === "removed") {
+      return "removed"
+    }
+    if (this.#effectiveVoterNodeIds().includes(nodeId)) {
+      return "voter"
+    }
+    const currentRole = this.#currentMembershipRole(nodeId)
+    if (currentRole) return currentRole
+    if (!this.options.authorizedNodes.some((node) => node.nodeId === nodeId)) {
+      return nodeId === this.options.identity.publicKeyId ? "learner" : null
+    }
+    return this.#isRevokedNode(nodeId) ? "removed" : "learner"
+  }
+
+  #ensureAuthorizedNodeRecord(node) {
+    const normalized = {
+      nodeId: node.nodeId,
+      publicKey: Buffer.isBuffer(node.publicKey) ? node.publicKey : Buffer.from(node.publicKey, "hex"),
+      feedKey: node.feedKey
+    }
+    const existing = this.options.authorizedNodes.find((entry) => entry.nodeId === normalized.nodeId)
+    if (!existing) {
+      this.options.authorizedNodes.push(normalized)
+      return normalized
+    }
+    if (
+      existing.feedKey !== normalized.feedKey ||
+      !existing.publicKey.equals(normalized.publicKey)
+    ) {
+      throw new Error(`Authorized node ${normalized.nodeId} does not match the existing record`)
+    }
+    return existing
+  }
+
+  async #ensureFeedCore(node) {
+    if (this.feedCores.has(node.nodeId)) {
+      return this.feedCores.get(node.nodeId)
+    }
+
+    const isLocal = node.nodeId === this.options.identity.publicKeyId
+    const core = isLocal
+      ? this.store.get({
+          keyPair: {
+            publicKey: this.options.identity.publicKey,
+            secretKey: this.options.identity.secretKey
+          },
+          valueEncoding: "json"
+        })
+      : this.store.get({ key: Buffer.from(node.feedKey, "hex"), valueEncoding: "json" })
+
+    await core.ready()
+    if (!isLocal) {
+      core.on("peer-add", (peer) => {
+        this.network?.trackPeer(true, node.nodeId, peer)
+        this.rpc?.sendHello({ targetNodeId: node.nodeId, peer })
+        void this.#notifyCurrentAuthoritativeTail(node.nodeId).catch(() => {})
+      })
+      core.on("peer-remove", (peer) => this.network?.trackPeer(false, node.nodeId, peer))
+      core.on("append", () => {
+        void this.syncFeed(node.nodeId).catch((error) => {
+          if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+            throw error
+          }
+        })
+      })
+    }
+    this.feedCores.set(node.nodeId, core)
+    this.rpc.register(node.nodeId, core)
+    return core
+  }
+
+  async #ensureJoinedNode(node) {
+    const record = this.#ensureAuthorizedNodeRecord(node)
+    await this.#ensureFeedCore(record)
+    await this.#recordPeerHint(record.nodeId, {
+      machineId: node.machineId ?? null,
+      peerPublicKey: node.noisePublicKey ?? null,
+      role: this.#membershipRole(record.nodeId)
+    })
+    if (record.nodeId !== this.options.identity.publicKeyId) {
+      void this.syncFeed(record.nodeId).catch((error) => {
+        if (!this.closing && error?.code !== "REQUEST_CANCELLED" && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }
+    return record
+  }
+
+  async #createRecoveryWatermark() {
+    const authoritativeLog = await this.getAuthoritativeLogStatus()
+    const heartbeats = await this.view.getHeartbeats()
+    const leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
+    return {
+      leaderNodeId,
+      term: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
+      splitFenced: this.#isSplitFenced(),
+      consensus: {
+        commitIndex: this.consensusState.commitIndex,
+        appliedIndex: this.consensusState.lastApplied
+      },
+      authoritativeLog: {
+        lastLogIndex: authoritativeLog.lastLogIndex,
+        lastLogTerm: authoritativeLog.lastLogTerm,
+        lastLogHash: authoritativeLog.lastLogHash,
+        snapshotIndex: Math.max(-1, (await this.view.getApplied(this.#authoritativeLogFeedKey())) - 1)
+      },
+      witnessLiveness: this.#witnessLivenessSummary(heartbeats, leaderNodeId),
+      leaderHints: {
+        nodeId: leaderNodeId,
+        peerPublicKey: leaderNodeId ? (this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? this.#peerHint(leaderNodeId)?.peerPublicKey ?? null) : null,
+        httpAddress: leaderNodeId ? (this.#peerHint(leaderNodeId)?.httpAddress ?? null) : null
+      },
+      witnessHints: this.#witnessHintEntries(leaderNodeId)
+    }
+  }
+
+  #witnessLivenessSummary(heartbeats, leaderNodeId) {
+    const freshnessCutoff = Date.now() - this.options.heartbeatTtlMs
+    let freshWitnessCount = 0
+    for (const nodeId of this.#effectiveVoterNodeIds()) {
+      if (nodeId === leaderNodeId) continue
+      if (nodeId === this.options.identity.publicKeyId) continue
+      const heartbeat = heartbeats[nodeId]
+      if (!heartbeat) continue
+      const ts = Date.parse(heartbeat.ts)
+      if (!Number.isFinite(ts) || ts < freshnessCutoff) continue
+      freshWitnessCount += 1
+    }
+    return {
+      freshWitnessCount,
+      reachableVoters: this.#reachableVotingNodeIds(),
+      quorum: this.#majoritySize(this.#effectiveVoterNodeIds().length)
+    }
+  }
+
+  #quorumStatus(witnessHealth = null) {
+    const voterNodeIds = this.#effectiveVoterNodeIds()
+    const learnerNodeIds = this.membershipState.current.learners
+
+    return {
+      voters: voterNodeIds,
+      learners: learnerNodeIds,
+      voterCount: voterNodeIds.length,
+      learnerCount: learnerNodeIds.length,
+      majority: this.#majoritySize(voterNodeIds.length),
+      reachableVoters: this.#reachableVotingNodeIds(),
+      requiredFollowerAcks: this.options.durability.requiredFollowerAcks,
+      witnessHealth
+    }
+  }
+
+  #leaderHealth(heartbeats, leaderNodeId, leaderFeedStatus = null) {
+    const heartbeat = leaderNodeId ? (heartbeats[leaderNodeId] ?? null) : null
+    return {
+      nodeId: leaderNodeId,
+      reachable: leaderNodeId ? this.#isLeaderReachable(leaderNodeId) : false,
+      heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? this.#heartbeatAgeMs(heartbeat),
+      alive: leaderFeedStatus?.alive ?? (heartbeat ? this.#heartbeatAgeMs(heartbeat) < this.options.heartbeatTtlMs : false),
+      splitFenced: this.#isSplitFenced(),
+      splitReason: this.splitState.reason,
+      lastKnownLeader: this.#lastKnownLeaderId()
+    }
+  }
+
+  async #reelectionStatus(heartbeats, leaderNodeId) {
+    const witnessEligible = await this.#canTriggerWitnessReelection(leaderNodeId)
+    let reason = null
+
+    if (!leaderNodeId) {
+      reason = "no-known-leader"
+    } else if (!this.#isSplitFenced()) {
+      reason = "leader-still-trusted"
+    } else if (this.#effectiveVoterNodeIds().length < 3) {
+      reason = "needs-three-voters"
+    } else if (this.splitState.reason !== "leader-heartbeat-expired") {
+      reason = this.splitState.reason ?? "split-fenced"
+    } else if (!witnessEligible) {
+      reason = "witness-proof-incomplete"
+    }
+
+    return {
+      allowed: witnessEligible,
+      reason,
+      leaderNodeId,
+      splitFenced: this.#isSplitFenced(),
+      witnessConnectionsAccepted: this.splitState.reason === "leader-heartbeat-expired",
+      witnessedFreshCount: this.#witnessLivenessSummary(heartbeats, leaderNodeId).freshWitnessCount
+    }
+  }
+
+  #peerCacheSummary() {
+    const hints = [...this.peerHints.keys()]
+      .map((nodeId) => this.#peerHint(nodeId))
+      .filter(Boolean)
+
+    return {
+      total: hints.length,
+      voters: hints.filter((hint) => hint.role === "voter").length,
+      learners: hints.filter((hint) => hint.role === "learner").length,
+      removed: hints.filter((hint) => hint.role === "removed").length,
+      withHttpAddress: hints.filter((hint) => hint.httpAddress).length,
+      withPeerPublicKey: hints.filter((hint) => hint.peerPublicKey).length,
+      freshestSeenAt: hints.reduce((latest, hint) => (String(hint.seenAt ?? "") > latest ? String(hint.seenAt ?? "") : latest), ""),
+      freshestSuccessfulAt: hints.reduce((latest, hint) => (
+        String(hint.lastSuccessfulAt ?? "") > latest ? String(hint.lastSuccessfulAt ?? "") : latest
+      ), "")
+    }
+  }
+
+  #heartbeatAgeMs(heartbeat) {
+    if (!heartbeat?.ts) return null
+    const ageMs = Date.now() - Date.parse(heartbeat.ts)
+    return Number.isFinite(ageMs) ? ageMs : null
+  }
+
+  async #adoptRecoveryWatermark(recovery) {
+    if (!recovery || typeof recovery !== "object") return
+    this.joinState.recovery = recovery
+
+    const leaderNodeId = recovery.leaderNodeId
+    if (
+      leaderNodeId &&
+      leaderNodeId !== this.options.identity.publicKeyId &&
+      this.#membershipRole(leaderNodeId) === "voter"
+    ) {
+      await this.#recordPeerHint(leaderNodeId, {
+        httpAddress: recovery.leaderHints?.httpAddress ?? null,
+        peerPublicKey: recovery.leaderHints?.peerPublicKey ?? null,
+        role: this.#membershipRole(leaderNodeId)
+      })
+      this.joinState.leaderNodeId = leaderNodeId
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+    }
+    for (const witness of recovery.witnessHints ?? []) {
+      if (!witness?.nodeId) continue
+      await this.#recordPeerHint(witness.nodeId, {
+        httpAddress: witness.httpAddress ?? null,
+        peerPublicKey: witness.peerPublicKey ?? null,
+        role: this.#membershipRole(witness.nodeId)
+      })
+    }
+    this.#refreshDirectPeerConnections()
+
+    await this.#repairFromRecoveryWatermark(recovery)
+  }
+
+  async #repairFromRecoveryWatermark(recovery) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    const leaderNodeId = recovery.leaderNodeId
+    if (!leaderNodeId || leaderNodeId === this.options.identity.publicKeyId) return
+    if (this.#membershipRole(leaderNodeId) !== "voter") return
+    if (!this.#isLeaderReachable(leaderNodeId)) return
+
+    const authoritative = recovery.authoritativeLog ?? {}
+    const consensus = recovery.consensus ?? {}
+    const leaderLastLogIndex = Number.isInteger(authoritative.lastLogIndex) ? authoritative.lastLogIndex : -1
+    const leaderLength = Math.max(0, leaderLastLogIndex + 1)
+    const leaderLastLogHash = typeof authoritative.lastLogHash === "string" ? authoritative.lastLogHash : null
+    const feedKey = this.#authoritativeLogFeedKey()
+    const committedApplied = await this.view.getApplied(feedKey)
+    const core = this.#authoritativeLogCore()
+
+    if (leaderLength >= committedApplied && core.length > leaderLength) {
+      this.diagnosticState.reconciliation = {
+        state: "truncating-tail",
+        at: new Date().toISOString(),
+        detail: "recovery-watermark-length"
+      }
+      await this.#truncateAuthoritativeTail(leaderLength, "recovery-watermark-length")
+    }
+    if (leaderLastLogHash && leaderLength > 0 && core.length >= leaderLength) {
+      const localTail = await core.get(leaderLength - 1)
+      if (localTail?.entryHash !== leaderLastLogHash) {
+        this.diagnosticState.reconciliation = {
+          state: "truncating-tail",
+          at: new Date().toISOString(),
+          detail: "recovery-watermark-hash"
+        }
+        await this.#truncateAuthoritativeTail(committedApplied, "recovery-watermark-hash")
+      }
+    }
+
+    await this.syncAuthoritativeLog()
+    const targetLength = Number.isInteger(consensus.commitIndex) ? Math.max(0, consensus.commitIndex + 1) : committedApplied
+    await this.#advanceCommittedFeed(targetLength)
+    this.diagnosticState.reconciliation = {
+      state: "in-sync",
+      at: new Date().toISOString(),
+      detail: "recovery-watermark"
+    }
+  }
+
+  #maybeSendJoinRequest(session) {
+    if (
+      this.closing ||
+      !this.#isLearner() ||
+      !this.transportIdentity ||
+      this.joinState.accepted ||
+      this.sentJoinRequestKeys.has(session.remotePublicKeyHex)
+    ) {
+      return
+    }
+
+    this.sentJoinRequestKeys.add(session.remotePublicKeyHex)
+    session.sendRequest(this.#createJoinRequest())
+  }
+
+  #maybeSendRecoveryWatermarkRequest(session) {
+    if (this.closing || !this.#usesSharedAuthoritativeLog()) return
+    if (!this.#isLearner() && !this.#isSplitFenced()) return
+    if (this.#isLearner() && !this.joinState.accepted) return
+    if (this.currentLeader() === this.options.identity.publicKeyId) return
+    if (this.#isSplitFenced() && this.#lastKnownLeaderId() && this.#lastKnownLeaderId() !== this.options.identity.publicKeyId) {
+      const knownLeaderKey = this.network?.peerPublicKeyForNodeId(this.#lastKnownLeaderId())
+      if (knownLeaderKey && knownLeaderKey !== session.remotePublicKeyHex) return
+    }
+
+    session.sendRequest(this.#createRecoveryWatermarkRequest())
+  }
+
+  #createJoinRequest() {
+    const payload = {
+      v: 1,
+      type: "replicore.join-request",
+      clusterId: this.options.clusterId,
+      machineId: this.transportIdentity.machineId,
+      identityPublicKey: this.options.identity.publicKey.toString("hex"),
+      feedKey: this.options.identity.feedKey,
+      noisePublicKey: this.transportIdentity.publicKeyHex,
+      role: "learner",
+      issuedAt: new Date().toISOString(),
+      nonce: randomBytes(16).toString("base64url")
+    }
+
+    return {
+      ...payload,
+      signature: signPayload(
+        this.transportIdentity.joinKeyPair.secretKey,
+        Buffer.from(canonicalize(payload))
+      )
+    }
+  }
+
+  #createRecoveryWatermarkRequest() {
+    return {
+      v: 1,
+      type: "replicore.recovery-watermark-request",
+      nodeId: this.options.identity.publicKeyId,
+      issuedAt: new Date().toISOString()
+    }
+  }
+
+  async #handleJoinRequest(session, message) {
+    if (!message) return
+    if (message.type === "replicore.recovery-watermark-request") {
+      session.sendResponse({
+        v: 1,
+        type: "replicore.recovery-watermark",
+        ok: true,
+        recovery: await this.#createRecoveryWatermark()
+      })
+      return
+    }
+    if (message.type !== "replicore.join-request") return
+
+    const currentLeader = this.currentLeader()
+    const recovery = await this.#createRecoveryWatermark()
+    if (currentLeader !== this.options.identity.publicKeyId) {
+      const leaderHint = currentLeader ?? this.#lastKnownLeaderId()
+      const refusal = this.#createRefusalError({
+        code: currentLeader ? "join-redirect" : "leader-unreachable",
+        internalCode: currentLeader ? "JOIN_REDIRECT" : "LEADER_UNAVAILABLE",
+        statusCode: 503,
+        retryable: true,
+        message: leaderHint
+          ? "Join requests must be handled by the current leader"
+          : "No current leader is available",
+        leaderNodeId: leaderHint
+      }).refusal
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: false,
+        redirect: true,
+        leaderNodeId: leaderHint,
+        recovery,
+        errorCode: currentLeader ? "NOT_LEADER" : "LEADER_UNAVAILABLE",
+        refusal,
+        error: refusal.message
+      })
+      return
+    }
+
+    try {
+      const summary = await this.#validateJoinRequest(session, message)
+      this.network?.observePeerIdentity(summary.nodeId, {
+        remotePublicKey: session.conn.remotePublicKey
+      })
+      await this.#ensureJoinedNode({
+        nodeId: summary.nodeId,
+        publicKey: summary.identityPublicKey,
+        feedKey: summary.feedKey,
+        machineId: summary.machineId,
+        noisePublicKey: summary.noisePublicKey
+      })
+
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: true,
+        redirect: false,
+        leaderNodeId: this.options.identity.publicKeyId,
+        acceptedLearner: {
+          nodeId: summary.nodeId,
+          machineId: summary.machineId,
+          noisePublicKey: summary.noisePublicKey
+        },
+        membership: {
+          current: this.membershipState.current,
+          version: this.membershipState.current.version,
+          voters: this.#voterNodes().map((node) => ({
+            nodeId: node.nodeId,
+            publicKey: node.publicKey.toString("hex"),
+            feedKey: node.feedKey
+          })),
+          learners: this.#membershipEntries()
+            .filter((entry) => entry.role === "learner")
+            .map((entry) => ({
+              nodeId: entry.nodeId,
+              feedKey: entry.feedKey
+            })),
+          removed: this.#membershipEntries()
+            .filter((entry) => entry.role === "removed")
+            .map((entry) => entry.nodeId)
+        },
+        consensus: {
+          currentTerm: this.consensusState.currentTerm,
+          commitIndex: this.consensusState.commitIndex,
+          lastApplied: this.consensusState.lastApplied
+        },
+        recovery,
+        readOnly: true
+      })
+    } catch (error) {
+      const errorCode = error?.code === "REMOVED_IDENTITY" ? "REMOVED_IDENTITY" : "JOIN_REJECTED"
+      session.sendResponse({
+        v: 1,
+        type: "replicore.join-response",
+        ok: false,
+        redirect: false,
+        leaderNodeId: this.options.identity.publicKeyId,
+        errorCode,
+        recovery,
+        refusal: error?.refusal ?? null,
+        error: error instanceof Error ? error.message : String(error),
+        ...(errorCode === "REMOVED_IDENTITY"
+            ? {
+              membership: {
+                current: this.membershipState.current,
+                version: this.membershipState.current.version,
+                voters: this.#voterNodes().map((node) => ({
+                  nodeId: node.nodeId,
+                  publicKey: node.publicKey.toString("hex"),
+                  feedKey: node.feedKey
+                })),
+                learners: this.#membershipEntries()
+                  .filter((entry) => entry.role === "learner")
+                  .map((entry) => ({
+                    nodeId: entry.nodeId,
+                    feedKey: entry.feedKey
+                  })),
+                removed: this.#membershipEntries()
+                  .filter((entry) => entry.role === "removed")
+                  .map((entry) => entry.nodeId)
+              },
+              consensus: {
+                currentTerm: this.consensusState.currentTerm,
+                commitIndex: this.consensusState.commitIndex,
+                lastApplied: this.consensusState.lastApplied
+              }
+            }
+          : {})
+      })
+    }
+  }
+
+  async #handleJoinResponse(_session, message) {
+    if (!message) return
+    if (message.type === "replicore.recovery-watermark") {
+      if (message.ok && message.recovery) {
+        await this.#adoptRecoveryWatermark(message.recovery)
+      }
+      return
+    }
+    if (message.type !== "replicore.join-response") return
+    if (message.recovery) {
+      await this.#adoptRecoveryWatermark(message.recovery)
+    }
+    if (!message.ok) {
+      if (message.membership) {
+        await this.#adoptJoinMembershipSnapshot(message)
+      }
+      if (message.redirect && message.leaderNodeId) {
+        this.joinState.leaderNodeId = message.leaderNodeId
+        this.consensusEngine.noteKnownLeader({
+          leaderNodeId: message.leaderNodeId,
+          electionTimeoutMs: this.options.electionTimeoutMaxMs
+        })
+      }
+      return
+    }
+
+    if (!message.acceptedLearner || message.acceptedLearner.nodeId !== this.options.identity.publicKeyId) {
+      throw new Error("Join response accepted a different learner identity")
+    }
+    if (message.acceptedLearner.machineId !== this.transportIdentity?.machineId) {
+      throw new Error("Join response machineId does not match the local machine identity")
+    }
+
+    for (const voter of message.membership?.voters ?? []) {
+      await this.#ensureJoinedNode(voter)
+    }
+
+    await this.#adoptJoinMembershipSnapshot(message)
+
+    this.joinState = {
+      accepted: true,
+      leaderNodeId: message.leaderNodeId ?? null,
+      recovery: message.recovery ?? null
+    }
+    await this.#ensureHeartbeatLoopStarted()
+    await this.#runHeartbeat()
+    if (message.leaderNodeId) {
+      this.consensusEngine.noteKnownLeader({
+        leaderNodeId: message.leaderNodeId,
+        electionTimeoutMs: this.options.electionTimeoutMaxMs
+      })
+    }
+  }
+
+  async #validateJoinRequest(session, message) {
+    if (message.v !== 1) {
+      throw this.#createJoinError("join-rejected", "Join request version must be 1")
+    }
+    if (message.type !== "replicore.join-request") {
+      throw this.#createJoinError("join-rejected", "Join request type must be replicore.join-request")
+    }
+    if (message.clusterId !== this.options.clusterId) {
+      throw this.#createJoinError("join-wrong-cluster", "Join request clusterId does not match this cluster")
+    }
+    if (message.role !== "learner") {
+      throw this.#createJoinError("join-rejected", "Join request role must be learner")
+    }
+    if (typeof message.machineId !== "string" || !/^[0-9a-f]{64}$/i.test(message.machineId)) {
+      throw this.#createJoinError("join-rejected", "Join request machineId must be a 32-byte hex string")
+    }
+    if (typeof message.identityPublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.identityPublicKey)) {
+      throw this.#createJoinError("join-rejected", "Join request identityPublicKey must be a 32-byte hex string")
+    }
+    if (typeof message.feedKey !== "string" || !/^[0-9a-f]+$/i.test(message.feedKey)) {
+      throw this.#createJoinError("join-rejected", "Join request feedKey must be a hex string")
+    }
+    if (typeof message.noisePublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.noisePublicKey)) {
+      throw this.#createJoinError("join-rejected", "Join request noisePublicKey must be a 32-byte hex string")
+    }
+    if (typeof message.nonce !== "string" || message.nonce.length === 0) {
+      throw this.#createJoinError("join-rejected", "Join request nonce is required")
+    }
+    if (typeof message.issuedAt !== "string") {
+      throw this.#createJoinError("join-rejected", "Join request issuedAt must be an ISO-8601 string")
+    }
+    if (typeof message.signature !== "string" || message.signature.length === 0) {
+      throw this.#createJoinError("join-bad-signature", "Join request signature is required")
+    }
+
+    const issuedAt = new Date(message.issuedAt)
+    if (Number.isNaN(issuedAt.getTime())) {
+      throw this.#createJoinError("join-stale-request", "Join request issuedAt must be a valid ISO-8601 string")
+    }
+    if (Math.abs(Date.now() - issuedAt.getTime()) > JOIN_REQUEST_MAX_SKEW_MS) {
+      throw this.#createJoinError("join-stale-request", "Join request issuedAt is outside the allowed freshness window")
+    }
+
+    const replayKey = `${message.machineId}:${message.nonce}`
+    if (this.seenJoinRequestNonces.has(replayKey)) {
+      throw this.#createJoinError("join-replay", "Join request nonce was already used")
+    }
+
+    const identityPublicKey = Buffer.from(message.identityPublicKey, "hex")
+    const feedKey = Hypercore.key(identityPublicKey).toString("hex")
+    if (feedKey !== message.feedKey) {
+      throw this.#createJoinError("join-rejected", "Join request feedKey does not match the supplied identity public key")
+    }
+
+    const derivedJoinIdentity = await deriveJoinKeyPair({
+      clusterSecret: this.options.clusterSecret,
+      machineId: message.machineId
+    })
+    const payload = {
+      v: message.v,
+      type: message.type,
+      clusterId: message.clusterId,
+      machineId: message.machineId,
+      identityPublicKey: message.identityPublicKey,
+      feedKey: message.feedKey,
+      noisePublicKey: message.noisePublicKey,
+      role: message.role,
+      issuedAt: message.issuedAt,
+      nonce: message.nonce
+    }
+    if (
+      !verifyPayload(
+        derivedJoinIdentity.publicKey,
+        Buffer.from(canonicalize(payload)),
+        message.signature
+      )
+    ) {
+      throw this.#createJoinError("join-bad-signature", "Join request signature is invalid")
+    }
+
+    const liveNoisePublicKey = session.conn.remotePublicKey.toString("hex")
+    if (liveNoisePublicKey !== message.noisePublicKey) {
+      throw this.#createJoinError("join-rejected", "Join request noisePublicKey does not match the live connection")
+    }
+
+    const nodeId = keyIdFromPublicKey(identityPublicKey)
+    const existingPeerHint = this.#peerHint(nodeId)
+    if (existingPeerHint?.machineId && existingPeerHint.machineId !== message.machineId) {
+      throw this.#createJoinError(
+        "join-rejected",
+        "Join request machineId does not match the existing node identity"
+      )
+    }
+    if (existingPeerHint?.peerPublicKey && existingPeerHint.peerPublicKey !== message.noisePublicKey) {
+      throw this.#createJoinError(
+        "join-rejected",
+        "Join request noisePublicKey does not match the existing node identity"
+      )
+    }
+
+    const existingMachineBinding = this.#peerHintByMachineId(message.machineId)
+    if (existingMachineBinding && existingMachineBinding.nodeId !== nodeId) {
+      throw this.#createJoinError(
+        "join-rejected",
+        `Machine identity ${message.machineId} is already bound to node ${existingMachineBinding.nodeId}`
+      )
+    }
+
+    if (this.#currentMembershipRole(nodeId) === "removed" || this.#isRevokedNode(nodeId)) {
+      throw this.#createJoinError(
+        "join-rejected",
+        "Removed node identities cannot rejoin through learner admission",
+        { internalCode: "REMOVED_IDENTITY", statusCode: 403, retryable: false }
+      )
+    }
+
+    this.seenJoinRequestNonces.add(replayKey)
+    return {
+      machineId: message.machineId,
+      noisePublicKey: message.noisePublicKey,
+      identityPublicKey,
+      feedKey,
+      nodeId
+    }
+  }
+
+  async #adoptJoinMembershipSnapshot(message) {
+    const previousRole = this.#role()
+    const snapshot = message.membership?.current
+    const nextMembershipState = {
+      current: this.#normalizeMembershipConfig(snapshot ?? {
+        version: message.membership?.version ?? this.membershipState.current.version,
+        voters: (message.membership?.voters ?? []).map((node) => node.nodeId),
+        learners: (message.membership?.learners ?? []).map((node) => node.nodeId),
+        removed: message.membership?.removed ?? []
+      }),
+      joint: null
+    }
+    await this.#persistMembershipState(nextMembershipState)
+    this.membershipState = nextMembershipState
+    this.consensusState = await this.consensusStateStore.save({
+      currentTerm: message.consensus?.currentTerm ?? this.consensusState.currentTerm,
+      commitIndex: message.consensus?.commitIndex ?? this.consensusState.commitIndex,
+      lastApplied: message.consensus?.lastApplied ?? this.consensusState.lastApplied,
+      membershipVersion: this.membershipState.current.version
+    })
+    this.#refreshDirectPeerConnections()
+    await this.#refreshHeartbeatRole(previousRole)
+  }
+
+  #membershipEntries() {
+    const entries = this.options.authorizedNodes.map((node) => ({
+      nodeId: node.nodeId,
+      feedKey: node.feedKey,
+      role: this.#membershipRole(node.nodeId)
+    }))
+    if (this.#isLearner() && !entries.some((entry) => entry.nodeId === this.options.identity.publicKeyId)) {
+      entries.push({
+        nodeId: this.options.identity.publicKeyId,
+        feedKey: this.options.identity.feedKey,
+        role: "learner"
+      })
+    }
+    return entries.sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+  }
+
+  #voterNodes() {
+    return this.options.authorizedNodes.filter((node) => this.#effectiveVoterNodeIds().includes(node.nodeId))
+  }
+
+  #effectiveVoterNodeIds() {
+    if (!this.membershipState) {
+      return this.options.authorizedNodes
+        .map((node) => node.nodeId)
+        .filter((nodeId) => !this.#isRevokedNode(nodeId))
+    }
+    if (!this.membershipState.joint) {
+      return this.membershipState.current.voters.filter((nodeId) => !this.#isRevokedNode(nodeId))
+    }
+    return [...new Set([
+      ...this.membershipState.joint.oldVoters,
+      ...this.membershipState.joint.newVoters
+    ])].filter((nodeId) => !this.#isRevokedNode(nodeId)).sort()
+  }
+
+  #jointMembership() {
+    return this.membershipState?.joint ?? null
+  }
+
+  async #loadMembershipState() {
+    const currentEntry = await this.consensusBee.get("membership/current")
+    const jointEntry = await this.consensusBee.get("membership/joint")
+    if (currentEntry?.value) {
+      return {
+        current: this.#normalizeMembershipConfig(currentEntry.value),
+        joint: jointEntry?.value ? this.#normalizeJointMembership(jointEntry.value) : null
+      }
+    }
+
+    const initial = this.#initialMembershipConfig()
+    await this.#persistMembershipState({
+      current: initial,
+      joint: null
+    })
+    this.consensusState = await this.consensusStateStore.save({
+      membershipVersion: initial.version
+    })
+    return {
+      current: initial,
+      joint: null
+    }
+  }
+
+  #initialMembershipConfig() {
+    const configured = this.options.membership ?? {}
+    const voters = (configured.voters ?? this.options.authorizedNodes
+      .map((node) => node.nodeId)
+      .filter((nodeId) => !this.#isRevokedNode(nodeId))).sort()
+    const removed = [...new Set(configured.removed ?? [...this.revokedNodeIds])].sort()
+    const learners = (configured.learners ?? this.options.authorizedNodes
+      .map((node) => node.nodeId)
+      .filter((nodeId) => !voters.includes(nodeId) && !removed.includes(nodeId))).sort()
+    return this.#normalizeMembershipConfig({
+      version: configured.version ?? 0,
+      voters,
+      learners,
+      removed
+    })
+  }
+
+  #normalizeMembershipConfig(config) {
+    return {
+      version: config.version ?? 0,
+      voters: [...new Set(config.voters ?? [])].sort(),
+      learners: [...new Set(config.learners ?? [])].sort(),
+      removed: [...new Set(config.removed ?? [])].sort()
+    }
+  }
+
+  #normalizeJointMembership(joint) {
+    return {
+      changeType: joint.changeType,
+      targetNodeId: joint.targetNodeId,
+      fromVersion: joint.fromVersion,
+      toVersion: joint.toVersion,
+      oldVoters: [...new Set(joint.oldVoters ?? [])].sort(),
+      newVoters: [...new Set(joint.newVoters ?? [])].sort()
+    }
+  }
+
+  async #persistMembershipState(state) {
+    const batch = this.consensusBee.batch()
+    await batch.put("membership/current", state.current)
+    if (state.joint) {
+      await batch.put("membership/joint", state.joint)
+    } else {
+      await batch.del("membership/joint")
+    }
+    await batch.flush()
+  }
+
+  async #commitMembershipChange({ changeType, targetNodeId, newVoters, learners, removed, promotion = null }) {
+    const current = this.membershipState.current
+    const nextVersion = current.version + 1
+    const joint = {
+      changeType,
+      targetNodeId,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: [...current.voters].sort(),
+      newVoters: [...newVoters].sort()
+    }
+    const finalConfig = this.#normalizeMembershipConfig({
+      version: nextVersion,
+      voters: newVoters,
+      learners,
+      removed
+    })
+    const quorumGroups = this.#jointQuorumGroups(joint)
+    const targetNode = this.options.authorizedNodes.find((node) => node.nodeId === targetNodeId) ?? null
+
+    const jointOperation = await this.#appendMembershipOperation({
+      phase: "joint",
+      changeType,
+      targetNodeId,
+      targetPublicKey: targetNode?.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetNode?.feedKey ?? null,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners: finalConfig.learners,
+      removed: finalConfig.removed,
+      quorumGroups
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? jointOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : jointOperation.seq + 1
+    )
+    await this.#runHeartbeat({ fresh: true })
+
+    const finalQuorumGroups = changeType === "removal" && this.#isLeaderReachable(targetNodeId)
+      ? [
+          ...quorumGroups,
+          {
+            eligibleNodeIds: [targetNodeId],
+            requiredCount: 1
+          }
+        ]
+      : quorumGroups
+    const finalOperation = await this.#appendMembershipOperation({
+      phase: "final",
+      changeType,
+      targetNodeId,
+      targetPublicKey: targetNode?.publicKey?.toString("hex") ?? null,
+      targetFeedKey: targetNode?.feedKey ?? null,
+      fromVersion: current.version,
+      toVersion: nextVersion,
+      oldVoters: joint.oldVoters,
+      newVoters: joint.newVoters,
+      learners: finalConfig.learners,
+      removed: finalConfig.removed,
+      quorumGroups: finalQuorumGroups
+    })
+    await this.#advanceCommittedFeed(
+      this.#usesSharedAuthoritativeLog() ? finalOperation.seq + 1 : this.options.identity.publicKeyId,
+      this.#usesSharedAuthoritativeLog() ? undefined : finalOperation.seq + 1
+    )
+
+    if (promotion) {
+      await this.consensusBee.put("promotion/current", promotion)
+    }
+
+    await this.#runHeartbeat({ fresh: true })
+  }
+
+  #jointQuorumGroups(joint) {
+    return [
+      {
+        eligibleNodeIds: joint.oldVoters,
+        requiredCount: this.#majoritySize(joint.oldVoters.length)
+      },
+      {
+        eligibleNodeIds: joint.newVoters,
+        requiredCount: this.#majoritySize(joint.newVoters.length)
+      }
+    ]
+  }
+
+  async #appendMembershipOperation({
+    phase,
+    changeType,
+    targetNodeId,
+    targetPublicKey,
+    targetFeedKey,
+    fromVersion,
+    toVersion,
+    oldVoters,
+    newVoters,
+    learners,
+    removed,
+    quorumGroups
+  }) {
+    if (!this.#hasReachableQuorum(quorumGroups)) {
+      throw new Error("Durability requirement not met: no reachable quorum available")
+    }
+
+    if (this.#usesSharedAuthoritativeLog()) {
+      try {
+        return await this.#withLocalAppendLock(async () => {
+          const previousOperation = await this.#previousAuthoritativeOperation()
+          const authoritativeCore = this.#authoritativeLogCore()
+          const operation = createSignedOperation({
+            kind: "membership",
+            type: "put",
+            key: `membership:${toVersion}:${phase}`,
+            keyspace: "system",
+            membership: {
+              phase,
+              changeType,
+              targetNodeId,
+              targetPublicKey,
+              targetFeedKey,
+              fromVersion,
+              toVersion,
+              oldVoters,
+              newVoters,
+              learners,
+              removed
+            },
+            seq: authoritativeCore.length,
+            term: this.consensusState.currentTerm,
+            index: authoritativeCore.length,
+            prevIndex: previousOperation?.index ?? -1,
+            prevHash: previousOperation?.entryHash ?? null,
+            feed: this.#authoritativeLogFeedKey(),
+            actor: this.options.identity.publicKeyId,
+            secretKey: this.authoritativeLogIdentity.secretKey,
+            encryptionKey: this.#currentEncryptionKey(),
+            encryptionKeyId: this.encryption.currentKeyId
+          })
+          const ackPromise = this.durabilityWaiter.waitForGroups(
+            operation.seq,
+            quorumGroups,
+            [this.options.identity.publicKeyId]
+          )
+          ackPromise.catch(() => {})
+          await authoritativeCore.append(operation)
+          void this.#notifyAuthoritativeAppend(operation).catch(() => {})
+          await this.syncAuthoritativeLog()
+          try {
+            await ackPromise
+          } catch (error) {
+            this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
+            this.diagnosticState.lastRejectedWriteReason = error instanceof Error ? error.message : String(error)
+            await this.#truncateUncommittedAuthoritativeTail()
+            throw error
+          }
+          return operation
+        })
+      } catch (error) {
+        await this.#runHeartbeat()
+        throw error
+      }
+    }
+
+    let operation = null
+    let ackPromise = null
+    await this.#withLocalAppendLock(async () => {
+      const previousOperation = await this.#previousLocalOperation()
+      const authoritativeCore = this.#localCore()
+      operation = createSignedOperation({
+        kind: "membership",
+        type: "put",
+        key: `membership:${toVersion}:${phase}`,
+        keyspace: "system",
+        membership: {
+          phase,
+          changeType,
+          targetNodeId,
+          targetPublicKey,
+          targetFeedKey,
+          fromVersion,
+          toVersion,
+          oldVoters,
+          newVoters,
+          learners,
+          removed
+        },
+        seq: authoritativeCore.length,
+        term: this.consensusState.currentTerm,
+        index: authoritativeCore.length,
+        prevIndex: previousOperation?.index ?? -1,
+        prevHash: previousOperation?.entryHash ?? null,
+        feed: this.options.identity.feedKey,
+        actor: this.options.identity.publicKeyId,
+        secretKey: this.options.identity.secretKey,
+        encryptionKey: this.#currentEncryptionKey(),
+        encryptionKeyId: this.encryption.currentKeyId
+      })
+      ackPromise = this.durabilityWaiter.waitForGroups(
+        operation.seq,
+        quorumGroups,
+        [this.options.identity.publicKeyId]
+      )
+      ackPromise.catch(() => {})
+      await authoritativeCore.append(operation)
+    })
+
+    await this.syncFeed(this.options.identity.publicKeyId)
+    try {
+      await ackPromise
+    } catch (error) {
+      await this.view.markSkippedEntry(this.options.identity.feedKey, operation.seq)
+      await this.#runHeartbeat()
+      throw error
+    }
+    return operation
+  }
+
+  async #applyCommittedMembershipOperation(operation) {
+    const previousRole = this.#role()
+    const membership = operation.membership
+    if (!membership || typeof membership !== "object") {
+      throw new Error("Committed membership operation is missing membership metadata")
+    }
+    if (membership.targetNodeId && membership.targetPublicKey && membership.targetFeedKey) {
+      this.#ensureAuthorizedNodeRecord({
+        nodeId: membership.targetNodeId,
+        publicKey: membership.targetPublicKey,
+        feedKey: membership.targetFeedKey
+      })
+    }
+
+    const nextMembershipState = membership.phase === "joint"
+      ? {
+        current: { ...this.membershipState.current },
+        joint: this.#normalizeJointMembership(membership)
+      }
+      : {
+        current: this.#normalizeMembershipConfig({
+          version: membership.toVersion,
+          voters: membership.newVoters,
+          learners: membership.learners,
+          removed: membership.removed
+        }),
+        joint: null
+      }
+    if (membership.phase !== "joint") {
+      this.consensusState = await this.consensusStateStore.save({
+        membershipVersion: membership.toVersion
+      })
+    }
+
+    await this.#persistMembershipState(nextMembershipState)
+    this.membershipState = nextMembershipState
+    this.#refreshDirectPeerConnections()
+    await this.#refreshHeartbeatRole(previousRole)
+  }
+
+  async #membershipStatusSnapshot() {
+    const heartbeats = await this.view.getHeartbeats()
+    return this.#membershipStatus(heartbeats)
+  }
+
+  #majoritySize(size) {
+    return majoritySize(size)
+  }
+
+  async #refreshHeartbeatRole(previousRole) {
+    const currentRole = this.#role()
+    if (previousRole !== "voter" && currentRole === "voter") {
+      this.#scheduleElectionTimer()
+      await this.#ensureHeartbeatLoopStarted()
+      await this.#runHeartbeat()
+      return
+    }
+
+    if (previousRole === "voter" && currentRole !== "voter" && this.electionTimer) {
+      clearTimeout(this.electionTimer)
+      this.electionTimer = null
+    }
+    if (this.#shouldEmitHeartbeats()) {
+      await this.#ensureHeartbeatLoopStarted()
+      await this.#runHeartbeat()
+    } else if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
+  #shouldEmitHeartbeats() {
+    return !this.closing && this.#role() !== "removed" && (!this.#isLearner() || this.joinState.accepted)
+  }
+
+  async #ensureHeartbeatLoopStarted() {
+    if (this.closing || this.heartbeatTimer) return
+    await this.#runHeartbeat()
+    this.heartbeatTimer = setInterval(() => {
+      void this.#runHeartbeat().catch((error) => {
+        if (!this.closing && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }, this.options.heartbeatIntervalMs)
+    this.heartbeatTimer.unref?.()
   }
 }
