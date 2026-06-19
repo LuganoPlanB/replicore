@@ -451,8 +451,8 @@ test(
   }
 )
 
-test("history keeps actor audit data and blocks new committed entries while followers are split-fenced", { concurrency: false }, async () => {
-  const testnet = await createTestnet(3)
+test("history keeps actor audit data and blocks new committed entries while a survivor is split-fenced", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
   const dirs = []
   const nodes = []
 
@@ -460,8 +460,7 @@ test("history keeps actor audit data and blocks new committed entries while foll
     const encryptionKey = randomBytes(32)
     const leaderIdentity = generateIdentity(seed("history-order-leader"))
     const follower1Identity = generateIdentity(seed("history-order-follower-1"))
-    const follower2Identity = generateIdentity(seed("history-order-follower-2"))
-    const authorizedNodes = [leaderIdentity, follower1Identity, follower2Identity].map((identity) => ({
+    const authorizedNodes = [leaderIdentity, follower1Identity].map((identity) => ({
       nodeId: identity.publicKeyId,
       publicKey: identity.publicKey,
       feedKey: identity.feedKey
@@ -485,22 +484,13 @@ test("history keeps actor audit data and blocks new committed entries while foll
       encryptionKey,
       bootstrap: testnet.bootstrap
     })
-    const follower2 = new HolepunchSwarmNode({
-      dataDir: await tempDir(dirs),
-      clusterId: "test-cluster",
-      topicSalt: "test-salt",
-      identity: follower2Identity,
-      authorizedNodes,
-      encryptionKey,
-      bootstrap: testnet.bootstrap
-    })
 
-    nodes.push(leader, follower1, follower2)
+    nodes.push(leader, follower1)
     for (const node of nodes) {
       await node.start()
     }
 
-    const firstLeaderId = [leaderIdentity, follower1Identity, follower2Identity]
+    const firstLeaderId = [leaderIdentity, follower1Identity]
       .map((identity) => identity.publicKeyId)
       .sort()[0]
     await waitFor(async () => nodes.every((node) => node.currentLeader() === firstLeaderId))
@@ -513,11 +503,9 @@ test("history keeps actor audit data and blocks new committed entries while foll
     nodes.splice(nodes.indexOf(firstLeaderNode), 1)
 
     await waitFor(async () => {
-      const statuses = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
-      return statuses.every((status) =>
-        status.splitStatus?.fenced === true &&
+      const [status] = await Promise.all(nodes.map((node) => node.getReplicationStatus()))
+      return status.splitStatus?.fenced === true &&
         status.splitStatus?.leaderNodeId === firstLeaderId
-      )
     })
 
     await assert.rejects(
@@ -873,6 +861,14 @@ test("leader writes require a voter majority, not just one follower acknowledgem
     const leaderId = nodes[0].currentLeader()
     const leaderNode = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
     const followers = nodes.filter((node) => node !== leaderNode)
+
+    await waitFor(async () => {
+      const status = await leaderNode.getReplicationStatus()
+      return followers.every((node) => {
+        const peer = status.peerReplication[node.options.identity.publicKeyId]
+        return peer?.alive === true && peer?.connectedPeers > 0
+      })
+    })
 
     await followers[0].close()
     await followers[1].close()

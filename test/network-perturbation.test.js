@@ -68,6 +68,21 @@ test("five-node static membership supports forwarding, replication, and deletes"
       }
     )
 
+    const authoritativeFeedKey = (await leader.getReplicationStatus()).authoritativeLog.feedKey
+    await waitFor(
+      async () => {
+        const statuses = await collectReplicationStatus(cluster.nodes)
+        return Object.values(statuses).every((status) => {
+          const leaderHeartbeat = status.heartbeatByNode?.[leaderId]
+          return leaderHeartbeat?.appliedFeeds?.[authoritativeFeedKey] >= 1
+        })
+      },
+      {
+        description: "five-node heartbeat commit visibility before delete",
+        onTimeout: () => collectClusterDiagnostics(cluster)
+      }
+    )
+
     await waitFor(
       async () => {
         const status = await leader.getReplicationStatus()
