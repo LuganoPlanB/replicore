@@ -1334,25 +1334,14 @@ test("offline leader yields failover writes and catches up cleanly after restart
     const failoverLeaderId = failoverLeader.options.identity.publicKeyId
     assert.notEqual(failoverLeaderId, originalLeaderId)
 
-    let duringFailover = null
-    await waitFor(
-      async () => {
-        const currentFailoverLeader = cluster.record(failoverLeaderId).node
-        if (currentFailoverLeader.currentLeader() !== failoverLeaderId) return false
-
-        try {
-          duringFailover = await currentFailoverLeader.put("hash:leader-during", { phase: "during" })
-          return true
-        } catch {
-          return false
-        }
-      },
-      {
-        description: "failover leader accepts writes after original leader outage",
-        onTimeout: () => collectClusterDiagnostics(cluster)
-      }
+    const duringFailover = await waitForDurableClusterWrite(
+      cluster,
+      "hash:leader-during",
+      { phase: "during" },
+      "failover leader accepts writes after original leader outage",
+      { timeoutMs: 30000 }
     )
-    assert.equal(duringFailover.actor, failoverLeaderId)
+    assert.equal(duringFailover.operation.actor, failoverLeaderId)
 
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:leader-during", { phase: "during" }),
@@ -1413,6 +1402,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
       },
       {
         description: "agreed leader accepts post-restart write",
+        timeoutMs: 30000,
         onTimeout: () => collectClusterDiagnostics(cluster)
       }
     )
@@ -1432,7 +1422,7 @@ test("offline leader yields failover writes and catches up cleanly after restart
     assert.equal(beforeHistory.length, 1)
     assert.equal(beforeHistory[0].opId, beforeFailover.opId)
     assert.equal(duringHistory.length, 1)
-    assert.equal(duringHistory[0].opId, duringFailover.opId)
+    assert.equal(duringHistory[0].opId, duringFailover.operation.opId)
     assert.equal(afterHistory.length, 1)
     assert.equal(afterHistory[0].opId, afterRecovery.operation.opId)
 
@@ -1590,20 +1580,12 @@ test("isolated leader blocks writes on both sides until heal and followers becom
       assert.equal(await node.get("hash:partition-during"), null)
     }
 
-    await waitFor(
-      async () => {
-        const status = await originalLeader.getReplicationStatus()
-        return liveFollowerIds(cluster, healedLeaderId).some(
-          (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
-        )
-      },
-      {
-        description: "old leader regains durable follower reachability after heal",
-        onTimeout: () => originalLeader.getReplicationStatus()
-      }
+    const afterHeal = await waitForDurableClusterWrite(
+      cluster,
+      "hash:partition-after",
+      { phase: "after" },
+      "post-heal durable write after isolated leader rejoins"
     )
-
-    const afterHeal = await healedLeader.put("hash:partition-after", { phase: "after" })
     await waitFor(
       async () => hasClusterValue(cluster.nodes, "hash:partition-after", { phase: "after" }),
       {
@@ -1612,8 +1594,8 @@ test("isolated leader blocks writes on both sides until heal and followers becom
       }
     )
 
-    assert.equal(afterHeal.actor, healedLeaderId)
-    assert.ok(afterHeal.opId)
+    assert.equal(afterHeal.operation.actor, healedLeaderId)
+    assert.ok(afterHeal.operation.opId)
 
     await assertClusterInvariants(cluster)
   } finally {
@@ -1708,27 +1690,14 @@ test(
       )
       const healedLeader = cluster.record(healedLeaderId).node
 
-      await waitFor(
-        async () => {
-          const status = await originalLeader.getReplicationStatus()
-          return liveFollowerIds(cluster, healedLeaderId).some(
-            (nodeId) => status.peerReplication[nodeId]?.alive === true && status.peerReplication[nodeId]?.connectedPeers > 0
-          )
-        },
-        {
-          description: "old leader regains durable follower reachability",
-          onTimeout: () => originalLeader.getReplicationStatus()
-        }
-      )
-
-      const afterHeal = await waitForDurableWriteFrom(
-        healedLeader,
+      const afterHeal = await waitForDurableClusterWrite(
+        cluster,
         "hash:subgroup-after",
         { phase: "after" },
         "post-heal durable write from the healed leader",
         { timeoutMs: 30000 }
       )
-      assert.ok(afterHeal.opId)
+      assert.ok(afterHeal.operation.opId)
 
       await waitFor(
         async () => hasClusterValue(cluster.nodes, "hash:subgroup-after", { phase: "after" }),
@@ -3035,7 +3004,7 @@ async function writeOnCurrentLeader(cluster, key, value) {
   return { ok: true, key, operation }
 }
 
-async function waitForDurableClusterWrite(cluster, key, value, description) {
+async function waitForDurableClusterWrite(cluster, key, value, description, options = {}) {
   let result = null
   await waitFor(
     async () => {
@@ -3050,6 +3019,7 @@ async function waitForDurableClusterWrite(cluster, key, value, description) {
     },
     {
       description,
+      timeoutMs: Number.isInteger(options.timeoutMs) ? options.timeoutMs : 30000,
       onTimeout: () => collectClusterDiagnostics(cluster)
     }
   )
@@ -3069,7 +3039,7 @@ async function waitForDurableWriteFrom(node, key, value, description, options = 
     },
     {
       description,
-      ...(Number.isInteger(options.timeoutMs) ? { timeoutMs: options.timeoutMs } : {}),
+      timeoutMs: Number.isInteger(options.timeoutMs) ? options.timeoutMs : 30000,
       onTimeout: () => node.getReplicationStatus()
     }
   )
