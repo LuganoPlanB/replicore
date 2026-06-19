@@ -241,15 +241,9 @@ export class HolepunchSwarmNode {
 
     if (!this.#isLearner()) {
       this.#scheduleElectionTimer()
-      await this.#runHeartbeat()
-      this.heartbeatTimer = setInterval(() => {
-        void this.#runHeartbeat().catch((error) => {
-          if (!this.closing && error?.code !== "SESSION_CLOSED") {
-            throw error
-          }
-        })
-      }, this.options.heartbeatIntervalMs)
-      this.heartbeatTimer.unref?.()
+    }
+    if (this.#shouldEmitHeartbeats()) {
+      await this.#ensureHeartbeatLoopStarted()
     }
   }
 
@@ -268,7 +262,7 @@ export class HolepunchSwarmNode {
     if (this.closing) return
 
     await this.network?.resume()
-    if (!this.#isLearner()) {
+    if (this.#shouldEmitHeartbeats()) {
       await this.#runHeartbeat()
     }
   }
@@ -310,10 +304,10 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async put(key, value, options = {}) {
-    await this.#refreshAuthoritativeMembership()
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
+    await this.#refreshAuthoritativeMembership()
     if (this.#isSplitFenced()) {
       throw this.#createSplitFencedError()
     }
@@ -332,10 +326,10 @@ export class HolepunchSwarmNode {
    * @param {{ keyspace?: string, ttlMs?: number }} [options]
    */
   async delete(key, options = {}) {
-    await this.#refreshAuthoritativeMembership()
     if (this.#isLearner()) {
       throw this.#createLearnerWriteError()
     }
+    await this.#refreshAuthoritativeMembership()
     if (this.#isSplitFenced()) {
       throw this.#createSplitFencedError()
     }
@@ -897,7 +891,10 @@ export class HolepunchSwarmNode {
     if (this.authoritativeSyncTimer) clearInterval(this.authoritativeSyncTimer)
     if (this.peerMaintenanceTimer) clearInterval(this.peerMaintenanceTimer)
     if (this.electionTimer) clearTimeout(this.electionTimer)
-    await Promise.allSettled(this.heartbeatPromise ? [this.heartbeatPromise] : [])
+    this.heartbeatTimer = null
+    this.authoritativeSyncTimer = null
+    this.peerMaintenanceTimer = null
+    this.electionTimer = null
     this.#rejectPendingWrites(new Error("Node is closing"))
     this.pendingSync.clear()
     this.authoritativeSyncPending = false
@@ -905,9 +902,21 @@ export class HolepunchSwarmNode {
     this.joinControl?.close()
     this.rpc?.close(new Error("Node is closing"))
     await Promise.allSettled([...this.feedCores.values()].map((core) => core.close()))
-    await Promise.allSettled(this.authoritativeSyncPromise ? [this.authoritativeSyncPromise] : [])
     if (this.#usesSharedAuthoritativeLog() && this.authoritativeLogCore) await this.authoritativeLogCore.close()
-    await Promise.allSettled(this.syncPromises.values())
+    const pendingHeartbeat = this.heartbeatPromise
+    if (pendingHeartbeat) {
+      void pendingHeartbeat.catch(() => {})
+      this.heartbeatPromise = null
+    }
+    const pendingAuthoritativeSync = this.authoritativeSyncPromise
+    if (pendingAuthoritativeSync) {
+      void pendingAuthoritativeSync.catch(() => {})
+      this.authoritativeSyncPromise = null
+    }
+    for (const pendingSync of this.syncPromises.values()) {
+      void pendingSync.catch(() => {})
+    }
+    this.syncPromises.clear()
     this.network?.clear()
     if (this.consensusBee) await this.consensusBee.close()
     if (this.viewBee) await this.viewBee.close()
@@ -2087,12 +2096,10 @@ export class HolepunchSwarmNode {
   }
 
   #hasReachableQuorum(groups) {
-    const reachable = new Set(this.#reachableVotingNodeIds())
     return groups.every((group) => {
       if (group.requiredCount <= 0) return true
-      const matchedCount = group.eligibleNodeIds
-        ? group.eligibleNodeIds.filter((nodeId) => reachable.has(nodeId)).length
-        : reachable.size
+      const eligibleNodeIds = group.eligibleNodeIds ?? this.#effectiveVoterNodeIds()
+      const matchedCount = eligibleNodeIds.filter((nodeId) => this.#isLeaderReachable(nodeId)).length
       return matchedCount >= group.requiredCount
     })
   }
@@ -3428,6 +3435,8 @@ export class HolepunchSwarmNode {
       leaderNodeId: message.leaderNodeId ?? null,
       recovery: message.recovery ?? null
     }
+    await this.#ensureHeartbeatLoopStarted()
+    await this.#runHeartbeat()
     if (message.leaderNodeId) {
       this.consensusEngine.noteKnownLeader({
         leaderNodeId: message.leaderNodeId,
@@ -3946,28 +3955,39 @@ export class HolepunchSwarmNode {
   async #refreshHeartbeatRole(previousRole) {
     const currentRole = this.#role()
     if (previousRole !== "voter" && currentRole === "voter") {
-      if (!this.heartbeatTimer && !this.closing) {
-        this.#scheduleElectionTimer()
-        await this.#runHeartbeat()
-        this.heartbeatTimer = setInterval(() => {
-          void this.#runHeartbeat().catch((error) => {
-            if (!this.closing && error?.code !== "SESSION_CLOSED") {
-              throw error
-            }
-          })
-        }, this.options.heartbeatIntervalMs)
-        this.heartbeatTimer.unref?.()
-      }
+      this.#scheduleElectionTimer()
+      await this.#ensureHeartbeatLoopStarted()
+      await this.#runHeartbeat()
       return
     }
 
-    if (previousRole === "voter" && currentRole !== "voter" && this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer)
-      this.heartbeatTimer = null
-    }
     if (previousRole === "voter" && currentRole !== "voter" && this.electionTimer) {
       clearTimeout(this.electionTimer)
       this.electionTimer = null
     }
+    if (this.#shouldEmitHeartbeats()) {
+      await this.#ensureHeartbeatLoopStarted()
+      await this.#runHeartbeat()
+    } else if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
+  #shouldEmitHeartbeats() {
+    return !this.closing && this.#role() !== "removed" && (!this.#isLearner() || this.joinState.accepted)
+  }
+
+  async #ensureHeartbeatLoopStarted() {
+    if (this.closing || this.heartbeatTimer) return
+    await this.#runHeartbeat()
+    this.heartbeatTimer = setInterval(() => {
+      void this.#runHeartbeat().catch((error) => {
+        if (!this.closing && error?.code !== "SESSION_CLOSED") {
+          throw error
+        }
+      })
+    }, this.options.heartbeatIntervalMs)
+    this.heartbeatTimer.unref?.()
   }
 }

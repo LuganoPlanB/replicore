@@ -26,9 +26,17 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "same-secret unknown peers|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion|removed voter cannot regain|replacement learner can join",
+      "same-secret unknown peers|init-cluster voter can admit|independently initialized clusters|learner can join through|learner catches up for reads|healed follower converges|live learner connection|learner can store a valid promotion",
       "test/swarm-node.test.js"
     ]
+  },
+  {
+    label: "swarm-node-removed",
+    args: ["test/swarm-node-removed-membership.run.mjs"]
+  },
+  {
+    label: "swarm-node-replacement",
+    args: ["test/swarm-node-replacement-membership.run.mjs"]
   },
   {
     label: "swarm-node-c",
@@ -83,7 +91,8 @@ const steps = [
 ]
 
 for (const step of steps) {
-  process.stdout.write(`step ${step.label}: ${process.execPath} ${step.args.join(" ")}\n`)
+  const command = step.cmd ?? process.execPath
+  process.stdout.write(`step ${step.label}: ${command} ${step.args.join(" ")}\n`)
   const exitCode = await runStep(step)
   if (exitCode !== 0) {
     process.exit(exitCode)
@@ -91,7 +100,8 @@ for (const step of steps) {
 }
 
 async function runStep(step) {
-  const child = spawn(process.execPath, step.args, {
+  const command = step.cmd ?? process.execPath
+  const child = spawn(command, step.args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: process.env
   })
@@ -105,7 +115,7 @@ async function runStep(step) {
 
   const timer = setTimeout(() => {
     process.stderr.write(
-      `[${step.label} ERR] timed out after ${timeoutMs}ms: ${process.execPath} ${step.args.join(" ")}\n`
+      `[${step.label} ERR] timed out after ${timeoutMs}ms: ${command} ${step.args.join(" ")}\n`
     )
     child.kill("SIGTERM")
     setTimeout(() => child.kill("SIGKILL"), 5000).unref()
