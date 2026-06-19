@@ -698,6 +698,9 @@ test("two-node leader loss stays split-fenced and does not autonomously reelect"
     assert.equal(forgedStatus.heartbeatByNode[firstLeaderId]?.reachableLeader, true)
     assert.equal(forgedStatus.splitStatus?.fenced, true)
     assert.equal(forgedStatus.readStatus.reason, "split-fenced")
+    assert.equal(forgedStatus.leaderHealth.splitFenced, true)
+    assert.equal(forgedStatus.reelection.allowed, false)
+    assert.equal(forgedStatus.reelection.reason, "needs-three-voters")
 
     await assert.rejects(
       survivor.put("hash:two-node-leader-loss", { blocked: true }),
@@ -1120,16 +1123,33 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
     assert.equal(typeof replication.knownPeerNodeIds.length, "number")
     assert.equal(typeof replication.peerReplication[followerNode.options.identity.publicKeyId].lag, "number")
     assert.equal(typeof replication.peerReplication[followerNode.options.identity.publicKeyId].alive, "boolean")
+    assert.equal(typeof replication.consensus.currentTerm, "number")
+    assert.equal(typeof replication.consensus.membershipVersion, "number")
+    assert.equal(typeof replication.leaderHealth.reachable, "boolean")
+    assert.equal(typeof replication.witnessHealth.freshWitnessCount, "number")
+    assert.equal(typeof replication.quorum.majority, "number")
+    assert.equal(typeof replication.peerCache.total, "number")
+    assert.equal(typeof replication.antiEntropy.state, "string")
+    assert.equal(replication.recentRefusal.reason, null)
+    assert.equal(typeof replication.reelection.allowed, "boolean")
 
     const writersResponse = await fetch(`${baseUrl}/status/writers`)
     assert.equal(writersResponse.status, 200)
     const writers = await writersResponse.json()
     assert.equal(writers.authorizedNodes.length, 3)
+    assert.equal(typeof writers.currentTerm, "number")
+    assert.equal(typeof writers.membershipVersion, "number")
+    assert.equal(typeof writers.quorum.majority, "number")
+    assert.equal(typeof writers.peerCache.total, "number")
 
     const leaderResponse = await fetch(`${baseUrl}/status/leader`)
     assert.equal(leaderResponse.status, 200)
     const leader = await leaderResponse.json()
     assert.equal(typeof leader.currentLeader, "string")
+    assert.equal(typeof leader.currentTerm, "number")
+    assert.equal(typeof leader.membershipVersion, "number")
+    assert.equal(typeof leader.witnessHealth.quorum, "number")
+    assert.equal(typeof leader.reelection.allowed, "boolean")
 
     const snapshotForbidden = await fetch(`${baseUrl}/admin/snapshot`, {
       headers: { authorization: "Bearer writer" }

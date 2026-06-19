@@ -412,8 +412,17 @@ export class HolepunchSwarmNode {
     const leaderFeedStatus =
       peerReplication[authoritativeLogNodeId] ??
       (await this.#feedReplicationStatus(authoritativeLogNodeId, heartbeats, now))
+    const knownLeader = this.currentLeader() ?? this.#lastKnownLeaderId()
+    const witnessHealth = this.#witnessLivenessSummary(heartbeats, knownLeader)
     const uncommittedTailLength = Math.max(0, authoritativeLog.length - authoritativeReplication.applied)
     const reconciliationState = uncommittedTailLength > 0 ? "reconciling" : "in-sync"
+    const antiEntropy = {
+      state: reconciliationState,
+      at: this.diagnosticState.reconciliation.at,
+      detail: this.diagnosticState.reconciliation.detail,
+      uncommittedTailLength,
+      stagedTail: authoritativeReplication.staged
+    }
 
     return buildReplicationStatus({
       nodeId: this.options.identity.publicKeyId,
@@ -423,8 +432,14 @@ export class HolepunchSwarmNode {
         currentTerm: this.consensusState.currentTerm,
         commitIndex: this.consensusState.commitIndex,
         lastApplied: this.consensusState.lastApplied,
-        knownLeader: this.currentLeader() ?? this.#lastKnownLeaderId()
+        lastLogIndex: authoritativeLog.lastLogIndex,
+        lastLogTerm: authoritativeLog.lastLogTerm,
+        membershipVersion: this.membershipState.current.version,
+        knownLeader
       },
+      leaderHealth: this.#leaderHealth(heartbeats, knownLeader, leaderFeedStatus),
+      witnessHealth,
+      quorum: this.#quorumStatus(witnessHealth),
       authoritativeLog: {
         ...authoritativeLog,
         commitIndex: this.consensusState.commitIndex,
@@ -436,11 +451,7 @@ export class HolepunchSwarmNode {
         lastTruncationReason: this.diagnosticState.lastTruncationReason,
         lastRejectedWriteAt: this.diagnosticState.lastRejectedWriteAt,
         lastRejectedWriteReason: this.diagnosticState.lastRejectedWriteReason,
-        reconciliation: {
-          state: reconciliationState,
-          at: this.diagnosticState.reconciliation.at,
-          detail: this.diagnosticState.reconciliation.detail
-        },
+        reconciliation: antiEntropy,
         connectedPeers: leaderFeedStatus?.connectedPeers ?? 0,
         alive: leaderFeedStatus?.alive ?? false,
         heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? null
@@ -453,6 +464,13 @@ export class HolepunchSwarmNode {
       knownPeerNodeIds: this.network?.knownPeerPublicKeys ?? [],
       membership: this.#membershipStatus(heartbeats),
       promotion: await this.#promotionStatus(),
+      peerCache: this.#peerCacheSummary(),
+      antiEntropy,
+      recentRefusal: {
+        at: this.diagnosticState.lastRejectedWriteAt,
+        reason: this.diagnosticState.lastRejectedWriteReason
+      },
+      reelection: await this.#reelectionStatus(heartbeats, knownLeader),
       network: this.network?.networkStatus() ?? { policyActive: false, allowedNodeIds: [], peers: {} },
       readStatus: this.#readStatus(),
       heartbeatByNode: heartbeats
@@ -463,10 +481,18 @@ export class HolepunchSwarmNode {
     return buildWritersStatus({
       role: this.#role(),
       currentLeader: this.currentLeader(),
+      currentTerm: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
       revokedNodeIds: [...this.revokedNodeIds],
       encryptionKeyId: this.encryption.currentKeyId,
       membershipFingerprint: this.#membershipFingerprint(),
       membership: this.#membershipEntries(),
+      quorum: this.#quorumStatus(),
+      peerCache: this.#peerCacheSummary(),
+      recentRefusal: {
+        at: this.diagnosticState.lastRejectedWriteAt,
+        reason: this.diagnosticState.lastRejectedWriteReason
+      },
       authorizedNodes: this.options.authorizedNodes.map((node) => ({
         nodeId: node.nodeId,
         feedKey: node.feedKey,
@@ -479,13 +505,19 @@ export class HolepunchSwarmNode {
   async getLeaderStatus() {
     const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
     const heartbeats = await this.view.getHeartbeats()
+    const witnessHealth = this.#witnessLivenessSummary(heartbeats, leader)
 
     return buildLeaderStatus({
       nodeId: this.options.identity.publicKeyId,
       role: this.#role(),
       currentLeader: leader,
       reachable: leader ? this.#isLeaderReachable(leader) : false,
-      heartbeat: leader ? (heartbeats[leader] ?? null) : null
+      heartbeat: leader ? (heartbeats[leader] ?? null) : null,
+      currentTerm: this.consensusState.currentTerm,
+      membershipVersion: this.membershipState.current.version,
+      splitStatus: { ...this.splitState },
+      witnessHealth,
+      reelection: await this.#reelectionStatus(heartbeats, leader)
     })
   }
 
@@ -2996,6 +3028,86 @@ export class HolepunchSwarmNode {
       reachableVoters: this.#reachableVotingNodeIds(),
       quorum: this.#majoritySize(this.#effectiveVoterNodeIds().length)
     }
+  }
+
+  #quorumStatus(witnessHealth = null) {
+    const voterNodeIds = this.#effectiveVoterNodeIds()
+    const learnerNodeIds = this.membershipState.current.learners
+
+    return {
+      voters: voterNodeIds,
+      learners: learnerNodeIds,
+      voterCount: voterNodeIds.length,
+      learnerCount: learnerNodeIds.length,
+      majority: this.#majoritySize(voterNodeIds.length),
+      reachableVoters: this.#reachableVotingNodeIds(),
+      requiredFollowerAcks: this.options.durability.requiredFollowerAcks,
+      witnessHealth
+    }
+  }
+
+  #leaderHealth(heartbeats, leaderNodeId, leaderFeedStatus = null) {
+    const heartbeat = leaderNodeId ? (heartbeats[leaderNodeId] ?? null) : null
+    return {
+      nodeId: leaderNodeId,
+      reachable: leaderNodeId ? this.#isLeaderReachable(leaderNodeId) : false,
+      heartbeatAgeMs: leaderFeedStatus?.heartbeatAgeMs ?? this.#heartbeatAgeMs(heartbeat),
+      alive: leaderFeedStatus?.alive ?? (heartbeat ? this.#heartbeatAgeMs(heartbeat) < this.options.heartbeatTtlMs : false),
+      splitFenced: this.#isSplitFenced(),
+      splitReason: this.splitState.reason,
+      lastKnownLeader: this.#lastKnownLeaderId()
+    }
+  }
+
+  async #reelectionStatus(heartbeats, leaderNodeId) {
+    const witnessEligible = await this.#canTriggerWitnessReelection(leaderNodeId)
+    let reason = null
+
+    if (!leaderNodeId) {
+      reason = "no-known-leader"
+    } else if (!this.#isSplitFenced()) {
+      reason = "leader-still-trusted"
+    } else if (this.#effectiveVoterNodeIds().length < 3) {
+      reason = "needs-three-voters"
+    } else if (this.splitState.reason !== "leader-heartbeat-expired") {
+      reason = this.splitState.reason ?? "split-fenced"
+    } else if (!witnessEligible) {
+      reason = "witness-proof-incomplete"
+    }
+
+    return {
+      allowed: witnessEligible,
+      reason,
+      leaderNodeId,
+      splitFenced: this.#isSplitFenced(),
+      witnessConnectionsAccepted: this.splitState.reason === "leader-heartbeat-expired",
+      witnessedFreshCount: this.#witnessLivenessSummary(heartbeats, leaderNodeId).freshWitnessCount
+    }
+  }
+
+  #peerCacheSummary() {
+    const hints = [...this.peerHints.keys()]
+      .map((nodeId) => this.#peerHint(nodeId))
+      .filter(Boolean)
+
+    return {
+      total: hints.length,
+      voters: hints.filter((hint) => hint.role === "voter").length,
+      learners: hints.filter((hint) => hint.role === "learner").length,
+      removed: hints.filter((hint) => hint.role === "removed").length,
+      withHttpAddress: hints.filter((hint) => hint.httpAddress).length,
+      withPeerPublicKey: hints.filter((hint) => hint.peerPublicKey).length,
+      freshestSeenAt: hints.reduce((latest, hint) => (String(hint.seenAt ?? "") > latest ? String(hint.seenAt ?? "") : latest), ""),
+      freshestSuccessfulAt: hints.reduce((latest, hint) => (
+        String(hint.lastSuccessfulAt ?? "") > latest ? String(hint.lastSuccessfulAt ?? "") : latest
+      ), "")
+    }
+  }
+
+  #heartbeatAgeMs(heartbeat) {
+    if (!heartbeat?.ts) return null
+    const ageMs = Date.now() - Date.parse(heartbeat.ts)
+    return Number.isFinite(ageMs) ? ageMs : null
   }
 
   async #adoptRecoveryWatermark(recovery) {

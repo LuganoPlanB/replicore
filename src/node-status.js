@@ -26,6 +26,9 @@ export function buildReplicationStatus({
   role,
   leader,
   consensus,
+  leaderHealth,
+  witnessHealth,
+  quorum,
   authoritativeLog,
   peerReplication,
   splitStatus,
@@ -35,6 +38,10 @@ export function buildReplicationStatus({
   knownPeerNodeIds,
   membership,
   promotion,
+  peerCache,
+  antiEntropy,
+  recentRefusal,
+  reelection,
   network,
   readStatus,
   heartbeatByNode
@@ -44,6 +51,9 @@ export function buildReplicationStatus({
     role,
     leader,
     consensus,
+    leaderHealth,
+    witnessHealth,
+    quorum,
     authoritativeLog,
     peerReplication,
     splitStatus,
@@ -53,6 +63,10 @@ export function buildReplicationStatus({
     knownPeerNodeIds,
     membership,
     promotion,
+    peerCache,
+    antiEntropy,
+    recentRefusal,
+    reelection,
     network,
     readStatus,
     heartbeatByNode
@@ -62,19 +76,29 @@ export function buildReplicationStatus({
 export function buildWritersStatus({
   role,
   currentLeader,
+  currentTerm,
+  membershipVersion,
   revokedNodeIds,
   encryptionKeyId,
   membershipFingerprint,
   membership,
+  quorum,
+  peerCache,
+  recentRefusal,
   authorizedNodes
 }) {
   return {
     role,
     currentLeader,
+    currentTerm,
+    membershipVersion,
     revokedNodeIds,
     encryptionKeyId,
     membershipFingerprint,
     membership,
+    quorum,
+    peerCache,
+    recentRefusal,
     authorizedNodes
   }
 }
@@ -84,13 +108,23 @@ export function buildLeaderStatus({
   role,
   currentLeader,
   reachable,
-  heartbeat
+  heartbeat,
+  currentTerm,
+  membershipVersion,
+  splitStatus,
+  witnessHealth,
+  reelection
 }) {
   return {
     nodeId,
     role,
     currentLeader,
     reachable,
-    heartbeat
+    heartbeat,
+    currentTerm,
+    membershipVersion,
+    splitStatus,
+    witnessHealth,
+    reelection
   }
 }
