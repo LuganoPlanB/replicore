@@ -3042,6 +3042,15 @@ async function waitForDurableClusterWrite(cluster, key, value, description, opti
       const status = statuses.find((entry) => entry.nodeId === leaderId)
       if (!status || status.splitStatus?.fenced === true) return false
       if (status.quorum.reachableVoters.length < status.quorum.majority) return false
+      const requiredFollowerLinks = Math.max(1, status.quorum.majority - 1)
+      const liveFollowerLinks = Object.entries(status.peerReplication)
+        .filter(([nodeId, peer]) =>
+          nodeId !== leaderId &&
+          peer?.alive === true &&
+          peer?.connectedPeers > 0
+        )
+        .length
+      if (liveFollowerLinks < requiredFollowerLinks) return false
 
       try {
         result = await leader.put(key, value).then((operation) => ({ ok: true, key, operation }))
