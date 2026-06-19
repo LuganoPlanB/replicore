@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 
 import { generateIdentity } from "./crypto.js"
+import { verifyOrPersistRuntimeGuardrails } from "./runtime-guardrails.js"
 
 /**
  * Load and normalize a node runtime config from JSON.
@@ -73,10 +74,20 @@ export async function loadRuntimeConfig(configPath) {
   }
   const encryption = normalizeEncryption(raw)
   const raft = normalizeRaftTimings(raw)
+  const dataDir = path.resolve(path.dirname(absolutePath), raw.dataDir)
+
+  await verifyOrPersistRuntimeGuardrails({
+    dataDir,
+    clusterId: requireString(raw.clusterId, "clusterId"),
+    clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
+    identity,
+    compatibilityMode: normalizedCompatibilityMode,
+    initCluster
+  })
 
   return {
     configPath: absolutePath,
-    dataDir: path.resolve(path.dirname(absolutePath), raw.dataDir),
+    dataDir,
     clusterId: requireString(raw.clusterId, "clusterId"),
     clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
     compatibilityMode: normalizedCompatibilityMode,

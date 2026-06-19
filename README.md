@@ -213,6 +213,11 @@ prefer the explicit `initCluster: true` bootstrap plus learner join and
 promotion. Joining nodes should use the secret-first learner config shown in
 `examples/local/joiner.json`.
 
+Replicore binds each `dataDir` to one cluster secret hash, one local signing
+identity, and one bootstrap mode. Restarting a populated directory with a
+different secret, different node identity, or `initCluster: true` after that
+directory already joined another cluster fails closed.
+
 Simple encryption config:
 
 ```json

@@ -94,6 +94,12 @@ test("loadRuntimeConfig supports an explicit initCluster bootstrap voter", async
     assert.equal(config.authorizedNodes.length, 1)
     assert.equal(config.authorizedNodes[0].nodeId, config.identity.publicKeyId)
     assert.equal(config.machineId, "local-demo-init-node")
+
+    const persisted = JSON.parse(
+      await readFile(path.join(dir, "data", "replicore-runtime.json"), "utf8")
+    )
+    assert.equal(persisted.identity.nodeId, config.identity.publicKeyId)
+    assert.equal(persisted.startupMode.initCluster, true)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -173,6 +179,104 @@ test("loadRuntimeConfig rejects a secret-first voter without initCluster", async
       loadRuntimeConfig(configPath),
       /Secret-first voter config requires initCluster: true/
     )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig rejects a changed identity for an existing data dir", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-identity-drift-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await loadRuntimeConfig(configPath)
+
+    raw.identitySeed = "7777777777777777777777777777777777777777777777777777777777777777"
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    await assert.rejects(loadRuntimeConfig(configPath), /Persisted node identity does not match/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig rejects a changed clusterSecret for an existing data dir", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-secret-drift-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await loadRuntimeConfig(configPath)
+
+    raw.clusterSecret = "9999999999999999999999999999999999999999999999999999999999999999"
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    await assert.rejects(loadRuntimeConfig(configPath), /Persisted clusterSecret does not match/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig rejects initCluster on a data dir that already joined as a learner", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-init-reuse-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const learnerRaw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-joiner.json"), "utf8")
+    )
+    learnerRaw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(learnerRaw, null, 2))
+    await loadRuntimeConfig(configPath)
+
+    const initRaw = {
+      ...learnerRaw,
+      role: "voter",
+      initCluster: true
+    }
+    delete initRaw.role
+    await writeFile(configPath, JSON.stringify(initRaw, null, 2))
+
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /initCluster cannot be used on a data directory that already joined another cluster/
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig rejects missing persisted identity metadata", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-missing-persisted-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+    await loadRuntimeConfig(configPath)
+
+    const persistedPath = path.join(dir, "data", "replicore-runtime.json")
+    const persisted = JSON.parse(await readFile(persistedPath, "utf8"))
+    delete persisted.identity.nodeId
+    await writeFile(persistedPath, JSON.stringify(persisted, null, 2))
+
+    await assert.rejects(loadRuntimeConfig(configPath), /Persisted identity metadata is missing/)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
