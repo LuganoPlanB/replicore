@@ -4,14 +4,14 @@ Resilient multi-node K/V storage for high availability, based on the Holepunch /
 
 This repository implements a small multi-node service with these properties:
 
-- Each node has its own writable Hypercore feed.
-- The application state is a signed append-only operation log.
-- A local Hyperbee is the derived K/V view, not the source of truth.
-- Only the current leader writes K/V operations.
-- Followers replicate feeds, serve reads, and forward writes to the leader.
-- Writes are considered successful only after leader-local append plus one follower acknowledgement.
+- One authoritative signed append-only leader log is the source of truth.
+- A local Hyperbee is the derived committed K/V view, not the source of truth.
+- Only the current quorum leader may commit K/V and membership operations.
+- Followers replicate the leader log, serve reads, and forward writes conservatively.
+- Learners can join with the shared secret, catch up read-only, and only become voters after committed promotion.
+- Writes are successful only after quorum commit, not after local append alone.
 
-The current implementation is a prototype. It is useful for local runs and architecture validation, not production deployment.
+Replicore is intended for non-Byzantine production use only within the boundaries stated in this README.
 
 ## Current Features
 
@@ -30,11 +30,12 @@ The current implementation is a prototype. It is useful for local runs and archi
 ## Not Implemented Yet
 
 - Real production auth such as JWT issuer integration, mTLS, or signed HTTP requests
-- Dynamic writer membership changes through the replicated log
 - Node identity rotation
 - Log pruning and feed rotation
 - Backup archive lifecycle
 - Production deployment packaging
+- Shared-secret compromise rotation and automatic cluster-wide recovery
+- Byzantine fault tolerance
 
 ## Requirements
 
@@ -301,18 +302,38 @@ The current test suite verifies these non-malicious failure behaviors:
 
 - follower crashes and restarts catch up from replicated feeds
 - former leaders can disappear, a new leader can write, and the old leader can rejoin and catch up
+- new same-secret nodes join as learners first and only become voters after committed promotion
+- wrong-secret nodes do not discover, mirror, or join the cluster
 - a single isolated node can continue serving local reads but cannot make durable writes
-- a connected subset with a live leader plus at least one follower can continue writing
+- only one connected side with the live leader and quorum can continue writing
 - isolated followers can serve stale reads until they heal and catch up
 - already-connected peers continue writing after bootstrap disappears
 - if a follower restarts while bootstrap remains unavailable, it starts locally but does not rediscover peers from scratch, stays disconnected, and does not catch up to writes made while it was away
-- membership is static; rolling out divergent `authorizedNodes` views is unsupported, nodes expose membership fingerprint mismatches in replication status, and degraded writes may stay blocked until configs converge again
+- learner promotion, voter removal, and node replacement go through committed membership changes
+- divergent membership views remain observable through membership fingerprints, and degraded writes may stay blocked until configs converge again
 - writes may fail transiently during failover windows while leader view and reachability converge
 - snapshot restore and persisted data directories recover current state after severe outage or full restart
+
+## Production Boundaries
+
+Replicore currently guarantees these properties for non-malicious failures:
+
+- committed writes are crash-safe across restart and leader replacement
+- only one partition may accept durable writes at a time; minority or split-fenced sides reject writes
+- `clusterSecret` gates discovery and first admission, but voter authority still requires committed membership
+- new nodes join as read-only learners, catch up, and can later be promoted to voters through quorum commit
+- stale reads are explicit in runtime status when a node is isolated or split-fenced
+- recovery is explicit: healed nodes reconcile to the committed leader log, and snapshot restore validates integrity metadata before import
+
+Operators must still treat these as hard limits:
+
+- no Byzantine or malicious-node tolerance
+- compromise of the shared secret requires manual rotation and operational recovery
+- clients that need freshest reads must use a leader-connected path or otherwise require a strong-read policy above the current API
+- do not initialize two independent clusters with the same `clusterSecret`; a fresh cluster must use one explicit `initCluster: true` voter and all other same-secret nodes must join as learners
 
 Not covered:
 
 - malevolent or Byzantine nodes
-- dynamic membership through the replicated log
-- production-grade consensus semantics
+- automatic shared-secret rotation and compromise recovery
 - production auth, backup lifecycle, or deployment packaging
