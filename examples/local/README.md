@@ -6,6 +6,17 @@ Start a local bootstrap node:
 npm run start:bootstrap
 ```
 
+Fresh-cluster bootstrap from one explicit initializer:
+
+```powershell
+npm run start:node -- examples/local/init-node.json
+npm run start:node -- examples/local/init-joiner.json
+```
+
+That file uses `initCluster: true`. It is the only secret-first voter bootstrap
+path. A node with the same `clusterSecret` but without `initCluster: true`
+must join as a learner instead of silently creating another voter cluster.
+
 Start three service nodes in separate terminals:
 
 ```powershell
@@ -28,6 +39,10 @@ The joiner starts as a learner. It discovers the cluster from the shared
 `clusterSecret`, derives its transport and join identities from
 `clusterSecret + machineIdentity`, catches up for reads, and must be promoted
 through committed membership before it can vote or satisfy durability.
+
+Recommended production topology is 3 voters. Two nodes can serve steady-state
+traffic, but leader loss fences the remaining node into read-only recovery
+instead of autonomous failover.
 
 Write through any node:
 

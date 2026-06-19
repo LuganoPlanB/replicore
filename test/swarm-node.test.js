@@ -1262,6 +1262,194 @@ test("same-secret unknown peers are surfaced as learner candidates without joini
   }
 })
 
+test("an init-cluster voter can admit, promote, and replicate with a secret-first learner", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "5656565656565656565656565656565656565656565656565656565656565656",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const initIdentity = generateIdentity(seed("init-cluster-voter"))
+    const learnerIdentity = generateIdentity(seed("init-cluster-learner"))
+
+    const initialVoter = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "init-cluster-join-flow",
+      clusterSecret,
+      machineId: "init-cluster-voter-machine",
+      identity: initIdentity,
+      authorizedNodes: [
+        {
+          nodeId: initIdentity.publicKeyId,
+          publicKey: initIdentity.publicKey,
+          feedKey: initIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await initialVoter.start()
+    nodes.push(initialVoter)
+
+    await waitFor(async () => initialVoter.currentLeader() === initIdentity.publicKeyId)
+    await initialVoter.put("hash:init-cluster-before", { value: "before-join" })
+
+    const learner = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "init-cluster-join-flow",
+      clusterSecret,
+      role: "learner",
+      machineId: "init-cluster-learner-machine",
+      identity: learnerIdentity,
+      authorizedNodes: [],
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await learner.start()
+    nodes.push(learner)
+
+    await waitFor(async () => {
+      const value = await learner.get("hash:init-cluster-before")
+      return value?.value?.value === "before-join"
+    })
+
+    const learnerStatus = await learner.getReplicationStatus()
+    assert.equal(learnerStatus.membership.localRole, "learner")
+    assert.deepEqual(learnerStatus.membership.voters.map((entry) => entry.nodeId), [initIdentity.publicKeyId])
+    assert.equal(initialVoter.getWritersStatus().authorizedNodes.some((entry) => entry.nodeId === learnerIdentity.publicKeyId), true)
+
+    const promotionWindow = nextCredentialWindow()
+    const credential = createPromotionCredential({
+      payload: {
+        v: 1,
+        type: "replicore.promotion",
+        clusterId: "init-cluster-join-flow",
+        membershipVersion: 0,
+        learnerNodeId: learnerIdentity.publicKeyId,
+        learnerNoisePublicKey: learner.transportIdentity.publicKeyHex,
+        targetRole: "voter",
+        issuedAt: promotionWindow.issuedAt,
+        expiresAt: promotionWindow.expiresAt,
+        nonce: "init-cluster-promotion",
+        signerNodeId: initIdentity.publicKeyId
+      },
+      signerSecretKey: initIdentity.secretKey
+    })
+
+    const accepted = await learner.submitPromotionCredential(credential)
+    assert.equal(accepted.eligible, true)
+    await initialVoter.commitPromotionCredential(credential)
+
+    await waitFor(async () => {
+      const status = await learner.getReplicationStatus()
+      return status.membership.localRole === "voter"
+    })
+    await waitFor(async () => {
+      const status = await initialVoter.getReplicationStatus()
+      return status.membership.voters.map((entry) => entry.nodeId).sort().join(",") ===
+        [initIdentity.publicKeyId, learnerIdentity.publicKeyId].sort().join(",")
+    })
+
+    await initialVoter.put("hash:init-cluster-after", { value: "after-promotion" })
+    await waitFor(async () => {
+      const value = await learner.get("hash:init-cluster-after")
+      return value?.value?.value === "after-promotion"
+    })
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
+test("two independently initialized clusters with the same secret do not auto-merge", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "6767676767676767676767676767676767676767676767676767676767676767",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const firstIdentity = generateIdentity(seed("same-secret-init-first"))
+    const secondIdentity = generateIdentity(seed("same-secret-init-second"))
+
+    const first = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "same-secret-double-init",
+      clusterSecret,
+      machineId: "same-secret-init-first-machine",
+      identity: firstIdentity,
+      authorizedNodes: [
+        {
+          nodeId: firstIdentity.publicKeyId,
+          publicKey: firstIdentity.publicKey,
+          feedKey: firstIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await first.start()
+    nodes.push(first)
+
+    const second = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "same-secret-double-init",
+      clusterSecret,
+      machineId: "same-secret-init-second-machine",
+      identity: secondIdentity,
+      authorizedNodes: [
+        {
+          nodeId: secondIdentity.publicKeyId,
+          publicKey: secondIdentity.publicKey,
+          feedKey: secondIdentity.feedKey
+        }
+      ],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    await second.start()
+    nodes.push(second)
+
+    await waitFor(async () => {
+      const firstStatus = await first.getReplicationStatus()
+      const secondStatus = await second.getReplicationStatus()
+      return (
+        first.currentLeader() === firstIdentity.publicKeyId &&
+        second.currentLeader() === secondIdentity.publicKeyId &&
+        firstStatus.network.learnerCandidates.includes(second.transportIdentity.publicKeyHex) &&
+        secondStatus.network.learnerCandidates.includes(first.transportIdentity.publicKeyHex)
+      )
+    })
+
+    await first.put("hash:double-init-first", { value: "first-only" })
+    await second.put("hash:double-init-second", { value: "second-only" })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+
+    assert.equal((await first.get("hash:double-init-second"))?.value?.value ?? null, null)
+    assert.equal((await second.get("hash:double-init-first"))?.value?.value ?? null, null)
+
+    const firstStatus = await first.getReplicationStatus()
+    const secondStatus = await second.getReplicationStatus()
+    assert.deepEqual(firstStatus.membership.voters.map((entry) => entry.nodeId), [firstIdentity.publicKeyId])
+    assert.deepEqual(secondStatus.membership.voters.map((entry) => entry.nodeId), [secondIdentity.publicKeyId])
+  } finally {
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    await testnet.destroy()
+  }
+})
+
 test("a learner can join through the leader control channel, catch up, and later become a live voter", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []

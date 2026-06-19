@@ -55,6 +55,17 @@ Start a local HyperDHT bootstrap node:
 npm run start:bootstrap
 ```
 
+For a fresh cluster, bootstrap one explicit initializer:
+
+```powershell
+npm run start:node -- examples/local/init-node.json
+npm run start:node -- examples/local/init-joiner.json
+```
+
+`initCluster: true` is the only supported secret-first voter bootstrap path.
+Another node with the same `clusterSecret` must join as a learner instead of
+implicitly creating a second voter cluster.
+
 Start three swarm nodes in separate terminals:
 
 ```powershell
@@ -64,9 +75,8 @@ npm run start:node -- examples/local/node-3.json
 ```
 
 Those three files are the current bootstrap-voter example. They still use
-`compatibilityMode: "legacy-static-membership"` for the initial voter set.
-That bootstrap path will be replaced by explicit `initCluster` semantics in the
-next slice.
+`compatibilityMode: "legacy-static-membership"` to show a pre-expanded local
+cluster. The explicit fresh-cluster bootstrap path is `examples/local/init-node.json`.
 
 Start a fourth node and let it join as a learner without editing the existing
 voter configs:
@@ -183,6 +193,7 @@ The node launcher expects:
 - `identitySeed`
 - optional `machineIdentity` (or legacy `machineId`)
 - either:
+  - `initCluster: true` for the first secret-first voter in a brand-new cluster
   - `compatibilityMode: "legacy-static-membership"` plus `authorizedNodeSeeds` or `authorizedNodes` for bootstrap voters
   - `role: "learner"` with no static membership fields for a secret-first joining node
 - either `encryptionKey` or `encryption`
@@ -197,8 +208,9 @@ launcher derives stable Replicore signing identities and feed keys from them.
 cluster-scoped transport `machineId`, Noise key, and join key.
 
 Legacy static membership remains supported for the initial voter set while the
-project moves toward explicit first-cluster bootstrap plus learner join and
-promotion. Joining nodes should prefer the secret-first learner config shown in
+project keeps a local-demo path for pre-expanded clusters. Fresh clusters should
+prefer the explicit `initCluster: true` bootstrap plus learner join and
+promotion. Joining nodes should use the secret-first learner config shown in
 `examples/local/joiner.json`.
 
 Simple encryption config:
@@ -232,6 +244,7 @@ If you already have static configs:
 - keep `compatibilityMode: "legacy-static-membership"` for the existing voter set
 - replace `topicSalt` with `clusterSecret` if needed
 - rename `machineId` to `machineIdentity` when convenient; the old field still loads
+- use `initCluster: true` only for a brand-new single-voter cluster
 - use a learner config like `examples/local/joiner.json` for new joining nodes instead of editing every existing node config by hand
 
 ## Project Layout

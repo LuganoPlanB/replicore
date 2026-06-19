@@ -65,10 +65,35 @@ test("loadRuntimeConfig supports a secret-first learner config", async () => {
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.compatibilityMode, "secret-first")
     assert.equal(config.role, "learner")
+    assert.equal(config.initCluster, false)
     assert.equal(config.machineId, "local-demo-node-4")
     assert.deepEqual(config.authorizedNodes, [])
     assert.deepEqual(config.revokedNodeIds, [])
     assert.equal(config.dataDir, path.join(dir, "data"))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig supports an explicit initCluster bootstrap voter", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-init-cluster-"))
+
+  try {
+    const configPath = path.join(dir, "init-node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    const config = await loadRuntimeConfig(configPath)
+    assert.equal(config.compatibilityMode, "secret-first")
+    assert.equal(config.role, "voter")
+    assert.equal(config.initCluster, true)
+    assert.equal(config.authorizedNodes.length, 1)
+    assert.equal(config.authorizedNodes[0].nodeId, config.identity.publicKeyId)
+    assert.equal(config.machineId, "local-demo-init-node")
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -117,14 +142,36 @@ test("loadRuntimeConfig requires an explicit legacy compatibility mode for stati
     await writeFile(configPath, JSON.stringify(raw, null, 2))
     await assert.rejects(
       loadRuntimeConfig(configPath),
-      /compatibilityMode must be set to "legacy-static-membership"/
+      /Static membership config requires compatibilityMode "legacy-static-membership"/
     )
 
     raw.compatibilityMode = "wrong-mode"
     await writeFile(configPath, JSON.stringify(raw, null, 2))
     await assert.rejects(
       loadRuntimeConfig(configPath),
-      /compatibilityMode must be set to "legacy-static-membership"/
+      /compatibilityMode must be "legacy-static-membership" when provided/
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig rejects a secret-first voter without initCluster", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-missing-init-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+    delete raw.initCluster
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /Secret-first voter config requires initCluster: true/
     )
   } finally {
     await rm(dir, { recursive: true, force: true })

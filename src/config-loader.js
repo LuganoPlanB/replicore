@@ -15,10 +15,11 @@ export async function loadRuntimeConfig(configPath) {
   const identitySeed = requireHex(raw.identitySeed ?? raw.nodeIdentitySeed, "identitySeed")
   const identity = generateIdentity(identitySeed)
   const role = normalizeRole(raw.role)
+  const initCluster = normalizeInitCluster(raw.initCluster)
   const compatibilityMode = normalizeCompatibilityMode(raw.compatibilityMode)
   const machineId = normalizeMachineIdentity(raw)
 
-  const authorizedNodes = normalizeAuthorizedNodes(raw, {
+  let authorizedNodes = normalizeAuthorizedNodes(raw, {
     required: compatibilityMode === "legacy-static-membership"
   })
   const localIncluded = authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)
@@ -26,6 +27,9 @@ export async function loadRuntimeConfig(configPath) {
   let revokedNodeIds = []
 
   if (compatibilityMode === "legacy-static-membership") {
+    if (initCluster) {
+      throw new Error('initCluster cannot be combined with compatibilityMode "legacy-static-membership"')
+    }
     if (role === "voter" && !localIncluded) {
       throw new Error("Authorized nodes do not include the local identity")
     }
@@ -38,18 +42,30 @@ export async function loadRuntimeConfig(configPath) {
     revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
   } else {
     normalizedCompatibilityMode = "secret-first"
-    if (role !== "learner") {
-      throw new Error(
-        'Secret-first file config currently requires role "learner"; initial voter bootstrap still uses compatibilityMode "legacy-static-membership" until initCluster lands'
-      )
-    }
     if (authorizedNodes.length > 0) {
       throw new Error(
-        'Secret-first learner config must omit authorizedNodeSeeds and authorizedNodes'
+        'Static membership config requires compatibilityMode "legacy-static-membership"'
       )
     }
     if (raw.revokedNodeIds !== undefined) {
-      throw new Error("Secret-first learner config must omit revokedNodeIds")
+      throw new Error(
+        'Secret-first config must omit revokedNodeIds until membership is committed in-cluster'
+      )
+    }
+    if (role === "learner") {
+      if (initCluster) {
+        throw new Error("initCluster may only be used with voter role")
+      }
+    } else if (initCluster) {
+      authorizedNodes = [{
+        nodeId: identity.publicKeyId,
+        publicKey: identity.publicKey,
+        feedKey: identity.feedKey
+      }]
+    } else {
+      throw new Error(
+        'Secret-first voter config requires initCluster: true; joining nodes must use role "learner"'
+      )
     }
   }
   if (revokedNodeIds.includes(identity.publicKeyId)) {
@@ -65,6 +81,7 @@ export async function loadRuntimeConfig(configPath) {
     clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
     compatibilityMode: normalizedCompatibilityMode,
     role,
+    initCluster,
     machineId,
     bootstrap: normalizeBootstrap(raw.bootstrap ?? []),
     heartbeatIntervalMs: raft.heartbeatIntervalMs,
@@ -97,6 +114,14 @@ function normalizeRole(value) {
   if (value === undefined) return "voter"
   if (value === "voter" || value === "learner") return value
   throw new Error("role must be either voter or learner")
+}
+
+function normalizeInitCluster(value) {
+  if (value === undefined) return false
+  if (typeof value !== "boolean") {
+    throw new Error("initCluster must be a boolean when provided")
+  }
+  return value
 }
 
 function normalizeCompatibilityMode(value) {
