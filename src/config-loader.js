@@ -12,28 +12,46 @@ export async function loadRuntimeConfig(configPath) {
   const absolutePath = path.resolve(configPath)
   const raw = JSON.parse(await readFile(absolutePath, "utf8"))
 
-  const identitySeed = requireHex(raw.identitySeed, "identitySeed")
+  const identitySeed = requireHex(raw.identitySeed ?? raw.nodeIdentitySeed, "identitySeed")
   const identity = generateIdentity(identitySeed)
   const role = normalizeRole(raw.role)
   const compatibilityMode = normalizeCompatibilityMode(raw.compatibilityMode)
+  const machineId = normalizeMachineIdentity(raw)
 
-  const authorizedNodes = normalizeAuthorizedNodes(raw)
-  if (compatibilityMode !== "legacy-static-membership") {
-    throw new Error(
-      'Static membership config requires compatibilityMode "legacy-static-membership"'
-    )
-  }
+  const authorizedNodes = normalizeAuthorizedNodes(raw, {
+    required: compatibilityMode === "legacy-static-membership"
+  })
   const localIncluded = authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)
-  if (role === "voter" && !localIncluded) {
-    throw new Error("Authorized nodes do not include the local identity")
+  let normalizedCompatibilityMode = compatibilityMode
+  let revokedNodeIds = []
+
+  if (compatibilityMode === "legacy-static-membership") {
+    if (role === "voter" && !localIncluded) {
+      throw new Error("Authorized nodes do not include the local identity")
+    }
+    if (role === "learner" && localIncluded) {
+      throw new Error("Learner config must not include the local identity in authorizedNodes")
+    }
+    if (role === "learner") {
+      throw new Error('compatibilityMode "legacy-static-membership" is incompatible with role "learner"')
+    }
+    revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
+  } else {
+    normalizedCompatibilityMode = "secret-first"
+    if (role !== "learner") {
+      throw new Error(
+        'Secret-first file config currently requires role "learner"; initial voter bootstrap still uses compatibilityMode "legacy-static-membership" until initCluster lands'
+      )
+    }
+    if (authorizedNodes.length > 0) {
+      throw new Error(
+        'Secret-first learner config must omit authorizedNodeSeeds and authorizedNodes'
+      )
+    }
+    if (raw.revokedNodeIds !== undefined) {
+      throw new Error("Secret-first learner config must omit revokedNodeIds")
+    }
   }
-  if (role === "learner" && localIncluded) {
-    throw new Error("Learner config must not include the local identity in authorizedNodes")
-  }
-  if (role === "learner") {
-    throw new Error('compatibilityMode "legacy-static-membership" is incompatible with role "learner"')
-  }
-  const revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
   if (revokedNodeIds.includes(identity.publicKeyId)) {
     throw new Error("Local identity is revoked in config")
   }
@@ -45,9 +63,9 @@ export async function loadRuntimeConfig(configPath) {
     dataDir: path.resolve(path.dirname(absolutePath), raw.dataDir),
     clusterId: requireString(raw.clusterId, "clusterId"),
     clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
-    compatibilityMode,
+    compatibilityMode: normalizedCompatibilityMode,
     role,
-    machineId: raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId"),
+    machineId,
     bootstrap: normalizeBootstrap(raw.bootstrap ?? []),
     heartbeatIntervalMs: raft.heartbeatIntervalMs,
     heartbeatTtlMs: raft.heartbeatTtlMs,
@@ -82,13 +100,28 @@ function normalizeRole(value) {
 }
 
 function normalizeCompatibilityMode(value) {
+  if (value === undefined) return null
   if (value === "legacy-static-membership") return value
   throw new Error(
-    'compatibilityMode must be set to "legacy-static-membership" for file-based static membership configs'
+    'compatibilityMode must be "legacy-static-membership" when provided'
   )
 }
 
-function normalizeAuthorizedNodes(raw) {
+function normalizeMachineIdentity(raw) {
+  const configMachineIdentity =
+    raw.machineIdentity === undefined ? undefined : requireString(raw.machineIdentity, "machineIdentity")
+  const legacyMachineId = raw.machineId === undefined ? undefined : requireString(raw.machineId, "machineId")
+
+  if (configMachineIdentity && legacyMachineId && configMachineIdentity !== legacyMachineId) {
+    throw new Error("machineIdentity and machineId must match when both are provided")
+  }
+
+  return configMachineIdentity ?? legacyMachineId
+}
+
+function normalizeAuthorizedNodes(raw, options = {}) {
+  const required = options.required ?? true
+
   if (Array.isArray(raw.authorizedNodeSeeds) && raw.authorizedNodeSeeds.length > 0) {
     return raw.authorizedNodeSeeds.map((seed, index) => {
       const identity = generateIdentity(requireHex(seed, `authorizedNodeSeeds[${index}]`))
@@ -108,6 +141,7 @@ function normalizeAuthorizedNodes(raw) {
     }))
   }
 
+  if (!required) return []
   throw new Error("Config must include authorizedNodeSeeds or authorizedNodes")
 }
 

@@ -63,6 +63,18 @@ npm run start:node -- examples/local/node-2.json
 npm run start:node -- examples/local/node-3.json
 ```
 
+Those three files are the current bootstrap-voter example. They still use
+`compatibilityMode: "legacy-static-membership"` for the initial voter set.
+That bootstrap path will be replaced by explicit `initCluster` semantics in the
+next slice.
+
+Start a fourth node and let it join as a learner without editing the existing
+voter configs:
+
+```powershell
+npm run start:node -- examples/local/joiner.json
+```
+
 Each node prints a `node-ready` JSON object with:
 
 - `nodeId`
@@ -70,6 +82,17 @@ Each node prints a `node-ready` JSON object with:
 - `dataDir`
 - HTTP bind address
 - currently observed leader
+
+`clusterSecret` is the shared discovery and admission root. Replicore derives:
+
+- the Holepunch topic from `clusterSecret + clusterId`
+- a cluster-scoped `machineId` from keyed Argon2d over `clusterSecret + machineIdentity`
+- the Noise transport key from `clusterSecret + machineId`
+- the join-signing key from `clusterSecret + machineId`
+
+Committed voter authority does not come from the secret alone. A joining node
+starts as a learner and only becomes a voter after committed membership
+promotion.
 
 ## CRUD
 
@@ -156,16 +179,27 @@ The node launcher expects:
 
 - `dataDir`
 - `clusterId`
-- `topicSalt`
+- `clusterSecret`
 - `identitySeed`
-- either `authorizedNodeSeeds` or `authorizedNodes`
+- optional `machineIdentity` (or legacy `machineId`)
+- either:
+  - `compatibilityMode: "legacy-static-membership"` plus `authorizedNodeSeeds` or `authorizedNodes` for bootstrap voters
+  - `role: "learner"` with no static membership fields for a secret-first joining node
 - either `encryptionKey` or `encryption`
 - optional `revokedNodeIds`
 - `bootstrap`
 - `http`
 - `auth`
 
-`identitySeed` and `authorizedNodeSeeds` are hex-encoded 32-byte seeds. The launcher derives stable node identities and feed keys from them.
+`identitySeed` and `authorizedNodeSeeds` are hex-encoded 32-byte seeds. The
+launcher derives stable Replicore signing identities and feed keys from them.
+`machineIdentity` is the local machine-specific input used to derive the
+cluster-scoped transport `machineId`, Noise key, and join key.
+
+Legacy static membership remains supported for the initial voter set while the
+project moves toward explicit first-cluster bootstrap plus learner join and
+promotion. Joining nodes should prefer the secret-first learner config shown in
+`examples/local/joiner.json`.
 
 Simple encryption config:
 
@@ -190,6 +224,15 @@ Keyring config with rotation support:
 ```
 
 Revoked writers remain part of the explicit cluster membership record, but nodes stop replicating from them and reject new operations signed by them after restart with updated config.
+
+## Migration
+
+If you already have static configs:
+
+- keep `compatibilityMode: "legacy-static-membership"` for the existing voter set
+- replace `topicSalt` with `clusterSecret` if needed
+- rename `machineId` to `machineIdentity` when convenient; the old field still loads
+- use a learner config like `examples/local/joiner.json` for new joining nodes instead of editing every existing node config by hand
 
 ## Project Layout
 

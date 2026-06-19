@@ -14,6 +14,21 @@ npm run start:node -- examples/local/node-2.json
 npm run start:node -- examples/local/node-3.json
 ```
 
+Those three files are the current bootstrap-voter example. They still use
+`compatibilityMode: "legacy-static-membership"` for the initial voter set.
+That is intentional until explicit `initCluster` bootstrap lands.
+
+Join a fourth node without editing the existing voter configs:
+
+```powershell
+npm run start:node -- examples/local/joiner.json
+```
+
+The joiner starts as a learner. It discovers the cluster from the shared
+`clusterSecret`, derives its transport and join identities from
+`clusterSecret + machineIdentity`, catches up for reads, and must be promoted
+through committed membership before it can vote or satisfy durability.
+
 Write through any node:
 
 ```powershell
@@ -43,6 +58,10 @@ Delete:
 curl -X DELETE "http://127.0.0.1:3002/kv/hash:abc?keyspace=default" `
   -H "authorization: Bearer writer"
 ```
+
+The public write surface is witness-first. Healthy witness nodes accept CRUD
+and forward to the current leader. Direct leader writes may be refused with
+structured hints that point clients back to witness entrypoints.
 
 Status:
 

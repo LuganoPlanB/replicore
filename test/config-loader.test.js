@@ -50,6 +50,30 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
   }
 })
 
+test("loadRuntimeConfig supports a secret-first learner config", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-secret-first-"))
+
+  try {
+    const configPath = path.join(dir, "joiner.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/joiner.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    const config = await loadRuntimeConfig(configPath)
+    assert.equal(config.compatibilityMode, "secret-first")
+    assert.equal(config.role, "learner")
+    assert.equal(config.machineId, "local-demo-node-4")
+    assert.deepEqual(config.authorizedNodes, [])
+    assert.deepEqual(config.revokedNodeIds, [])
+    assert.equal(config.dataDir, path.join(dir, "data"))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("loadRuntimeConfig requires a 32-byte clusterSecret", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-secret-"))
 
@@ -147,12 +171,33 @@ test("loadRuntimeConfig accepts an explicit machine identity source override", a
       await readFile(path.resolve("examples/local/node-1.json"), "utf8")
     )
     raw.dataDir = "./data"
-    raw.machineId = "override-machine"
+    raw.machineIdentity = "override-machine"
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.machineId, "override-machine")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("loadRuntimeConfig accepts the legacy machineId alias", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-machine-id-alias-"))
+
+  try {
+    const configPath = path.join(dir, "node.json")
+    const raw = JSON.parse(
+      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+    )
+    raw.dataDir = "./data"
+    delete raw.machineIdentity
+    raw.machineId = "legacy-machine-id"
+
+    await writeFile(configPath, JSON.stringify(raw, null, 2))
+
+    const config = await loadRuntimeConfig(configPath)
+    assert.equal(config.machineId, "legacy-machine-id")
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
