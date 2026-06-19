@@ -18,6 +18,8 @@ import {
 } from "../src/index.js"
 import { waitFor } from "./helpers/eventual.js"
 import {
+  deleteValue,
+  expectDeleted,
   expectCommittedOperation,
   expectCommittedValue,
   expectHistoryOps,
@@ -1105,6 +1107,31 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
         return false
       }
     })
+
+    await waitFor(async () => {
+      const values = await Promise.all(nodes.map((node) => node.get("hash:http")))
+      return values.every((value) => value?.value?.through === "http")
+    })
+
+    expectCommittedValue(await getValue(leaderBaseUrl, "hash:http"), { through: "http" })
+
+    const deleteOperation = expectCommittedOperation(
+      await deleteValue(baseUrl, "hash:http"),
+      { type: "delete", key: "hash:http", keyspace: "default" }
+    )
+
+    await waitFor(async () => {
+      const values = await Promise.all(nodes.map((node) => node.get("hash:http")))
+      return values.every((value) => value?.deleted === true)
+    })
+
+    expectDeleted(await getValue(baseUrl, "hash:http"))
+    expectDeleted(await getValue(leaderBaseUrl, "hash:http"))
+
+    expectHistoryOps(await getHistory(baseUrl, "hash:http"), [
+      { type: "put", opId: operation.opId },
+      { type: "delete", opId: deleteOperation.opId }
+    ])
 
     const replicationResponse = await requestJson(`${baseUrl}/status/replication`)
     assert.equal(replicationResponse.status, 200)
