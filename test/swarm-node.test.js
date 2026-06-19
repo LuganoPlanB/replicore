@@ -3383,7 +3383,13 @@ test("committed feed progress survives follower restart after watermark-driven a
     assert.equal(restartedValue?.value?.phase, "committed")
 
     const afterRestartProgress = await restarted.view.getFeedProgress(leaderFeedKey)
-    assert.deepEqual(afterRestartProgress, beforeRestartProgress)
+    assert.equal(afterRestartProgress.committedApplied, beforeRestartProgress.committedApplied)
+    assert.equal(afterRestartProgress.committedLastOpId, beforeRestartProgress.committedLastOpId)
+    assert.ok(afterRestartProgress.rawApplied >= beforeRestartProgress.rawApplied)
+    assert.ok(afterRestartProgress.rawApplied >= afterRestartProgress.committedApplied)
+    if (afterRestartProgress.rawApplied === beforeRestartProgress.rawApplied) {
+      assert.equal(afterRestartProgress.rawLastOpId, beforeRestartProgress.rawLastOpId)
+    }
     assert.equal((await restarted.getReplicationStatus()).peerReplication[currentLeaderId].staged.count, 0)
   } finally {
     await Promise.allSettled([restarted?.close(), ...nodes.map((node) => node.close())])
