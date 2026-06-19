@@ -1317,6 +1317,209 @@ test("acknowledged HTTP CRUD survives leader restart with one committed history 
   }
 })
 
+test("learner HTTP CRUD stays read-only while serving caught-up reads", { concurrency: false }, async () => {
+  const leaderIdentity = generateIdentity(seed("http-learner-leader"))
+  const followerIdentity = generateIdentity(seed("http-learner-follower"))
+  const learnerIdentity = generateIdentity(seed("http-learner-node"))
+  const identities = [leaderIdentity, followerIdentity, learnerIdentity]
+  const authorizedNodes = identities.map((identity) => ({
+    nodeId: identity.publicKeyId,
+    publicKey: identity.publicKey,
+    feedKey: identity.feedKey
+  }))
+  const cluster = await createSwarmCluster({
+    identities,
+    authorizedNodes,
+    membership: {
+      version: 1,
+      voters: [leaderIdentity.publicKeyId, followerIdentity.publicKeyId].sort(),
+      learners: [learnerIdentity.publicKeyId],
+      removed: []
+    },
+    heartbeatIntervalMs: 100,
+    heartbeatTtlMs: 800
+  })
+  const servers = []
+
+  try {
+    await cluster.startAll()
+    const leaderId = await waitForClusterLeaderId(cluster)
+    const leaderNode = cluster.record(leaderId).node
+    const learnerNode = cluster.record(learnerIdentity.publicKeyId).node
+
+    await leaderNode.put("hash:http-learner-visible", { phase: "before-http" })
+    await waitFor(async () => (await learnerNode.get("hash:http-learner-visible"))?.value?.phase === "before-http")
+
+    const server = new HolepunchHttpServer({
+      node: learnerNode,
+      auth: {
+        tokens: {
+          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        }
+      }
+    })
+    await server.start()
+    servers.push(server)
+
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    expectCommittedValue(await getValue(baseUrl, "hash:http-learner-visible"), { phase: "before-http" })
+
+    const learnerPut = expectWriteRefusal(
+      await putValue(baseUrl, "hash:http-learner-blocked", { phase: "blocked" }),
+      { status: 403, code: "read-only-learner" }
+    )
+    assert.equal(learnerPut.retryable, false)
+
+    const learnerDelete = expectWriteRefusal(
+      await deleteValue(baseUrl, "hash:http-learner-visible"),
+      { status: 403, code: "read-only-learner" }
+    )
+    assert.equal(learnerDelete.retryable, false)
+
+    await leaderNode.put("hash:http-learner-after", { phase: "after-http" })
+    await waitFor(async () => (await learnerNode.get("hash:http-learner-after"))?.value?.phase === "after-http")
+    expectCommittedValue(await getValue(baseUrl, "hash:http-learner-after"), { phase: "after-http" })
+
+    const learnerStatus = await requestJson(`${baseUrl}/status/replication`)
+    assert.equal(learnerStatus.status, 200)
+    assert.equal(learnerStatus.payload.role, "learner")
+    assert.equal(learnerStatus.payload.membership.localRole, "learner")
+    assert.equal(await learnerNode.get("hash:http-learner-blocked"), null)
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
+    await cluster.closeAll()
+  }
+})
+
+test("wrong-secret nodes do not discover or mirror cluster CRUD state", { concurrency: false }, async () => {
+  const testnet = await createTestnet(3)
+  const dirs = []
+  const nodes = []
+  const servers = []
+
+  try {
+    const clusterSecret = Buffer.from(
+      "abababababababababababababababababababababababababababababababab",
+      "hex"
+    )
+    const wrongSecret = Buffer.from(
+      "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "hex"
+    )
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("http-wrong-secret-leader"))
+    const followerIdentity = generateIdentity(seed("http-wrong-secret-follower"))
+    const wrongIdentity = generateIdentity(seed("http-wrong-secret-node"))
+
+    const voters = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "http-wrong-secret-cluster",
+      clusterSecret,
+      machineId: "http-wrong-secret-leader-machine",
+      identity: leaderIdentity,
+      authorizedNodes: voters,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "http-wrong-secret-cluster",
+      clusterSecret,
+      machineId: "http-wrong-secret-follower-machine",
+      identity: followerIdentity,
+      authorizedNodes: voters,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const wrongSecretNode = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "http-wrong-secret-cluster",
+      clusterSecret: wrongSecret,
+      machineId: "http-wrong-secret-other-machine",
+      identity: wrongIdentity,
+      authorizedNodes: [{
+        nodeId: wrongIdentity.publicKeyId,
+        publicKey: wrongIdentity.publicKey,
+        feedKey: wrongIdentity.feedKey
+      }],
+      durability: { requiredFollowerAcks: 0 },
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower, wrongSecretNode)
+    await leader.start()
+    await follower.start()
+    await wrongSecretNode.start()
+
+    await waitFor(async () => {
+      const firstLeader = leader.currentLeader()
+      return firstLeader !== null && firstLeader === follower.currentLeader()
+    })
+    const leaderNode = leader.currentLeader() === leaderIdentity.publicKeyId ? leader : follower
+    const witnessNode = leaderNode === leader ? follower : leader
+
+    for (const node of [witnessNode, wrongSecretNode]) {
+      const server = new HolepunchHttpServer({
+        node,
+        auth: {
+          tokens: {
+            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          }
+        }
+      })
+      await server.start()
+      servers.push(server)
+    }
+
+    const clusterServer = servers.find(
+      (server) => server.options.node.options.identity.publicKeyId === witnessNode.options.identity.publicKeyId
+    )
+    const wrongServer = servers.find(
+      (server) => server.options.node.options.identity.publicKeyId === wrongSecretNode.options.identity.publicKeyId
+    )
+    const clusterBaseUrl = `http://${clusterServer.address.address}:${clusterServer.address.port}`
+    const wrongBaseUrl = `http://${wrongServer.address.address}:${wrongServer.address.port}`
+
+    const clusterOperation = expectCommittedOperation(
+      await putValue(clusterBaseUrl, "hash:http-wrong-secret", { side: "cluster" }),
+      { type: "put", key: "hash:http-wrong-secret", keyspace: "default" }
+    )
+    assert.ok(clusterOperation.opId)
+
+    await waitFor(async () => (await witnessNode.get("hash:http-wrong-secret"))?.value?.side === "cluster")
+    expectCommittedValue(await getValue(clusterBaseUrl, "hash:http-wrong-secret"), { side: "cluster" })
+    expectAbsent(await getValue(wrongBaseUrl, "hash:http-wrong-secret"))
+
+    const wrongWrite = expectWriteRefusal(
+      await putValue(wrongBaseUrl, "hash:http-wrong-secret", { side: "wrong-secret" }),
+      { status: 503, code: /not-witness-entrypoint|leader-unreachable/ }
+    )
+    assert.equal(typeof wrongWrite.error, "string")
+
+    expectCommittedValue(await getValue(clusterBaseUrl, "hash:http-wrong-secret"), { side: "cluster" })
+    expectAbsent(await getValue(wrongBaseUrl, "hash:http-wrong-secret"))
+
+    const wrongStatus = await wrongSecretNode.getReplicationStatus()
+    assert.equal(wrongStatus.connections, 0)
+    assert.deepEqual(wrongStatus.network.learnerCandidates, [])
+    assert.deepEqual(wrongStatus.membership.voters.map((entry) => entry.nodeId), [wrongIdentity.publicKeyId])
+  } finally {
+    await Promise.allSettled(servers.map((server) => server.close()))
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 test("same-secret unknown peers are surfaced as learner candidates without joining membership", { concurrency: false }, async () => {
   const testnet = await createTestnet(3)
   const dirs = []
