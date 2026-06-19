@@ -26,6 +26,7 @@ export class HolepunchHttpServer {
       ...options
     }
     this.server = null
+    this.sockets = new Set()
   }
 
   async start() {
@@ -33,6 +34,10 @@ export class HolepunchHttpServer {
 
     this.server = http.createServer((req, res) => {
       void this.#handle(req, res)
+    })
+    this.server.on("connection", (socket) => {
+      this.sockets.add(socket)
+      socket.once("close", () => this.sockets.delete(socket))
     })
 
     await new Promise((resolve) => {
@@ -43,10 +48,15 @@ export class HolepunchHttpServer {
 
   async close() {
     if (!this.server) return
+    const server = this.server
+    server.closeIdleConnections?.()
     await new Promise((resolve, reject) => {
-      this.server.close((error) => (error ? reject(error) : resolve()))
+      server.close((error) => (error ? reject(error) : resolve()))
+      server.closeAllConnections?.()
+      for (const socket of this.sockets) socket.destroy()
     })
     this.server = null
+    this.sockets.clear()
     await this.options.node.setHttpAddress(null)
   }
 
@@ -212,7 +222,8 @@ export class HolepunchHttpServer {
     const body = JSON.stringify(payload)
     res.writeHead(statusCode, {
       "content-type": "application/json; charset=utf-8",
-      "content-length": Buffer.byteLength(body)
+      "content-length": Buffer.byteLength(body),
+      "connection": "close"
     })
     res.end(body)
   }
