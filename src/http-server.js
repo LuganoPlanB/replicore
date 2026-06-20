@@ -286,7 +286,17 @@ export class HolepunchHttpServer {
       chunks.push(chunk)
     }
     if (chunks.length === 0) return {}
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        const publicError = new Error("Invalid JSON body")
+        publicError.code = "INVALID_JSON"
+        publicError.statusCode = 400
+        throw publicError
+      }
+      throw error
+    }
   }
 
   #errorPayload(error) {

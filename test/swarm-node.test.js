@@ -3657,6 +3657,98 @@ test("HTTP body size limit enforces maximum request body size through Content-Le
   }
 })
 
+test("HTTP malformed JSON returns 400 without calling node handlers and later valid requests still work", { concurrency: false }, async () => {
+  const calls = {
+    qualifyClientWriteEntrypoint: 0,
+    put: 0,
+    rotateEncryptionKey: 0
+  }
+  const node = {
+    async setHttpAddress() {},
+    async qualifyClientWriteEntrypoint() {
+      calls.qualifyClientWriteEntrypoint += 1
+    },
+    async put() {
+      calls.put += 1
+      return {
+        opId: "stub-op-1",
+        actor: "stub-node",
+        type: "put",
+        key: "key-valid",
+        keyspace: "default"
+      }
+    },
+    rotateEncryptionKey() {
+      calls.rotateEncryptionKey += 1
+      return { keyId: "rotated" }
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    auth: {
+      tokens: {
+        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+        admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] }
+      }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const malformedWrite = await fetch(`${baseUrl}/kv/key-malformed?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: "{\"value\":"
+    })
+    assert.equal(malformedWrite.status, 400)
+    const malformedWritePayload = await malformedWrite.json()
+    assert.equal(malformedWritePayload.code, "INVALID_JSON")
+    assert.equal(malformedWritePayload.error, "Invalid JSON body")
+    assert.equal(calls.qualifyClientWriteEntrypoint, 1)
+    assert.equal(calls.put, 0)
+    assert.ok(!JSON.stringify(malformedWritePayload).includes("SyntaxError"))
+
+    const malformedAdmin = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: "{\"keyId\":"
+    })
+    assert.equal(malformedAdmin.status, 400)
+    const malformedAdminPayload = await malformedAdmin.json()
+    assert.equal(malformedAdminPayload.code, "INVALID_JSON")
+    assert.equal(malformedAdminPayload.error, "Invalid JSON body")
+    assert.equal(calls.rotateEncryptionKey, 0)
+    assert.ok(!JSON.stringify(malformedAdminPayload).includes("SyntaxError"))
+
+    const validWrite = await putValue(baseUrl, "key-valid", { ok: true })
+    expectCommittedOperation(validWrite)
+    assert.equal(calls.put, 1)
+
+    const validRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "next-key" })
+    })
+    assert.equal(validRotate.status, 200)
+    const validRotatePayload = await validRotate.json()
+    assert.deepEqual(validRotatePayload, { ok: true, keyId: "rotated" })
+    assert.equal(calls.rotateEncryptionKey, 1)
+  } finally {
+    await server.close()
+  }
+})
+
 test("HTTP error payload suppresses internal cluster state in refusal responses", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
