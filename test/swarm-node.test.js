@@ -3732,6 +3732,81 @@ test("HTTP error payload suppresses internal cluster state in refusal responses"
   }
 })
 
+test("HTTP rate limiting returns 429 after exceeding per-token write budget", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+  let server = null
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("http-rate-limit-leader"))
+    const followerIdentity = generateIdentity(seed("http-rate-limit-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-rate-limit",
+      topicSalt: "test-rate-limit",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-rate-limit",
+      topicSalt: "test-rate-limit",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower)
+    await leader.start()
+    await follower.start()
+
+    const leaderId = [leaderIdentity, followerIdentity].sort((a, b) =>
+      a.publicKeyId.localeCompare(b.publicKeyId)
+    )[0].publicKeyId
+    await waitFor(
+      async () => nodes.every((node) => node.currentLeader() === leaderId),
+      { description: "leader convergence for rate limit test" }
+    )
+
+    const witness = nodes.find((node) => node.options.identity.publicKeyId !== leaderId)
+    server = new HolepunchHttpServer({
+      node: witness,
+      auth: {
+        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+      },
+      rateLimit: {
+        writes: { max: 2, windowMs: 60_000 },
+        reads: { max: 600, windowMs: 60_000 }
+      }
+    })
+    await server.start()
+    await waitForWritableWitness(witness)
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    await putValue(baseUrl, "key-1", { n: 1 })
+    await putValue(baseUrl, "key-2", { n: 2 })
+    const thirdResult = await putValue(baseUrl, "key-3", { n: 3 })
+    assert.equal(thirdResult.status, 429)
+    assert.equal(thirdResult.payload.code, "TOO_MANY_REQUESTS")
+  } finally {
+    await server?.close()
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
