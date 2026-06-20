@@ -23,6 +23,7 @@ export class HolepunchHttpServer {
       host: "127.0.0.1",
       port: 0,
       auth: { tokens: {} },
+      maxBodySize: 64 * 1024,
       ...options
     }
     this.server = null
@@ -126,7 +127,7 @@ export class HolepunchHttpServer {
 
       if (req.method === "POST" && url.pathname === "/admin/snapshot/import") {
         this.#authorizeAdmin(req)
-        const body = await this.#readJson(req)
+        const body = await this.#readJson(req, 1024 * 1024)
         await this.options.node.restoreSnapshot(body)
         return this.#json(res, 200, { ok: true })
       }
@@ -188,9 +189,27 @@ export class HolepunchHttpServer {
     return token ? this.options.auth.tokens[token] ?? null : null
   }
 
-  async #readJson(req) {
+  async #readJson(req, maxSize = this.options.maxBodySize) {
+    const contentLength = Number.parseInt(req.headers["content-length"], 10)
+    if (Number.isFinite(contentLength) && contentLength > maxSize) {
+      const error = new Error("Request body too large")
+      error.code = "PAYLOAD_TOO_LARGE"
+      error.statusCode = 413
+      throw error
+    }
+
+    let totalSize = 0
     const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
+    for await (const chunk of req) {
+      totalSize += chunk.length
+      if (totalSize > maxSize) {
+        const error = new Error("Request body too large")
+        error.code = "PAYLOAD_TOO_LARGE"
+        error.statusCode = 413
+        throw error
+      }
+      chunks.push(chunk)
+    }
     if (chunks.length === 0) return {}
     return JSON.parse(Buffer.concat(chunks).toString("utf8"))
   }
