@@ -236,6 +236,13 @@ export class NodeRpcRouter {
    */
   #sendRequest(extension, peer, message, options) {
     const requestId = `${this.options.localNodeId}-${++this.requestId}`
+    if (!extension || typeof extension.send !== "function") {
+      const error = new Error(`${options.timeoutMessage(requestId)}: RPC extension unavailable`)
+      error.code = "RPC_EXTENSION_UNAVAILABLE"
+      error.retryable = true
+      return Promise.reject(error)
+    }
+
     const response = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.inflightRequests.delete(requestId)
@@ -245,7 +252,7 @@ export class NodeRpcRouter {
     })
     response.catch(() => {})
 
-    extension?.send(
+    extension.send(
       {
         ...message,
         requestId
