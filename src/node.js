@@ -22,6 +22,7 @@ import {
 } from "./operation.js"
 import { MaterializedView } from "./materialized-view.js"
 import { NodeRpcRouter } from "./node-rpc.js"
+import { PeerHintManager } from "./peer-hints.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { validatePromotionCredential } from "./promotion-credential.js"
 import { ConsensusEngine, majoritySize } from "./raft-engine.js"
@@ -31,7 +32,6 @@ import { deriveTopic } from "./config.js"
 import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
 
 const JOIN_REQUEST_MAX_SKEW_MS = 5 * 60 * 1000
-const PEER_HINT_TTL_MS = 15 * 60 * 1000
 
 /**
  * Minimal multi-node swarm whose committed cluster history is represented by
@@ -111,7 +111,6 @@ export class HolepunchSwarmNode {
     this.authoritativeLogIdentity = null
     this.authoritativeLogCore = null
     this.feedCores = new Map()
-    this.peerHints = new Map()
     this.localHttpAddress = null
     this.heartbeatTimer = null
     this.heartbeatPromise = null
@@ -165,7 +164,7 @@ export class HolepunchSwarmNode {
       joinState: () => this.joinState,
       role: () => this.#role(),
       isLeaderReachable: (nodeId) => this.#isLeaderReachable(nodeId),
-      getPeerHint: (nodeId) => this.#peerHint(nodeId),
+      getPeerHint: (nodeId) => this._peerHints?.get(nodeId) ?? null,
       getEffectiveVoterNodeIds: () => this.#effectiveVoterNodeIds(),
       network: () => this.network,
       currentLeader: () => this.currentLeader(),
@@ -194,6 +193,10 @@ export class HolepunchSwarmNode {
     const consensusCore = this.store.get({ name: "consensus-state" })
     this.consensusBee = new Hyperbee(consensusCore, { keyEncoding: "utf-8", valueEncoding: "json" })
     await this.consensusBee.ready()
+    this._peerHints = new PeerHintManager({
+      consensusBee: this.consensusBee,
+      localNodeId: this.options.identity.publicKeyId
+    })
     this.consensusStateStore = new ConsensusStateStore(this.consensusBee)
     this.consensusState = await this.consensusStateStore.load()
     await this.#loadPeerHints()
@@ -2257,16 +2260,7 @@ export class HolepunchSwarmNode {
   }
 
   async #loadPeerHints() {
-    const now = Date.now()
-    for await (const entry of this.consensusBee.createReadStream({
-      gt: "peer-hints/",
-      lt: "peer-hints/~"
-    })) {
-      const hint = entry.value
-      if (!hint?.nodeId) continue
-      if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= now) continue
-      this.peerHints.set(hint.nodeId, hint)
-    }
+    await this._peerHints.load()
   }
 
   #refreshDirectPeerConnections() {
@@ -2317,7 +2311,7 @@ export class HolepunchSwarmNode {
       }
     }
 
-    const cachedHints = [...this.peerHints.values()]
+    const cachedHints = [...this._peerHints.hints.values()]
       .filter((hint) => hint?.peerPublicKey && hint.role !== "removed")
       .sort((left, right) => {
         const leftRank = left.nodeId === leaderNodeId ? 0 : (left.role === "voter" ? 1 : 2)
@@ -2364,13 +2358,7 @@ export class HolepunchSwarmNode {
   }
 
   #peerHint(nodeId) {
-    const hint = this.peerHints.get(nodeId) ?? null
-    if (!hint) return null
-    if (Number.isInteger(hint.expiresAt) && hint.expiresAt <= Date.now()) {
-      this.peerHints.delete(nodeId)
-      return null
-    }
-    return hint
+    return this._peerHints.get(nodeId)
   }
 
   /**
@@ -2383,54 +2371,16 @@ export class HolepunchSwarmNode {
    * @param {string} machineId
    */
   #peerHintByMachineId(machineId) {
-    if (typeof machineId !== "string" || machineId.length === 0) return null
-    for (const hint of this.peerHints.values()) {
-      const current = this.#peerHint(hint.nodeId)
-      if (current?.machineId === machineId) return current
-    }
-    return null
+    return this._peerHints.getByMachineId(machineId)
   }
 
   async #recordPeerHint(nodeId, patch) {
-    const existing = this.#peerHint(nodeId)
-    const now = Date.now()
-    const nextHttpAddress = patch.httpAddress === undefined ? (existing?.httpAddress ?? null) : patch.httpAddress
-    const nextPeerPublicKey = patch.peerPublicKey ?? existing?.peerPublicKey ?? null
-    const nextMachineId = patch.machineId ?? existing?.machineId ?? null
-    const nextRole = patch.role ?? existing?.role ?? null
-    if (
-      existing &&
-      existing.peerPublicKey === nextPeerPublicKey &&
-      existing.machineId === nextMachineId &&
-      JSON.stringify(existing.httpAddress) === JSON.stringify(nextHttpAddress) &&
-      existing.role === nextRole &&
-      Number.isInteger(existing.expiresAt) &&
-      existing.expiresAt > now + Math.floor(PEER_HINT_TTL_MS / 2)
-    ) {
-      return
-    }
-    const next = {
-      nodeId,
-      peerPublicKey: nextPeerPublicKey,
-      machineId: nextMachineId,
-      httpAddress: nextHttpAddress,
-      role: nextRole,
-      seenAt: new Date().toISOString(),
-      lastSuccessfulAt: new Date(now).toISOString(),
-      expiresAt: now + PEER_HINT_TTL_MS
-    }
-    this.peerHints.set(nodeId, next)
-    await this.consensusBee.put(`peer-hints/${nodeId}`, next)
+    await this._peerHints.record(nodeId, patch)
     this.#refreshDirectPeerConnections()
   }
 
   #normalizeHttpAddress(address) {
-    if (!address || typeof address !== "object") return null
-    if (typeof address.address !== "string" || !Number.isInteger(address.port)) return null
-    return {
-      host: address.address,
-      port: address.port
-    }
+    return this._peerHints.normalizeHttpAddress(address)
   }
 
   async #promotionStatus() {
@@ -2979,7 +2929,7 @@ export class HolepunchSwarmNode {
   }
 
   #peerCacheSummary() {
-    const hints = [...this.peerHints.keys()]
+    const hints = [...this._peerHints.hints.keys()]
       .map((nodeId) => this.#peerHint(nodeId))
       .filter(Boolean)
 
