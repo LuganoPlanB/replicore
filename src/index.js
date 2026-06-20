@@ -21,6 +21,7 @@ export {
 } from "./crypto.js"
 export { MaterializedView } from "./materialized-view.js"
 export { HolepunchHttpServer } from "./http-server.js"
+export { SetupHttpServer } from "./setup-http-server.js"
 export {
   createSignedOperation,
   decryptOperationValue,
