@@ -873,6 +873,19 @@ test("leader writes require a voter majority, not just one follower acknowledgem
     await followers[0].close()
     await followers[1].close()
 
+    await waitFor(async () => {
+      const status = await leaderNode.getReplicationStatus()
+      const offline = [followers[0], followers[1]].every((node) => {
+        const peer = status.peerReplication[node.options.identity.publicKeyId]
+        return peer?.alive === false
+      })
+      const online = [followers[2], followers[3]].every((node) => {
+        const peer = status.peerReplication[node.options.identity.publicKeyId]
+        return peer?.alive === true && peer?.connectedPeers > 0
+      })
+      return offline && online
+    })
+
     const majorityWrite = await leaderNode.put("hash:majority-write", { phase: "majority" })
     assert.equal((await leaderNode.getConsensusState()).commitIndex, majorityWrite.seq)
 
