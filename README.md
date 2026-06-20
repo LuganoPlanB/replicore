@@ -53,6 +53,20 @@ Replicore is intended for non-Byzantine production use only within the boundarie
 - Node.js 24.6 or newer
 - npm
 
+## Releases
+
+Releases are managed by GitHub Actions with Release Please.
+
+Commits on `main` are interpreted with Conventional Commits:
+
+- `fix: ...` creates a patch release.
+- `feat: ...` creates a minor release.
+- `feat!: ...`, `fix!: ...`, or a `BREAKING CHANGE:` footer creates a major release.
+
+When releasable commits are present, the release workflow opens or updates a
+release PR that bumps `package.json`, updates `package-lock.json`, and writes
+`CHANGELOG.md`. Merging that PR creates the `vX.Y.Z` tag and GitHub release.
+
 ## Install
 
 ```powershell
