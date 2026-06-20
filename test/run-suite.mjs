@@ -225,8 +225,14 @@ function validateShards(shards, discoveredTestsByFile) {
   const shardCoverageByFile = new Map()
 
   for (const shard of shards) {
-    if (!shard.file || !shard.patterns?.length) continue
     const discoveredTitles = discoveredTestsByFile.get(shard.file) ?? []
+    if (!shard.file) continue
+
+    if (!shard.patterns?.length) {
+      selectedTitlesByShard.set(shard.label, discoveredTitles)
+      continue
+    }
+
     const matcher = new RegExp(buildExactPattern(shard.patterns))
     const selectedTitles = discoveredTitles.filter((title) => matcher.test(title))
 
@@ -374,11 +380,10 @@ function escapeJsonString(value) {
 function printShardSummary(shards, selectedTitlesByShard) {
   for (const shard of shards) {
     const selectedTitles = selectedTitlesByShard.get(shard.label)
-    const selectionCount = selectedTitles?.length ?? 0
     const summary = [
       `[suite] ${shard.label}:`,
       shard.file ?? shard.args[0],
-      `selected=${selectionCount}`,
+      `selected=${describeSelection(shard, selectedTitles)}`,
       `timeout=${timeoutMs}ms`
     ]
     process.stdout.write(`${summary.join(" ")}\n`)
@@ -389,6 +394,12 @@ function printShardSummary(shards, selectedTitlesByShard) {
       process.stdout.write(`[suite] excluded: ${file} :: ${title} :: ${reason}\n`)
     }
   }
+}
+
+function describeSelection(shard, selectedTitles) {
+  if (!shard.file) return "script"
+  if (!shard.patterns?.length) return `all(${selectedTitles?.length ?? 0})`
+  return String(selectedTitles?.length ?? 0)
 }
 
 async function runStep(shard, args, selectedTitles) {
