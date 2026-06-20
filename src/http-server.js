@@ -190,6 +190,17 @@ export class HolepunchHttpServer {
   }
 
   async #readJson(req, maxSize = this.options.maxBodySize) {
+    const contentType = req.headers["content-type"] ?? ""
+    if (!contentType.startsWith("application/json")) {
+      if (Number.parseInt(req.headers["content-length"] ?? "0", 10) === 0 && !contentType) {
+        return {}
+      }
+      const error = new Error("Unsupported Media Type")
+      error.code = "UNSUPPORTED_MEDIA_TYPE"
+      error.statusCode = 415
+      throw error
+    }
+
     const contentLength = Number.parseInt(req.headers["content-length"], 10)
     if (Number.isFinite(contentLength) && contentLength > maxSize) {
       const error = new Error("Request body too large")
