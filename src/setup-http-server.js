@@ -19,6 +19,7 @@ export class SetupHttpServer {
    *   state?: () => Promise<unknown> | unknown,
    *   deriveMachineId?: typeof deriveMachineId,
    *   listNetworkInterfaces?: typeof listNetworkInterfaces,
+   *   logger?: Pick<Console, "error">,
    *   uiRoot?: string | null,
    *   loadDraft?: () => Promise<unknown>,
    *   saveDraft?: (draft: unknown) => Promise<unknown>
@@ -31,6 +32,7 @@ export class SetupHttpServer {
       state: () => ({ mode: "setup" }),
       deriveMachineId,
       listNetworkInterfaces,
+      logger: console,
       uiRoot: null,
       loadDraft: null,
       saveDraft: null,
@@ -129,7 +131,15 @@ export class SetupHttpServer {
 
       return this.#sendJson(res, 404, { error: "Not found" })
     } catch (error) {
-      return this.#sendError(res, error?.statusCode ?? 500, {
+      const status = error?.statusCode ?? 500
+      if (status >= 500) {
+        this.options.logger?.error?.("setup http internal error", { status, error })
+        return this.#sendError(res, status, {
+          error: "Internal server error",
+          code: "INTERNAL_ERROR"
+        })
+      }
+      return this.#sendError(res, status, {
         error: error instanceof Error ? error.message : String(error)
       })
     }
