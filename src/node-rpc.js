@@ -1,3 +1,5 @@
+// Keep the legacy wire name for compatibility with existing peers and
+// persisted deployments. This constant is intentionally not renamed here.
 const RPC_EXTENSION = "planb-cleard-rpc-v1"
 
 /**
