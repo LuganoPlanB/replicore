@@ -24,6 +24,11 @@ const shards = [
     args: ["--test", "--test-concurrency=1"]
   },
   {
+    label: "http-rate-limit",
+    file: "test/http-rate-limit.test.js",
+    args: ["--test", "--test-concurrency=1"]
+  },
+  {
     label: "swarm-node-a",
     file: "test/swarm-node.test.js",
     args: ["--test", "--test-concurrency=1"],
@@ -99,7 +104,7 @@ const shards = [
       "HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD calls",
       "HTTP admin routes validate bodies before node admin calls",
       "HTTP error payload suppresses internal cluster state in refusal responses",
-      "HTTP rate limiting returns 429 after exceeding per-token write budget"
+      "HTTP rate limiting returns 429 after exceeding per-IP write budget"
     ]
   },
   {

@@ -4060,7 +4060,7 @@ test("HTTP error payload suppresses internal cluster state in refusal responses"
   }
 })
 
-test("HTTP rate limiting returns 429 after exceeding per-token write budget", { concurrency: false }, async () => {
+test("HTTP rate limiting returns 429 after exceeding per-IP write budget", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
   const nodes = []
@@ -4114,6 +4114,7 @@ test("HTTP rate limiting returns 429 after exceeding per-token write budget", { 
         tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
       },
       rateLimit: {
+        all: { max: 300, windowMs: 60_000 },
         writes: { max: 2, windowMs: 60_000 },
         reads: { max: 600, windowMs: 60_000 }
       }
@@ -4124,9 +4125,21 @@ test("HTTP rate limiting returns 429 after exceeding per-token write budget", { 
 
     await putValue(baseUrl, "key-1", { n: 1 })
     await putValue(baseUrl, "key-2", { n: 2 })
-    const thirdResult = await putValue(baseUrl, "key-3", { n: 3 })
-    assert.equal(thirdResult.status, 429)
-    assert.equal(thirdResult.payload.code, "TOO_MANY_REQUESTS")
+    const thirdResponse = await fetch(`${baseUrl}/kv/key-3?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ value: { n: 3 } })
+    })
+    assert.equal(thirdResponse.status, 429)
+    assert.equal(thirdResponse.headers.get("retry-after"), "60")
+    assert.equal(thirdResponse.headers.get("ratelimit-limit"), "2")
+    assert.equal(thirdResponse.headers.get("ratelimit-remaining"), "0")
+    assert.match(thirdResponse.headers.get("ratelimit-reset") ?? "", /^\d+$/)
+    const thirdPayload = await thirdResponse.json()
+    assert.equal(thirdPayload.code, "TOO_MANY_REQUESTS")
   } finally {
     await server?.close()
     await Promise.allSettled(nodes.map((node) => node.close()))
