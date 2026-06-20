@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
@@ -31,6 +31,40 @@ test("setup http server exposes setup state and no CRUD routes", { concurrency: 
     assert.deepEqual(missingCrud.payload, { error: "Not found" })
   } finally {
     await server.close()
+  }
+})
+
+test("setup http server serves built setup assets alongside setup routes", { concurrency: false }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-ui-"))
+  const assetsDir = path.join(dir, "assets")
+  const server = new SetupHttpServer({
+    uiRoot: dir,
+    state: () => ({ mode: "setup" })
+  })
+
+  try {
+    await mkdir(assetsDir, { recursive: true })
+    await writeFile(path.join(dir, "index.html"), "<!doctype html><html><body>setup-ui</body></html>\n")
+    await writeFile(path.join(assetsDir, "app.js"), "console.log('setup-ui')\n")
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const rootResponse = await fetch(baseUrl)
+    assert.equal(rootResponse.status, 200)
+    assert.match(rootResponse.headers.get("content-type") ?? "", /^text\/html/)
+    assert.match(await rootResponse.text(), /setup-ui/)
+
+    const assetResponse = await fetch(`${baseUrl}/assets/app.js`)
+    assert.equal(assetResponse.status, 200)
+    assert.match(assetResponse.headers.get("content-type") ?? "", /^text\/javascript/)
+    assert.match(await assetResponse.text(), /setup-ui/)
+
+    const state = await requestJson(`${baseUrl}/setup/state`)
+    assert.equal(state.status, 200)
+    assert.deepEqual(state.payload, { mode: "setup" })
+  } finally {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
   }
 })
 

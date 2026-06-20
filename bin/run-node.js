@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 import {
   HolepunchHttpServer,
@@ -16,6 +17,7 @@ if (cli.setup) {
   const setupConfigPath = cli.configPath ? path.resolve(cli.configPath) : null
   const setupDraftPath = setupConfigPath ? deriveSetupDraftPath(setupConfigPath) : null
   const setupServer = new SetupHttpServer({
+    uiRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/setup-ui"),
     state: () => ({
       mode: "setup",
       configPath: setupConfigPath

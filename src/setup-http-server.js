@@ -1,4 +1,6 @@
 import http from "node:http"
+import { readFile } from "node:fs/promises"
+import path from "node:path"
 
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
 import { listNetworkInterfaces } from "./setup/network-interfaces.js"
@@ -15,6 +17,7 @@ export class SetupHttpServer {
    *   state?: () => Promise<unknown> | unknown,
    *   deriveMachineId?: typeof deriveMachineId,
    *   listNetworkInterfaces?: typeof listNetworkInterfaces,
+   *   uiRoot?: string | null,
    *   loadDraft?: () => Promise<unknown>,
    *   saveDraft?: (draft: unknown) => Promise<unknown>
    * }} [options]
@@ -26,6 +29,7 @@ export class SetupHttpServer {
       state: () => ({ mode: "setup" }),
       deriveMachineId,
       listNetworkInterfaces,
+      uiRoot: null,
       loadDraft: null,
       saveDraft: null,
       ...options
@@ -115,6 +119,13 @@ export class SetupHttpServer {
         }
       }
 
+      if (req.method === "GET") {
+        const asset = await this.#readStaticAsset(url.pathname)
+        if (asset) {
+          return this.#send(res, 200, asset.contentType, asset.body)
+        }
+      }
+
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       return this.#json(res, error?.statusCode ?? 500, {
@@ -129,6 +140,44 @@ export class SetupHttpServer {
       error.statusCode = 409
       throw error
     }
+  }
+
+  async #readStaticAsset(pathname) {
+    if (!this.options.uiRoot) return null
+
+    const uiRoot = path.resolve(this.options.uiRoot)
+    const decodedPath = decodeURIComponent(pathname)
+    const relativePath =
+      decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "")
+    const candidatePath = path.resolve(uiRoot, relativePath)
+
+    if (!candidatePath.startsWith(`${uiRoot}${path.sep}`) && candidatePath !== path.join(uiRoot, "index.html")) {
+      return null
+    }
+
+    try {
+      return {
+        body: await readFile(candidatePath),
+        contentType: contentTypeForPath(candidatePath)
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+
+    if (!decodedPath.includes(".")) {
+      const indexPath = path.join(uiRoot, "index.html")
+
+      try {
+        return {
+          body: await readFile(indexPath),
+          contentType: "text/html; charset=utf-8"
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error
+      }
+    }
+
+    return null
   }
 
   async #readJson(req) {
@@ -153,11 +202,32 @@ export class SetupHttpServer {
 
   #json(res, statusCode, payload) {
     const body = JSON.stringify(payload)
+    this.#send(res, statusCode, "application/json; charset=utf-8", body)
+  }
+
+  #send(res, statusCode, contentType, body) {
     res.writeHead(statusCode, {
-      "content-type": "application/json; charset=utf-8",
+      "content-type": contentType,
       "content-length": Buffer.byteLength(body),
       "connection": "close"
     })
     res.end(body)
+  }
+}
+
+function contentTypeForPath(filePath) {
+  switch (path.extname(filePath)) {
+    case ".html":
+      return "text/html; charset=utf-8"
+    case ".css":
+      return "text/css; charset=utf-8"
+    case ".js":
+      return "text/javascript; charset=utf-8"
+    case ".json":
+      return "application/json; charset=utf-8"
+    case ".svg":
+      return "image/svg+xml"
+    default:
+      return "application/octet-stream"
   }
 }
