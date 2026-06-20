@@ -111,6 +111,7 @@ const shards = [
     patterns: [
       "pre-authorized standby node can join later and catch up without config changes",
       "planned node addition works after full-cluster restart with expanded membership",
+      "joint-consensus learner promotion blocks when only one side of the joint quorum is available",
       "joint-consensus voter removal blocks when only one side of the joint quorum is available"
     ]
   },
@@ -141,6 +142,7 @@ const shards = [
       "follower write forwarding pauses during leader loss and recovers after replacement or return",
       "split-fenced follower restart preserves write refusal until the leader returns",
       "concurrent writes during split fencing do not create accepted operations before the leader returns",
+      "failed local write stays uncommitted across leader restart and later healthy writes",
       "HTTP witness CRUD keeps writes on the leader-connected side during a split",
       "deterministic churn preserves convergence and write outcome invariants",
       "full-cluster cold restart from persisted data directories rebuilds state and accepts new writes"
@@ -169,21 +171,7 @@ const requiredTestsByFile = new Map([
   ]
 ])
 
-const excludedTestsByFile = new Map([
-  [
-    "test/network-perturbation.test.js",
-    new Map([
-      [
-        "joint-consensus learner promotion blocks when only one side of the joint quorum is available",
-        "Currently fails after heal with a follower-ack timeout and needs a separate perturbation fix."
-      ],
-      [
-        "timed-out local append stays uncommitted across leader restart and later healthy writes",
-        "Currently asserts an outdated follower-ack timeout message and needs a separate semantics update."
-      ]
-    ])
-  ]
-])
+const excludedTestsByFile = new Map()
 
 const discoveredTestsByFile = new Map()
 for (const shard of shards) {

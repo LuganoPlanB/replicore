@@ -1216,8 +1216,8 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
 test("HTTP CRUD failure before commit stays absent after leader restart", { concurrency: false }, async () => {
   const cluster = await createSwarmCluster({
     size: 3,
-    heartbeatIntervalMs: 100,
-    heartbeatTtlMs: 800,
+    heartbeatIntervalMs: 1000,
+    heartbeatTtlMs: 5000,
     ackDelayMsByNodeId: {},
     durability: {
       requiredFollowerAcks: 1,
@@ -1236,10 +1236,14 @@ test("HTTP CRUD failure before commit stays absent after leader restart", { conc
       .sort()
     cluster.options.ackDelayMsByNodeId = Object.fromEntries(followerIds.map((nodeId) => [nodeId, 1000]))
     await Promise.all(followerIds.map((nodeId) => cluster.restartNode(nodeId)))
-    await waitForClusterLeaderId(cluster)
+    const currentLeaderId = await waitForClusterLeaderId(cluster)
 
-    const witness = cluster.record(followerIds[0]).node
-    const leader = cluster.record(leaderId).node
+    const witnessId = cluster.records
+      .map((record) => record.identity.publicKeyId)
+      .filter((nodeId) => nodeId !== currentLeaderId)
+      .sort()[0]
+    const witness = cluster.record(witnessId).node
+    const leader = cluster.record(currentLeaderId).node
     const server = new HolepunchHttpServer({
       node: witness,
       auth: {
