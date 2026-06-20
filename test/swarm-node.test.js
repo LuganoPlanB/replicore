@@ -3631,6 +3631,18 @@ test("HTTP body size limit enforces maximum request body size through Content-Le
     assert.equal(largeResponse.status, 413)
     const largePayload = await largeResponse.json()
     assert.equal(largePayload.code, "PAYLOAD_TOO_LARGE")
+
+    const wrongTypeResponse = await fetch(`${baseUrl}/kv/key-contenttype?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "text/plain"
+      },
+      body: JSON.stringify({ value: { broken: true } })
+    })
+    assert.equal(wrongTypeResponse.status, 415)
+    const wrongTypePayload = await wrongTypeResponse.json()
+    assert.equal(wrongTypePayload.code, "UNSUPPORTED_MEDIA_TYPE")
   } finally {
     await server?.close()
     await Promise.allSettled(nodes.map((node) => node.close()))
