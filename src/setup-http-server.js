@@ -1,5 +1,8 @@
 import http from "node:http"
 
+import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
+import { normalizeSetupMachineIdInput } from "./setup-validation.js"
+
 /**
  * Minimal local-only HTTP surface for setup mode before a node is configured.
  */
@@ -8,7 +11,8 @@ export class SetupHttpServer {
    * @param {{
    *   host?: string,
    *   port?: number,
-   *   state?: () => Promise<unknown> | unknown
+   *   state?: () => Promise<unknown> | unknown,
+   *   deriveMachineId?: typeof deriveMachineId
    * }} [options]
    */
   constructor(options = {}) {
@@ -16,6 +20,7 @@ export class SetupHttpServer {
       host: "127.0.0.1",
       port: 0,
       state: () => ({ mode: "setup" }),
+      deriveMachineId,
       ...options
     }
     this.server = null
@@ -65,11 +70,41 @@ export class SetupHttpServer {
         return this.#json(res, 200, await this.options.state())
       }
 
+      if (req.method === "POST" && url.pathname === "/setup/derive-machine-id") {
+        const input = normalizeSetupMachineIdInput(await this.#readJson(req))
+        const machineId = await this.options.deriveMachineId(input)
+        return this.#json(res, 200, {
+          machineId: machineId.toString("hex"),
+          kdf: "argon2d",
+          purpose: MACHINE_ID_PURPOSE
+        })
+      }
+
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       return this.#json(res, error?.statusCode ?? 500, {
         error: error instanceof Error ? error.message : String(error)
       })
+    }
+  }
+
+  async #readJson(req) {
+    const chunks = []
+
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    }
+
+    if (chunks.length === 0) {
+      return {}
+    }
+
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    } catch {
+      const error = new Error("Request body must be valid JSON")
+      error.statusCode = 400
+      throw error
     }
   }
 

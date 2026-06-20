@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 
 import { SetupHttpServer } from "../src/index.js"
+import { deriveMachineId, MACHINE_ID_PURPOSE } from "../src/cluster-secret.js"
 import { requestJson } from "./helpers/http-crud.js"
 
 test("setup http server exposes setup state and no CRUD routes", { concurrency: false }, async () => {
@@ -84,5 +85,58 @@ test("run-node setup mode starts without loading a node config", { concurrency: 
   } finally {
     child.kill("SIGTERM")
     await new Promise((resolve) => child.once("exit", resolve))
+  }
+})
+
+test("setup http server derives machine identifiers through the backend", { concurrency: false }, async () => {
+  const server = new SetupHttpServer()
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const clusterSecret = "ab".repeat(32)
+    const machineIdentity = "  machine-id-value  "
+
+    const response = await requestJson(`${baseUrl}/setup/derive-machine-id`, {
+      method: "POST",
+      body: {
+        clusterSecret,
+        machineIdentity
+      }
+    })
+
+    assert.equal(response.status, 200)
+    assert.deepEqual(response.payload, {
+      machineId: (await deriveMachineId({
+        clusterSecret: Buffer.from(clusterSecret, "hex"),
+        machineIdentity
+      })).toString("hex"),
+      kdf: "argon2d",
+      purpose: MACHINE_ID_PURPOSE
+    })
+  } finally {
+    await server.close()
+  }
+})
+
+test("setup http server rejects invalid machine-id derivation input", { concurrency: false }, async () => {
+  const server = new SetupHttpServer()
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const response = await requestJson(`${baseUrl}/setup/derive-machine-id`, {
+      method: "POST",
+      body: {
+        clusterSecret: "aa".repeat(31),
+        machineIdentity: " "
+      }
+    })
+
+    assert.equal(response.status, 400)
+    assert.equal(response.payload.error, "clusterSecret must decode to 32 bytes")
+  } finally {
+    await server.close()
   }
 })
