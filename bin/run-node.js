@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { access } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -16,11 +17,13 @@ const cli = parseCli(process.argv.slice(2))
 if (cli.setup) {
   const setupConfigPath = cli.configPath ? path.resolve(cli.configPath) : null
   const setupDraftPath = setupConfigPath ? deriveSetupDraftPath(setupConfigPath) : null
+  const configExists = setupConfigPath ? await pathExists(setupConfigPath) : false
   const setupServer = new SetupHttpServer({
     uiRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/setup-ui"),
     state: () => ({
       mode: "setup",
-      configPath: setupConfigPath
+      configPath: setupConfigPath,
+      configExists
     }),
     loadDraft: setupDraftPath ? () => readSetupDraft(setupDraftPath) : null,
     saveDraft: setupDraftPath ? (draft) => writeSetupDraft(setupDraftPath, draft).then((result) => result.draft) : null
@@ -33,6 +36,9 @@ if (cli.setup) {
       {
         type: "setup-ready",
         configPath: setupConfigPath,
+        draftPath: setupDraftPath,
+        configExists,
+        url: `http://${setupServer.address.address}:${setupServer.address.port}/`,
         http: setupServer.address
       },
       null,
@@ -127,4 +133,13 @@ function parseCli(argv) {
 function deriveSetupDraftPath(configPath) {
   const parsed = path.parse(configPath)
   return path.join(parsed.dir, `${parsed.name}.setup-draft.json`)
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
 }

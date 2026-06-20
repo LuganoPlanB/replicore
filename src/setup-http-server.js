@@ -175,6 +175,11 @@ export class SetupHttpServer {
       } catch (error) {
         if (error?.code !== "ENOENT") throw error
       }
+
+      return {
+        body: Buffer.from(fallbackSetupHtml(), "utf8"),
+        contentType: "text/html; charset=utf-8"
+      }
     }
 
     return null
@@ -230,4 +235,20 @@ function contentTypeForPath(filePath) {
     default:
       return "application/octet-stream"
   }
+}
+
+function fallbackSetupHtml() {
+  return [
+    "<!doctype html>",
+    "<html lang=\"en\">",
+    "<head>",
+    "<meta charset=\"utf-8\" />",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />",
+    "<title>Replicore Setup</title>",
+    "</head>",
+    "<body>",
+    "<main><h1>Replicore Setup</h1><p>Setup UI assets are not built yet.</p></main>",
+    "</body>",
+    "</html>"
+  ].join("")
 }

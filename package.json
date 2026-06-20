@@ -6,6 +6,7 @@
   "scripts": {
     "build:setup-ui": "vite build --config setup-ui/vite.config.js",
     "dev:setup-ui": "vite --config setup-ui/vite.config.js",
+    "start:setup": "node bin/run-node.js --setup",
     "test": "node test/run-suite.mjs",
     "test:reliability": "node test/reliability-churn.mjs",
     "start:bootstrap": "node bin/run-bootstrap.js",

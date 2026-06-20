@@ -69,7 +69,9 @@ test("setup http server serves built setup assets alongside setup routes", { con
 })
 
 test("run-node setup mode starts without loading a node config", { concurrency: false }, async () => {
-  const child = spawn(process.execPath, ["bin/run-node.js", "--setup"], {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-cli-"))
+  const configPath = path.join(dir, "node.json")
+  const child = spawn(process.execPath, ["bin/run-node.js", "--setup", configPath], {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"]
   })
@@ -111,18 +113,31 @@ test("run-node setup mode starts without loading a node config", { concurrency: 
 
   try {
     assert.equal(ready.type, "setup-ready")
-    assert.equal(ready.configPath, null)
+    assert.equal(ready.configPath, configPath)
+    assert.equal(ready.draftPath, path.join(dir, "node.setup-draft.json"))
+    assert.equal(ready.configExists, false)
+    assert.equal(typeof ready.url, "string")
     assert.equal(typeof ready.http?.port, "number")
 
     const state = await requestJson(`http://${ready.http.address}:${ready.http.port}/setup/state`)
     assert.equal(state.status, 200)
     assert.deepEqual(state.payload, {
       mode: "setup",
-      configPath: null
+      configPath,
+      configExists: false
     })
+
+    const interfaces = await requestJson(`http://${ready.http.address}:${ready.http.port}/setup/interfaces`)
+    assert.equal(interfaces.status, 200)
+    assert.equal(Array.isArray(interfaces.payload.interfaces), true)
+
+    const rootResponse = await fetch(ready.url)
+    assert.equal(rootResponse.status, 200)
+    assert.match(rootResponse.headers.get("content-type") ?? "", /^text\/html/)
   } finally {
     child.kill("SIGTERM")
     await new Promise((resolve) => child.once("exit", resolve))
+    await rm(dir, { recursive: true, force: true })
   }
 })
 
