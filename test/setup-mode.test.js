@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
-import { SetupHttpServer } from "../src/index.js"
+import { HolepunchHttpServer, SetupHttpServer } from "../src/index.js"
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "../src/cluster-secret.js"
 import { readSetupDraft, writeSetupDraft } from "../src/setup-draft-store.js"
 import { requestJson } from "./helpers/http-crud.js"
@@ -257,6 +257,41 @@ test("setup http server reports when setup draft storage is unavailable", { conc
     assert.deepEqual(response.payload, {
       error: "Setup draft storage is unavailable"
     })
+  } finally {
+    await server.close()
+  }
+})
+
+test("node http server does not expose setup routes", { concurrency: false }, async () => {
+  const node = {
+    async setHttpAddress() {},
+    async getReplicationStatus() {
+      return { ok: true }
+    },
+    getWritersStatus() {
+      return { ok: true }
+    },
+    async getLeaderStatus() {
+      return { ok: true }
+    }
+  }
+  const server = new HolepunchHttpServer({ node })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const setupState = await requestJson(`${baseUrl}/setup/state`)
+    assert.equal(setupState.status, 404)
+    assert.deepEqual(setupState.payload, { error: "Not found" })
+
+    const setupDraft = await requestJson(`${baseUrl}/setup/draft`)
+    assert.equal(setupDraft.status, 404)
+    assert.deepEqual(setupDraft.payload, { error: "Not found" })
+
+    const replication = await requestJson(`${baseUrl}/status/replication`)
+    assert.equal(replication.status, 200)
+    assert.deepEqual(replication.payload, { ok: true })
   } finally {
     await server.close()
   }
