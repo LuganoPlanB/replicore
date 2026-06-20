@@ -23,6 +23,12 @@ import {
 import { MaterializedView } from "./materialized-view.js"
 import { NodeRpcRouter } from "./node-rpc.js"
 import { PeerHintManager } from "./peer-hints.js"
+import {
+  createSnapshot as createSnapshotEnvelope,
+  normalizeSnapshotEnvelope,
+  restoreSnapshot as restoreSnapshotEnvelope,
+  snapshotContentHash
+} from "./snapshot-file.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { validatePromotionCredential } from "./promotion-credential.js"
 import { ConsensusEngine, majoritySize } from "./raft-engine.js"
@@ -817,77 +823,40 @@ export class HolepunchSwarmNode {
   }
 
   async createSnapshot() {
-    const content = await this.view.exportSnapshot()
-    if (!this.#usesSharedAuthoritativeLog()) {
-      return content
-    }
-
-    const authoritativeLog = await this.getAuthoritativeLogStatus()
-    const snapshot = {
-      version: 2,
-      createdAt: new Date().toISOString(),
-      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId(),
+    return createSnapshotEnvelope({
+      view: this.view,
+      usesSharedAuthoritativeLog: () => this.#usesSharedAuthoritativeLog(),
+      getAuthoritativeLogStatus: () => this.getAuthoritativeLogStatus(),
+      currentLeader: () => this.currentLeader(),
+      lastKnownLeaderId: () => this.#lastKnownLeaderId(),
       membershipVersion: this.membershipState.current.version,
-      lastIncludedIndex: this.consensusState.lastApplied,
-      lastIncludedTerm: authoritativeLog.lastLogTerm,
-      content
-    }
-    return {
-      ...snapshot,
-      contentHash: this.#snapshotContentHash(snapshot)
-    }
+      lastAppliedIndex: this.consensusState.lastApplied
+    })
   }
 
   /**
    * @param {{ version: number, entries: Array<{ key: string, value: unknown }> }} snapshot
    */
   async restoreSnapshot(snapshot) {
-    const envelope = this.#normalizeSnapshotEnvelope(snapshot)
-    if (envelope) {
-      const expectedHash = this.#snapshotContentHash({
-        version: envelope.version,
-        createdAt: envelope.createdAt,
-        leaderNodeId: envelope.leaderNodeId,
-        membershipVersion: envelope.membershipVersion,
-        lastIncludedIndex: envelope.lastIncludedIndex,
-        lastIncludedTerm: envelope.lastIncludedTerm,
-        content: envelope.content
-      })
-      if (expectedHash !== envelope.contentHash) {
-        throw new Error("Snapshot content hash mismatch")
+    await restoreSnapshotEnvelope({
+      view: this.view,
+      snapshot,
+      currentLeader: () => this.currentLeader(),
+      onPostRestore: async (envelope) => {
+        if (Number.isInteger(envelope.lastIncludedIndex)) {
+          this.consensusState = await this.consensusStateStore.save({
+            commitIndex: Math.max(this.consensusState.commitIndex, envelope.lastIncludedIndex),
+            lastApplied: Math.max(this.consensusState.lastApplied, envelope.lastIncludedIndex)
+          })
+        }
+        this.diagnosticState.reconciliation = {
+          state: "snapshot-installed",
+          at: new Date().toISOString(),
+          detail: envelope.leaderNodeId ?? "unknown-leader"
+        }
+        await this.syncAuthoritativeLog()
       }
-      if (this.currentLeader() && envelope.leaderNodeId && envelope.leaderNodeId !== this.currentLeader()) {
-        throw new Error("Snapshot leader identity does not match current leader")
-      }
-      await this.view.importSnapshot(envelope.content)
-      if (Number.isInteger(envelope.lastIncludedIndex)) {
-        this.consensusState = await this.consensusStateStore.save({
-          commitIndex: Math.max(this.consensusState.commitIndex, envelope.lastIncludedIndex),
-          lastApplied: Math.max(this.consensusState.lastApplied, envelope.lastIncludedIndex)
-        })
-      }
-      this.diagnosticState.reconciliation = {
-        state: "snapshot-installed",
-        at: new Date().toISOString(),
-        detail: envelope.leaderNodeId ?? "unknown-leader"
-      }
-      await this.syncAuthoritativeLog()
-      return
-    }
-
-    await this.view.importSnapshot(snapshot)
-  }
-
-  #normalizeSnapshotEnvelope(snapshot) {
-    if (!snapshot || typeof snapshot !== "object") return null
-    if (snapshot.version !== 2) return null
-    if (!snapshot.content || typeof snapshot.content !== "object") return null
-    if (typeof snapshot.contentHash !== "string" || snapshot.contentHash.length === 0) return null
-    return snapshot
-  }
-
-  #snapshotContentHash(snapshot) {
-    return createHash("sha256").update(canonicalize(snapshot)).digest("hex")
+    })
   }
 
   /**
