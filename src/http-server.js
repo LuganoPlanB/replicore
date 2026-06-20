@@ -1,4 +1,5 @@
 import http from "node:http"
+import { readJsonBody } from "./http/body.js"
 
 /**
  * Minimal authorized HTTP surface for the swarm node.
@@ -254,49 +255,11 @@ export class HolepunchHttpServer {
   }
 
   async #readJson(req, maxSize = this.options.maxBodySize) {
-    const contentType = req.headers["content-type"] ?? ""
-    if (!contentType.startsWith("application/json")) {
-      if (Number.parseInt(req.headers["content-length"] ?? "0", 10) === 0 && !contentType) {
-        return {}
-      }
-      const error = new Error("Unsupported Media Type")
-      error.code = "UNSUPPORTED_MEDIA_TYPE"
-      error.statusCode = 415
-      throw error
-    }
-
-    const contentLength = Number.parseInt(req.headers["content-length"], 10)
-    if (Number.isFinite(contentLength) && contentLength > maxSize) {
-      const error = new Error("Request body too large")
-      error.code = "PAYLOAD_TOO_LARGE"
-      error.statusCode = 413
-      throw error
-    }
-
-    let totalSize = 0
-    const chunks = []
-    for await (const chunk of req) {
-      totalSize += chunk.length
-      if (totalSize > maxSize) {
-        const error = new Error("Request body too large")
-        error.code = "PAYLOAD_TOO_LARGE"
-        error.statusCode = 413
-        throw error
-      }
-      chunks.push(chunk)
-    }
-    if (chunks.length === 0) return {}
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString("utf8"))
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        const publicError = new Error("Invalid JSON body")
-        publicError.code = "INVALID_JSON"
-        publicError.statusCode = 400
-        throw publicError
-      }
-      throw error
-    }
+    return readJsonBody(req, {
+      maxBytes: maxSize,
+      contentType: req.headers["content-type"] ?? "",
+      allowEmpty: true
+    })
   }
 
   #errorPayload(error) {
