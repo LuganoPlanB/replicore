@@ -28,10 +28,11 @@ export class HolepunchHttpServer {
    * }} options
    */
   constructor(options) {
-    this.options = {
+   this.options = {
       host: "127.0.0.1",
       port: 0,
       auth: { tokens: {} },
+      logger: console,
       maxBodySize: 64 * 1024,
       rateLimit: options?.rateLimit ?? {
         all: { max: 300, windowMs: 60_000 },
@@ -201,7 +202,7 @@ export class HolepunchHttpServer {
         ? { error: "Internal server error", code: "INTERNAL_ERROR" }
         : this.#errorPayload(error)
       if (isInternalError) {
-        console.error("http internal error", { status, code: error?.code, message: error?.message?.slice(0, 200) })
+        this.options.logger?.error?.("http internal error", { status, code: error?.code, message: error?.message?.slice(0, 200) })
       }
       return this.#json(res, status, payload, extraHeaders)
     }
@@ -252,6 +253,7 @@ export class HolepunchHttpServer {
     const remoteAddress = req.socket?.remoteAddress ?? "unknown"
     const globalResult = this.rateLimiters.all(remoteAddress)
     if (!globalResult.allowed) {
+      this.#logRateLimit(req, "all")
       throw this.#createRateLimitError(globalResult, this.options.rateLimit.all ?? { max: 300, windowMs: 60_000 })
     }
 
@@ -260,8 +262,18 @@ export class HolepunchHttpServer {
 
     const result = limiter(remoteAddress)
     if (!result.allowed) {
+      this.#logRateLimit(req, category)
       throw this.#createRateLimitError(result, this.options.rateLimit[category] ?? { max: 0, windowMs: 0 })
     }
+  }
+
+  #logRateLimit(req, category) {
+    this.options.logger?.warn?.("http rate limited", {
+      method: req.method,
+      path: new URL(req.url, "http://127.0.0.1").pathname,
+      remoteAddress: req.socket?.remoteAddress ?? "unknown",
+      limitName: category
+    })
   }
 
   #createRateLimitError(result, config) {

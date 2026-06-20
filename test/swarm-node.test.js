@@ -4148,6 +4148,68 @@ test("HTTP rate limiting returns 429 after exceeding per-IP write budget", { con
   }
 })
 
+test("HTTP rate limit logging omits authorization tokens", { concurrency: false }, async () => {
+  const entries = []
+  const node = {
+    async setHttpAddress() {},
+    async qualifyClientWriteEntrypoint() {},
+    async put(key, value, options) {
+      return {
+        opId: "rate-limit-log-op",
+        actor: "stub-node",
+        type: "put",
+        key,
+        keyspace: options.keyspace,
+        value
+      }
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    logger: {
+      warn(message, payload) {
+        entries.push({ level: "warn", message, payload })
+      },
+      error() {}
+    },
+    auth: {
+      tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+    },
+    rateLimit: {
+      all: { max: 300, windowMs: 60_000 },
+      writes: { max: 1, windowMs: 60_000 },
+      reads: { max: 600, windowMs: 60_000 }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    await putValue(baseUrl, "key-1", { n: 1 })
+    const denied = await fetch(`${baseUrl}/kv/key-2?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ value: { n: 2 } })
+    })
+    assert.equal(denied.status, 429)
+
+    assert.equal(entries.length, 1)
+    assert.equal(entries[0].message, "http rate limited")
+    assert.deepEqual(Object.keys(entries[0].payload).sort(), ["limitName", "method", "path", "remoteAddress"])
+    assert.equal(entries[0].payload.method, "PUT")
+    assert.equal(entries[0].payload.path, "/kv/key-2")
+    assert.equal(typeof entries[0].payload.remoteAddress, "string")
+    assert.equal(entries[0].payload.limitName, "writes")
+    assert.ok(!JSON.stringify(entries[0]).includes("Bearer writer"))
+  } finally {
+    await server.close()
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
