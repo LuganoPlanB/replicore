@@ -107,27 +107,16 @@ export class NodeRpcRouter {
     }
 
     const extension = this.#extensionFor(targetNodeId)
-    const requestId = `${this.options.localNodeId}-${++this.requestId}`
-    const response = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.inflightRequests.delete(requestId)
-        reject(new Error(`Timed out forwarding write request ${requestId}`))
-      }, this.options.timeoutMs)
-      this.inflightRequests.set(requestId, { resolve, reject, timer })
-    })
-    response.catch(() => {})
-
-    extension?.send(
+    return this.#sendRequest(
+      extension,
+      peer,
       {
         type: "write-request",
-        requestId,
         from: this.options.localNodeId,
         request
       },
-      peer
+      { timeoutMessage: (requestId) => `Timed out forwarding write request ${requestId}` }
     )
-
-    return response
   }
 
   /**
@@ -139,27 +128,16 @@ export class NodeRpcRouter {
     }
 
     const extension = this.#extensionFor(targetNodeId)
-    const requestId = `${this.options.localNodeId}-${++this.requestId}`
-    const response = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.inflightRequests.delete(requestId)
-        reject(new Error(`Timed out forwarding vote request ${requestId}`))
-      }, this.options.timeoutMs)
-      this.inflightRequests.set(requestId, { resolve, reject, timer })
-    })
-    response.catch(() => {})
-
-    extension?.send(
+    return this.#sendRequest(
+      extension,
+      peer,
       {
         type: "vote-request",
-        requestId,
         from: this.options.localNodeId,
         ...request
       },
-      peer
+      { timeoutMessage: (requestId) => `Timed out forwarding vote request ${requestId}` }
     )
-
-    return response
   }
 
   /**
@@ -246,6 +224,36 @@ export class NodeRpcRouter {
    */
   #extensionFor(nodeId) {
     return this.extensions.get(nodeId) ?? null
+  }
+
+  /**
+   * Track one RPC request until timeout or response.
+   *
+   * @param {{ send?: (message: any, peer: any) => void } | null} extension
+   * @param {any} peer
+   * @param {Record<string, unknown>} message
+   * @param {{ timeoutMessage: (requestId: string) => string }} options
+   */
+  #sendRequest(extension, peer, message, options) {
+    const requestId = `${this.options.localNodeId}-${++this.requestId}`
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.inflightRequests.delete(requestId)
+        reject(new Error(options.timeoutMessage(requestId)))
+      }, this.options.timeoutMs)
+      this.inflightRequests.set(requestId, { resolve, reject, timer })
+    })
+    response.catch(() => {})
+
+    extension?.send(
+      {
+        ...message,
+        requestId
+      },
+      peer
+    )
+
+    return response
   }
 
   /**

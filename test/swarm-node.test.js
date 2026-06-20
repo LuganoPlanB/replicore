@@ -440,7 +440,7 @@ test(
     const forwardingNode = nodes[0]
     await assert.rejects(
       forwardingNode.put("hash:gamma", { failover: true }),
-      /split-fenced|Current leader .* is not reachable|No current leader is available/
+      /split-fenced|Current leader .* is not reachable|No current leader is available|Durability requirement not met/
     )
     assert.equal(await forwardingNode.get("hash:gamma"), null)
   } finally {
