@@ -3558,6 +3558,87 @@ test("closing a leader rejects a delayed durability wait without leaving a live 
   }
 })
 
+test("HTTP body size limit enforces maximum request body size through Content-Length header", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+  let server = null
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("http-body-limit-leader"))
+    const followerIdentity = generateIdentity(seed("http-body-limit-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-body-limit",
+      topicSalt: "test-body-limit",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-body-limit",
+      topicSalt: "test-body-limit",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower)
+    await leader.start()
+    await follower.start()
+
+    const leaderId = [leaderIdentity, followerIdentity].sort((a, b) =>
+      a.publicKeyId.localeCompare(b.publicKeyId)
+    )[0].publicKeyId
+    await waitFor(
+      async () => nodes.every((node) => node.currentLeader() === leaderId),
+      { description: "leader convergence for body limit test" }
+    )
+
+    const witness = nodes.find((node) => node.options.identity.publicKeyId !== leaderId)
+    server = new HolepunchHttpServer({
+      node: witness,
+      auth: {
+        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+      }
+    })
+    await server.start()
+    await waitForWritableWitness(witness)
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const smallResult = await putValue(baseUrl, "key-small", { size: "small" })
+    assert.equal(smallResult.status, 200)
+
+    const largeBody = "x".repeat(128 * 1024)
+    const largeResponse = await fetch(`${baseUrl}/kv/key-large?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: largeBody
+    })
+    assert.equal(largeResponse.status, 413)
+    const largePayload = await largeResponse.json()
+    assert.equal(largePayload.code, "PAYLOAD_TOO_LARGE")
+  } finally {
+    await server?.close()
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],
