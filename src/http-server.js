@@ -161,7 +161,14 @@ export class HolepunchHttpServer {
     } catch (error) {
       const status = error?.statusCode ?? 500
       const extraHeaders = error?.retryAfter ? { "retry-after": String(error.retryAfter) } : undefined
-      return this.#json(res, status, this.#errorPayload(error), extraHeaders)
+      const isInternalError = status >= 500 && !error?.refusal
+      const payload = isInternalError
+        ? { error: "Internal server error", code: "INTERNAL_ERROR" }
+        : this.#errorPayload(error)
+      if (isInternalError) {
+        console.error("http internal error", { status, code: error?.code, message: error?.message?.slice(0, 200) })
+      }
+      return this.#json(res, status, payload, extraHeaders)
     }
   }
 
@@ -314,6 +321,7 @@ export class HolepunchHttpServer {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(body),
       "connection": "close",
+      "x-content-type-options": "nosniff",
       ...(extraHeaders ?? {})
     })
     res.end(body)
