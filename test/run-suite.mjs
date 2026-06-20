@@ -103,6 +103,8 @@ const shards = [
       "HTTP malformed JSON returns 400 without calling node handlers and later valid requests still work",
       "HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD calls",
       "HTTP admin routes validate bodies before node admin calls",
+      "HTTP JSON responses carry consistent security headers across success and error paths",
+      "HTTP internal errors are sanitized for clients and logged with the injected logger",
       "HTTP error payload suppresses internal cluster state in refusal responses",
       "HTTP rate limiting returns 429 after exceeding per-IP write budget",
       "HTTP rate limit logging omits authorization tokens"
