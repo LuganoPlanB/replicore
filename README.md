@@ -281,8 +281,8 @@ If you already have static configs:
 ## Project Layout
 
 - `bin/run-bootstrap.js`: local HyperDHT bootstrap helper
-- `bin/run-node.js`C:/Users/denis/devel/planb-cleard/bin/run-node.js:1): config-driven node runner
-- `src/node.js`C:/Users/denis/devel/planb-cleard/src/node.js:1): swarm node, replication, forwarding, leadership, durability
+- `bin/run-node.js`: config-driven node runner
+- `src/node.js`: swarm node, replication, forwarding, leadership, durability
 - `src/http-server.js`: minimal authorized HTTP surface
 - `src/materialized-view.js`: derived Hyperbee state
 - `src/operation.js`: operation creation, signing, validation
