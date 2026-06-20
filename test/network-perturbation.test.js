@@ -623,23 +623,18 @@ test("joint-consensus learner promotion blocks when only one side of the joint q
       blockedStatus.membership.learners.some((entry) => entry.nodeId === learnerIdentity.publicKeyId),
       true
     )
+    const blockedStatuses = Object.values(await collectReplicationStatus(cluster.nodes))
+    assert.ok(blockedStatuses.every((status) => status.membership.version === 0))
+    assert.ok(blockedStatuses.every((status) => status.membership.joint === null))
+    assert.ok(
+      blockedStatuses.every((status) =>
+        status.membership.learners.some((entry) => entry.nodeId === learnerIdentity.publicKeyId)
+      )
+    )
 
     await cluster.healPartition()
     await waitForClusterConvergence(cluster)
-    await waitFor(
-      async () => {
-        const status = await leader.getReplicationStatus()
-        return identities
-          .slice(0, 3)
-          .map((identity) => identity.publicKeyId)
-          .filter((nodeId) => nodeId !== leaderId)
-          .every((nodeId) => status.peerReplication[nodeId]?.connectedPeers > 0)
-      },
-      {
-        description: "promotion leader regains enough live connectivity after heal",
-        onTimeout: () => collectClusterDiagnostics(cluster)
-      }
-    )
+    await waitForPromotionCommitReadiness(cluster, leaderId, learnerIdentity.publicKeyId)
 
     let committed = null
     let lastPromotionError = null
@@ -1745,8 +1740,8 @@ test("failed local write stays uncommitted across leader restart and later healt
 
   const cluster = await createSwarmCluster({
     identities,
-    heartbeatIntervalMs: 100,
-    heartbeatTtlMs: 900,
+    heartbeatIntervalMs: 1000,
+    heartbeatTtlMs: 5000,
     ackDelayMsByNodeId,
     durability: {
       requiredFollowerAcks: 1,
@@ -3010,6 +3005,59 @@ async function waitForClusterConvergence(cluster) {
     },
     {
       description: "cluster leader convergence",
+      onTimeout: () => collectClusterDiagnostics(cluster)
+    }
+  )
+}
+
+async function waitForPromotionCommitReadiness(cluster, leaderId, learnerId) {
+  await waitFor(
+    async () => {
+      const statuses = await collectReplicationStatus(cluster.nodes)
+      const leaderStatus = statuses[leaderId]
+      const learnerStatus = statuses[learnerId]
+      if (!leaderStatus || !learnerStatus) return false
+      if (leaderStatus.network.policyActive) return false
+      if (leaderStatus.leader !== leaderId) return false
+      if (learnerStatus.leader !== leaderId) return false
+
+      const authoritativeFeedKey = leaderStatus.authoritativeLog.feedKey
+      const oldFollowerIds = leaderStatus.membership.current.voters.filter((nodeId) => nodeId !== leaderId)
+
+      if (
+        !oldFollowerIds.every((nodeId) => {
+          const status = statuses[nodeId]
+          if (!status) return false
+          return (
+            status.leader === leaderId &&
+            status.leaderHealth.reachable === true &&
+            status.network.peers?.[leaderId]?.connected === true &&
+            (status.heartbeatByNode?.[leaderId]?.appliedFeeds?.[authoritativeFeedKey] ?? -1) >=
+              leaderStatus.authoritativeLog.length
+          )
+        })
+      ) {
+        return false
+      }
+
+      if (
+        !oldFollowerIds.every((nodeId) => {
+          const peer = leaderStatus.peerReplication[nodeId]
+          return peer?.alive === true && peer?.connectedPeers > 0
+        })
+      ) {
+        return false
+      }
+
+      return (
+        leaderStatus.network.peers?.[learnerId]?.connected === true &&
+        learnerStatus.network.peers?.[leaderId]?.connected === true &&
+        leaderStatus.peerReplication[learnerId]?.connectedPeers > 0 &&
+        learnerStatus.authoritativeLog.connectedPeers > 0
+      )
+    },
+    {
+      description: "promotion participants regain authoritative connectivity after heal",
       onTimeout: () => collectClusterDiagnostics(cluster)
     }
   )
