@@ -19,6 +19,11 @@ const shards = [
     args: ["--test", "--test-concurrency=1"]
   },
   {
+    label: "http-validation",
+    file: "test/http-validation.test.js",
+    args: ["--test", "--test-concurrency=1"]
+  },
+  {
     label: "swarm-node-a",
     file: "test/swarm-node.test.js",
     args: ["--test", "--test-concurrency=1"],
@@ -90,6 +95,7 @@ const shards = [
       "a staged delete stays out of reads, history, and snapshots until committed",
       "closing a leader rejects a delayed durability wait without leaving a live timer behind",
       "HTTP body size limit enforces maximum request body size through Content-Length header",
+      "HTTP malformed JSON returns 400 without calling node handlers and later valid requests still work",
       "HTTP error payload suppresses internal cluster state in refusal responses",
       "HTTP rate limiting returns 429 after exceeding per-token write budget"
     ]
