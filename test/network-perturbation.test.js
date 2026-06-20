@@ -1739,9 +1739,7 @@ test("failed local write stays uncommitted across leader restart and later healt
   const identities = createIdentities(3, ["timeout-leader", "timeout-follower-a", "timeout-follower-b"])
   const leaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
   const ackDelayMsByNodeId = Object.fromEntries(
-    identities
-      .filter((identity) => identity.publicKeyId !== leaderId)
-      .map((identity) => [identity.publicKeyId, 1000])
+    identities.map((identity) => [identity.publicKeyId, 1000])
   )
 
   const cluster = await createSwarmCluster({
@@ -1749,6 +1747,7 @@ test("failed local write stays uncommitted across leader restart and later healt
     heartbeatIntervalMs: 1000,
     heartbeatTtlMs: 5000,
     ackDelayMsByNodeId,
+    useHeartbeatDurability: false,
     durability: {
       requiredFollowerAcks: 1,
       timeoutMs: 300

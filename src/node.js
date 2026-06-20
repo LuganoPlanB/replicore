@@ -73,7 +73,8 @@ export class HolepunchSwarmNode {
    *   forwarding?: boolean,
    *   ackDelayMs?: number,
    *   networkPolicy?: { allowedNodeIds?: string[], allowConnection?: (localNodeId: string, remoteNodeId: string) => boolean },
-   *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number }
+   *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number },
+   *   useHeartbeatDurability?: boolean
    * }} options
    */
   constructor(options) {
@@ -86,6 +87,7 @@ export class HolepunchSwarmNode {
       maxInflightReplication: 16,
       electionTimeoutSeed: null,
       forwarding: true,
+      useHeartbeatDurability: true,
       durability: {
         requiredFollowerAcks: 1,
         timeoutMs: 5000,
@@ -1688,6 +1690,7 @@ export class HolepunchSwarmNode {
    * @param {Record<string, unknown>} operation
    */
   #recordHeartbeatDurability(nodeId, operation) {
+    if (!this.options.useHeartbeatDurability) return
     if (!this.#usesSharedAuthoritativeLog()) return
     if (this.currentLeader() !== this.options.identity.publicKeyId) return
     if (nodeId === this.options.identity.publicKeyId) return

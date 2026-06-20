@@ -32,6 +32,7 @@ const RESOURCE_TIMEOUT_MS = Number(process.env.REPLICORE_TEST_RESOURCE_TIMEOUT_M
  *   forwarding?: boolean,
  *   ackDelayMsByNodeId?: Record<string, number>,
  *   durability?: { requiredFollowerAcks?: number, timeoutMs?: number },
+ *   useHeartbeatDurability?: boolean,
  *   revokedNodeIds?: string[],
  *   identityLabels?: string[],
  *   bootstrap?: Array<string | { host: string, port: number }>,
@@ -87,6 +88,7 @@ export async function createSwarmCluster(options = {}) {
       heartbeatTtlMs: options.heartbeatTtlMs ?? 3000,
       forwarding: options.forwarding ?? true,
       ackDelayMsByNodeId: options.ackDelayMsByNodeId ?? {},
+      useHeartbeatDurability: options.useHeartbeatDurability,
       durability: options.durability,
       revokedNodeIds: options.revokedNodeIds ?? []
     },
@@ -193,6 +195,9 @@ export async function createSwarmCluster(options = {}) {
       }
       if (this.options.durability) {
         nodeOptions.durability = this.options.durability
+      }
+      if (this.options.useHeartbeatDurability !== undefined) {
+        nodeOptions.useHeartbeatDurability = this.options.useHeartbeatDurability
       }
 
       const node = new HolepunchSwarmNode(nodeOptions)
