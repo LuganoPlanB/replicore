@@ -131,6 +131,38 @@ Committed voter authority does not come from the secret alone. A joining node
 starts as a learner and only becomes a voter after committed membership
 promotion.
 
+## Setup Wizard
+
+Start the local setup mode without joining a cluster:
+
+```powershell
+npm run start:setup -- .\data\node-1.json
+```
+
+Setup mode prints a `setup-ready` JSON object with:
+
+- local setup URL
+- requested config path
+- sibling draft path
+- whether the final config file already exists
+- HTTP bind address
+
+The setup server exposes a local web wizard and setup-only JSON routes such as:
+
+- `GET /setup/state`
+- `GET /setup/interfaces`
+- `POST /setup/derive-machine-id`
+- `GET /setup/draft`
+- `POST /setup/draft`
+
+### Setup Security Boundary
+
+- Setup mode binds to `127.0.0.1` by default.
+- Do not expose setup mode on a public interface.
+- The cluster secret and raw machine identity are sensitive inputs.
+- The setup draft file contains sensitive material and should stay on local operator-controlled storage.
+- Production use should treat setup mode as local console access, or expose it only through an operator-controlled tunnel with equivalent trust.
+
 ## CRUD
 
 Write:
