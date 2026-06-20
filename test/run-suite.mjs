@@ -29,6 +29,11 @@ const shards = [
     args: ["--test", "--test-concurrency=1"]
   },
   {
+    label: "node-rpc",
+    file: "test/node-rpc.test.js",
+    args: ["--test", "--test-concurrency=1"]
+  },
+  {
     label: "swarm-node-a",
     file: "test/swarm-node.test.js",
     args: ["--test", "--test-concurrency=1"],
