@@ -3059,6 +3059,16 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
         .every((node) => status.peerReplication[node.options.identity.publicKeyId]?.alive === true)
     })
 
+    const voterIds = authorizedNodes.map((n) => n.nodeId)
+    await waitFor(async () => {
+      const status = await currentLeaderNode.getReplicationStatus()
+      const aliveCount = voterIds.filter((id) => status?.peerReplication?.[id]?.alive === true).length
+      return aliveCount >= Math.ceil(voterIds.length / 2)
+    }, {
+      description: "leader has reachable quorum before first write",
+      timeout: 15_000
+    })
+
     await currentLeaderNode.put("hash:degraded-snapshot", { phase: "before-snapshot" })
     await currentLeaderNode.put("hash:degraded-delete", { phase: "before-delete" })
     await waitFor(async () => (await follower.get("hash:degraded-snapshot"))?.value?.phase === "before-snapshot")
