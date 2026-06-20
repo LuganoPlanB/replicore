@@ -352,6 +352,40 @@ test("setup JSON responses carry the shared security headers", { concurrency: fa
   }
 })
 
+test("setup HTTP internal errors are sanitized for clients and logged with the injected logger", { concurrency: false }, async () => {
+  const logs = []
+  const server = new SetupHttpServer({
+    logger: {
+      error(...args) {
+        logs.push(args)
+      }
+    },
+    state: async () => {
+      throw new Error("sensitive-setup-marker")
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const response = await fetch(`${baseUrl}/setup/state`)
+
+    assert.equal(response.status, 500)
+    assertJsonSecurityHeaders(response)
+    const payload = await response.json()
+    assert.deepEqual(payload, {
+      error: "Internal server error",
+      code: "INTERNAL_ERROR"
+    })
+    assert.ok(!JSON.stringify(payload).includes("sensitive-setup-marker"))
+    assert.equal(logs.length, 1)
+    assert.equal(logs[0][0], "setup http internal error")
+    assert.equal(logs[0][1].error?.message, "sensitive-setup-marker")
+  } finally {
+    await server.close()
+  }
+})
+
 test("setup http server persists and reloads setup drafts without exposing file paths", { concurrency: false }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-http-"))
   const draftPath = path.join(dir, "node.setup-draft.json")

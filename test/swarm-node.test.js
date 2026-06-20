@@ -4001,6 +4001,7 @@ test("HTTP JSON responses carry consistent security headers across success and e
   const server = new HolepunchHttpServer({
     node,
     maxBodySize: 32,
+    logger: { error() {}, warn() {} },
     auth: {
       tokens: {
         reader: { readKeyspaces: ["default"], writeKeyspaces: [] },
@@ -4010,6 +4011,7 @@ test("HTTP JSON responses carry consistent security headers across success and e
   })
   const rateLimitedServer = new HolepunchHttpServer({
     node,
+    logger: { error() {}, warn() {} },
     auth: {
       tokens: {
         reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
@@ -4084,6 +4086,52 @@ test("HTTP JSON responses carry consistent security headers across success and e
     assert.equal(limited.status, 429)
   } finally {
     await rateLimitedServer.close()
+  }
+})
+
+test("HTTP internal errors are sanitized for clients and logged with the injected logger", { concurrency: false }, async () => {
+  const logs = []
+  const node = {
+    async setHttpAddress() {},
+    async get() {
+      throw new Error("sensitive-http-marker")
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    logger: {
+      error(...args) {
+        logs.push(args)
+      }
+    },
+    auth: {
+      tokens: {
+        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+      }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const response = await fetch(`${baseUrl}/kv/${encodeURIComponent("explode")}?keyspace=default`, {
+      headers: {
+        authorization: "Bearer reader"
+      }
+    })
+
+    assert.equal(response.status, 500)
+    const payload = await response.json()
+    assert.deepEqual(payload, {
+      error: "Internal server error",
+      code: "INTERNAL_ERROR"
+    })
+    assert.ok(!JSON.stringify(payload).includes("sensitive-http-marker"))
+    assert.equal(logs.length, 1)
+    assert.equal(logs[0][0], "http internal error")
+    assert.equal(logs[0][1].error?.message, "sensitive-http-marker")
+  } finally {
+    await server.close()
   }
 })
 

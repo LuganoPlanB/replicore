@@ -203,7 +203,7 @@ export class HolepunchHttpServer {
         ? { error: "Internal server error", code: "INTERNAL_ERROR" }
         : this.#errorPayload(error)
       if (isInternalError) {
-        this.options.logger?.error?.("http internal error", { status, code: error?.code, message: error?.message?.slice(0, 200) })
+        this.options.logger?.error?.("http internal error", { status, code: error?.code, error })
       }
       return this.#sendError(res, status, payload, extraHeaders)
     }
