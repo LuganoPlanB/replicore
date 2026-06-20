@@ -25,6 +25,7 @@ import { NodeRpcRouter } from "./node-rpc.js"
 import { buildLeaderStatus, buildNodeStatus, buildReplicationStatus, buildWritersStatus } from "./node-status.js"
 import { validatePromotionCredential } from "./promotion-credential.js"
 import { ConsensusEngine, majoritySize } from "./raft-engine.js"
+import { RefusalErrors } from "./refusal-errors.js"
 import { SwarmNetwork } from "./swarm-network.js"
 import { deriveTopic } from "./config.js"
 import { deriveJoinKeyPair, resolveTransportIdentity } from "./transport-identity.js"
@@ -157,6 +158,20 @@ export class HolepunchSwarmNode {
     })
     this.electionState = this.consensusEngine.state
     this.closing = false
+    this._refusalErrors = new RefusalErrors({
+      consensusState: () => this.consensusState,
+      membershipState: () => this.membershipState,
+      splitState: () => this.splitState,
+      joinState: () => this.joinState,
+      role: () => this.#role(),
+      isLeaderReachable: (nodeId) => this.#isLeaderReachable(nodeId),
+      getPeerHint: (nodeId) => this.#peerHint(nodeId),
+      getEffectiveVoterNodeIds: () => this.#effectiveVoterNodeIds(),
+      network: () => this.network,
+      currentLeader: () => this.currentLeader(),
+      lastKnownLeaderId: () => this.#lastKnownLeaderId(),
+      localNodeId: this.options.identity.publicKeyId
+    })
   }
 
   async start() {
@@ -200,7 +215,7 @@ export class HolepunchSwarmNode {
           throw new Error("This node is not the current leader")
         }
         if (this.#membershipRole(message.from) !== "voter") {
-          throw this.#createLearnerWriteError()
+          throw this._refusalErrors.createLearnerWriteError()
         }
 
         return message.request.action === "put"
@@ -305,14 +320,14 @@ export class HolepunchSwarmNode {
    */
   async put(key, value, options = {}) {
     if (this.#isLearner()) {
-      throw this.#createLearnerWriteError()
+      throw this._refusalErrors.createLearnerWriteError()
     }
     await this.#refreshAuthoritativeMembership()
     if (this.#isSplitFenced()) {
-      throw this.#createSplitFencedError()
+      throw this._refusalErrors.createSplitFencedError()
     }
     if (await this.#shouldBlockForMembershipMismatch()) {
-      throw this.#createMembershipChangingError()
+      throw this._refusalErrors.createMembershipChangingError()
     }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "put", key, value, options })
@@ -327,14 +342,14 @@ export class HolepunchSwarmNode {
    */
   async delete(key, options = {}) {
     if (this.#isLearner()) {
-      throw this.#createLearnerWriteError()
+      throw this._refusalErrors.createLearnerWriteError()
     }
     await this.#refreshAuthoritativeMembership()
     if (this.#isSplitFenced()) {
-      throw this.#createSplitFencedError()
+      throw this._refusalErrors.createSplitFencedError()
     }
     if (await this.#shouldBlockForMembershipMismatch()) {
-      throw this.#createMembershipChangingError()
+      throw this._refusalErrors.createMembershipChangingError()
     }
     if (this.currentLeader() !== this.options.identity.publicKeyId) {
       return this.#forwardWrite({ action: "delete", key, options })
@@ -346,7 +361,7 @@ export class HolepunchSwarmNode {
   async qualifyClientWriteEntrypoint() {
     await this.#refreshAuthoritativeMembership()
     if (this.currentLeader() === this.options.identity.publicKeyId) {
-      throw this.#createNotWitnessEntrypointError()
+      throw this._refusalErrors.createNotWitnessEntrypointError()
     }
   }
 
@@ -1530,7 +1545,7 @@ export class HolepunchSwarmNode {
   async #appendKvOperation(type, key, value, options) {
     const quorumGroups = this.#writeQuorumGroups()
     if (!this.#hasReachableQuorum(quorumGroups)) {
-      throw this.#createDurabilityUnavailableError()
+      throw this._refusalErrors.createDurabilityUnavailableError()
     }
 
     if (!this.#usesSharedAuthoritativeLog()) {
@@ -1574,7 +1589,7 @@ export class HolepunchSwarmNode {
           if (this.closing) {
             throw new Error("Node is closing")
           }
-          const normalizedError = this.#normalizeDurabilityWaitError(error)
+          const normalizedError = this._refusalErrors.normalizeDurabilityWaitError(error)
           this.diagnosticState.lastRejectedWriteAt = new Date().toISOString()
           this.diagnosticState.lastRejectedWriteReason = normalizedError instanceof Error ? normalizedError.message : String(normalizedError)
           await this.#truncateUncommittedAuthoritativeTail()
@@ -1629,7 +1644,7 @@ export class HolepunchSwarmNode {
       if (this.closing) {
         throw new Error("Node is closing")
       }
-      const normalizedError = this.#normalizeDurabilityWaitError(error)
+      const normalizedError = this._refusalErrors.normalizeDurabilityWaitError(error)
       await this.view.markSkippedEntry(this.options.identity.feedKey, operation.seq)
       await this.view.setStagedEntryResolution(this.options.identity.feedKey, operation.seq, "rejected")
       await this.#runHeartbeat()
@@ -1642,21 +1657,21 @@ export class HolepunchSwarmNode {
 
   async #forwardWrite(request) {
     if (this.#isLearner()) {
-      throw this.#createLearnerWriteError()
+      throw this._refusalErrors.createLearnerWriteError()
     }
     if (this.#isSplitFenced()) {
-      throw this.#createSplitFencedError()
+      throw this._refusalErrors.createSplitFencedError()
     }
     if (!this.options.forwarding) {
       throw new Error("Write forwarding is disabled on this node")
     }
 
     const leader = this.currentLeader() ?? this.#lastKnownLeaderId()
-    if (!leader) throw this.#createLeaderUnavailableError()
+    if (!leader) throw this._refusalErrors.createLeaderUnavailableError()
 
     const peer = this.#peerForNodeId(leader)
     if (!peer) {
-      throw this.#createLeaderUnavailableError(`Current leader ${leader} is not reachable`, leader)
+      throw this._refusalErrors.createLeaderUnavailableError(`Current leader ${leader} is not reachable`, leader)
     }
 
     return this.rpc.forwardWrite({ targetNodeId: leader, peer, request })
@@ -2241,153 +2256,6 @@ export class HolepunchSwarmNode {
     })
   }
 
-  #createLearnerWriteError() {
-    return this.#createRefusalError({
-      code: "read-only-learner",
-      internalCode: "READ_ONLY_LEARNER",
-      statusCode: 403,
-      retryable: false,
-      message: "This node is a read-only learner and cannot accept or proxy writes"
-    })
-  }
-
-  #createSplitFencedError() {
-    return this.#createRefusalError({
-      code: "split-fenced",
-      internalCode: "SPLIT_FENCED",
-      statusCode: 503,
-      retryable: true,
-      message: "This node is split-fenced and is waiting to reconnect to the current leader",
-      leaderNodeId: this.#lastKnownLeaderId()
-    })
-  }
-
-  #createLeaderUnavailableError(
-    message = "No current leader is available",
-    leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId()
-  ) {
-    return this.#createRefusalError({
-      code: "leader-unreachable",
-      internalCode: "LEADER_UNREACHABLE",
-      statusCode: 503,
-      retryable: true,
-      message,
-      leaderNodeId
-    })
-  }
-
-  #createNotWitnessEntrypointError() {
-    return this.#createRefusalError({
-      code: "not-witness-entrypoint",
-      internalCode: "NOT_WITNESS_ENTRYPOINT",
-      statusCode: 503,
-      retryable: true,
-      message: "Direct leader-facing CRUD is not supported; send writes to a witness node",
-      leaderNodeId: this.currentLeader() ?? this.#lastKnownLeaderId()
-    })
-  }
-
-  #createMembershipChangingError(message = "Durability requirement not met: membership mismatch blocks degraded writes") {
-    return this.#createRefusalError({
-      code: "membership-changing",
-      internalCode: "MEMBERSHIP_CHANGING",
-      statusCode: 503,
-      retryable: true,
-      message
-    })
-  }
-
-  #createDurabilityUnavailableError(message = "Durability requirement not met: no reachable quorum available") {
-    return this.#createRefusalError({
-      code: "leader-unreachable",
-      internalCode: "DURABILITY_UNAVAILABLE",
-      statusCode: 503,
-      retryable: true,
-      message
-    })
-  }
-
-  #normalizeDurabilityWaitError(error) {
-    if (
-      typeof error?.message === "string" &&
-      error.message.startsWith("Timed out waiting for follower acknowledgement")
-    ) {
-      return this.#createDurabilityUnavailableError()
-    }
-    return error
-  }
-
-  #createJoinError(code, message, options = {}) {
-    return this.#createRefusalError({
-      code,
-      internalCode: options.internalCode ?? code.replace(/-/g, "_").toUpperCase(),
-      statusCode: options.statusCode ?? 400,
-      retryable: options.retryable ?? false,
-      message,
-      leaderNodeId: options.leaderNodeId ?? this.currentLeader() ?? this.#lastKnownLeaderId()
-    })
-  }
-
-  #createRefusalError({ code, internalCode, statusCode, retryable, message, leaderNodeId = this.currentLeader() ?? this.#lastKnownLeaderId() }) {
-    const error = new Error(message)
-    const refusal = {
-      code,
-      message,
-      retryable,
-      currentTerm: this.consensusState.currentTerm,
-      knownLeaderId: leaderNodeId ?? null,
-      leaderReachable: leaderNodeId ? this.#isLeaderReachable(leaderNodeId) : false,
-      splitStatus: { ...this.splitState },
-      commitIndex: this.consensusState.commitIndex,
-      membershipVersion: this.membershipState.current.version,
-      role: this.#role(),
-      reconnectHints: this.#refusalReconnectHints(leaderNodeId)
-    }
-    error.code = internalCode
-    error.statusCode = statusCode
-    error.leader = leaderNodeId ?? null
-    error.splitStatus = { ...this.splitState }
-    error.refusal = refusal
-    return error
-  }
-
-  #refusalReconnectHints(leaderNodeId) {
-    const recoveryLeaderHints = this.joinState.recovery?.leaderHints ?? null
-    const persistedLeaderHint = leaderNodeId ? this.#peerHint(leaderNodeId) : null
-    const leaderHint = leaderNodeId
-      ? {
-          nodeId: leaderNodeId,
-          peerPublicKey: this.network?.peerPublicKeyForNodeId(leaderNodeId)
-            ?? persistedLeaderHint?.peerPublicKey
-            ?? recoveryLeaderHints?.peerPublicKey
-            ?? null,
-          httpAddress: persistedLeaderHint?.httpAddress ?? recoveryLeaderHints?.httpAddress ?? null
-        }
-      : null
-    const witnesses = this.#witnessHintEntries(leaderNodeId)
-
-    return {
-      leader: leaderHint,
-      witnesses
-    }
-  }
-
-  #witnessHintEntries(leaderNodeId) {
-    return this.#effectiveVoterNodeIds()
-      .filter((nodeId) => nodeId !== this.options.identity.publicKeyId && nodeId !== leaderNodeId)
-      .map((nodeId) => {
-        const hint = this.#peerHint(nodeId)
-        return {
-          nodeId,
-          peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? hint?.peerPublicKey ?? null,
-          httpAddress: hint?.httpAddress ?? null,
-          reachable: this.#isLeaderReachable(nodeId)
-        }
-      })
-      .filter((hint) => hint.peerPublicKey || hint.httpAddress)
-      .sort((left, right) => left.nodeId.localeCompare(right.nodeId))
-  }
-
   async #loadPeerHints() {
     const now = Date.now()
     for await (const entry of this.consensusBee.createReadStream({
@@ -2441,7 +2309,7 @@ export class HolepunchSwarmNode {
       }
     } else {
       pushNodeIdPeerKey(leaderNodeId)
-      for (const witness of this.#witnessHintEntries(leaderNodeId)) {
+      for (const witness of this._refusalErrors.witnessHintEntries(leaderNodeId)) {
         pushPeerKey(witness.peerPublicKey)
       }
       for (const nodeId of this.#effectiveVoterNodeIds()) {
@@ -3032,7 +2900,7 @@ export class HolepunchSwarmNode {
         peerPublicKey: leaderNodeId ? (this.network?.peerPublicKeyForNodeId(leaderNodeId) ?? this.#peerHint(leaderNodeId)?.peerPublicKey ?? null) : null,
         httpAddress: leaderNodeId ? (this.#peerHint(leaderNodeId)?.httpAddress ?? null) : null
       },
-      witnessHints: this.#witnessHintEntries(leaderNodeId)
+      witnessHints: this._refusalErrors.witnessHintEntries(leaderNodeId)
     }
   }
 
@@ -3292,7 +3160,7 @@ export class HolepunchSwarmNode {
     const recovery = await this.#createRecoveryWatermark()
     if (currentLeader !== this.options.identity.publicKeyId) {
       const leaderHint = currentLeader ?? this.#lastKnownLeaderId()
-      const refusal = this.#createRefusalError({
+      const refusal = this._refusalErrors.createRefusalError({
         code: currentLeader ? "join-redirect" : "leader-unreachable",
         internalCode: currentLeader ? "JOIN_REDIRECT" : "LEADER_UNAVAILABLE",
         statusCode: 503,
@@ -3465,56 +3333,56 @@ export class HolepunchSwarmNode {
 
   async #validateJoinRequest(session, message) {
     if (message.v !== 1) {
-      throw this.#createJoinError("join-rejected", "Join request version must be 1")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request version must be 1")
     }
     if (message.type !== "replicore.join-request") {
-      throw this.#createJoinError("join-rejected", "Join request type must be replicore.join-request")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request type must be replicore.join-request")
     }
     if (message.clusterId !== this.options.clusterId) {
-      throw this.#createJoinError("join-wrong-cluster", "Join request clusterId does not match this cluster")
+      throw this._refusalErrors.createJoinError("join-wrong-cluster", "Join request clusterId does not match this cluster")
     }
     if (message.role !== "learner") {
-      throw this.#createJoinError("join-rejected", "Join request role must be learner")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request role must be learner")
     }
     if (typeof message.machineId !== "string" || !/^[0-9a-f]{64}$/i.test(message.machineId)) {
-      throw this.#createJoinError("join-rejected", "Join request machineId must be a 32-byte hex string")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request machineId must be a 32-byte hex string")
     }
     if (typeof message.identityPublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.identityPublicKey)) {
-      throw this.#createJoinError("join-rejected", "Join request identityPublicKey must be a 32-byte hex string")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request identityPublicKey must be a 32-byte hex string")
     }
     if (typeof message.feedKey !== "string" || !/^[0-9a-f]+$/i.test(message.feedKey)) {
-      throw this.#createJoinError("join-rejected", "Join request feedKey must be a hex string")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request feedKey must be a hex string")
     }
     if (typeof message.noisePublicKey !== "string" || !/^[0-9a-f]{64}$/i.test(message.noisePublicKey)) {
-      throw this.#createJoinError("join-rejected", "Join request noisePublicKey must be a 32-byte hex string")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request noisePublicKey must be a 32-byte hex string")
     }
     if (typeof message.nonce !== "string" || message.nonce.length === 0) {
-      throw this.#createJoinError("join-rejected", "Join request nonce is required")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request nonce is required")
     }
     if (typeof message.issuedAt !== "string") {
-      throw this.#createJoinError("join-rejected", "Join request issuedAt must be an ISO-8601 string")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request issuedAt must be an ISO-8601 string")
     }
     if (typeof message.signature !== "string" || message.signature.length === 0) {
-      throw this.#createJoinError("join-bad-signature", "Join request signature is required")
+      throw this._refusalErrors.createJoinError("join-bad-signature", "Join request signature is required")
     }
 
     const issuedAt = new Date(message.issuedAt)
     if (Number.isNaN(issuedAt.getTime())) {
-      throw this.#createJoinError("join-stale-request", "Join request issuedAt must be a valid ISO-8601 string")
+      throw this._refusalErrors.createJoinError("join-stale-request", "Join request issuedAt must be a valid ISO-8601 string")
     }
     if (Math.abs(Date.now() - issuedAt.getTime()) > JOIN_REQUEST_MAX_SKEW_MS) {
-      throw this.#createJoinError("join-stale-request", "Join request issuedAt is outside the allowed freshness window")
+      throw this._refusalErrors.createJoinError("join-stale-request", "Join request issuedAt is outside the allowed freshness window")
     }
 
     const replayKey = `${message.machineId}:${message.nonce}`
     if (this.seenJoinRequestNonces.has(replayKey)) {
-      throw this.#createJoinError("join-replay", "Join request nonce was already used")
+      throw this._refusalErrors.createJoinError("join-replay", "Join request nonce was already used")
     }
 
     const identityPublicKey = Buffer.from(message.identityPublicKey, "hex")
     const feedKey = Hypercore.key(identityPublicKey).toString("hex")
     if (feedKey !== message.feedKey) {
-      throw this.#createJoinError("join-rejected", "Join request feedKey does not match the supplied identity public key")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request feedKey does not match the supplied identity public key")
     }
 
     const derivedJoinIdentity = await deriveJoinKeyPair({
@@ -3540,24 +3408,24 @@ export class HolepunchSwarmNode {
         message.signature
       )
     ) {
-      throw this.#createJoinError("join-bad-signature", "Join request signature is invalid")
+      throw this._refusalErrors.createJoinError("join-bad-signature", "Join request signature is invalid")
     }
 
     const liveNoisePublicKey = session.conn.remotePublicKey.toString("hex")
     if (liveNoisePublicKey !== message.noisePublicKey) {
-      throw this.#createJoinError("join-rejected", "Join request noisePublicKey does not match the live connection")
+      throw this._refusalErrors.createJoinError("join-rejected", "Join request noisePublicKey does not match the live connection")
     }
 
     const nodeId = keyIdFromPublicKey(identityPublicKey)
     const existingPeerHint = this.#peerHint(nodeId)
     if (existingPeerHint?.machineId && existingPeerHint.machineId !== message.machineId) {
-      throw this.#createJoinError(
+      throw this._refusalErrors.createJoinError(
         "join-rejected",
         "Join request machineId does not match the existing node identity"
       )
     }
     if (existingPeerHint?.peerPublicKey && existingPeerHint.peerPublicKey !== message.noisePublicKey) {
-      throw this.#createJoinError(
+      throw this._refusalErrors.createJoinError(
         "join-rejected",
         "Join request noisePublicKey does not match the existing node identity"
       )
@@ -3565,14 +3433,14 @@ export class HolepunchSwarmNode {
 
     const existingMachineBinding = this.#peerHintByMachineId(message.machineId)
     if (existingMachineBinding && existingMachineBinding.nodeId !== nodeId) {
-      throw this.#createJoinError(
+      throw this._refusalErrors.createJoinError(
         "join-rejected",
         `Machine identity ${message.machineId} is already bound to node ${existingMachineBinding.nodeId}`
       )
     }
 
     if (this.#currentMembershipRole(nodeId) === "removed" || this.#isRevokedNode(nodeId)) {
-      throw this.#createJoinError(
+      throw this._refusalErrors.createJoinError(
         "join-rejected",
         "Removed node identities cannot rejoin through learner admission",
         { internalCode: "REMOVED_IDENTITY", statusCode: 403, retryable: false }
