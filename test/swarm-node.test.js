@@ -1056,6 +1056,7 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
       publicKey: identity.publicKey,
       feedKey: identity.feedKey
     }))
+    const requestTimeoutMs = 15_000
 
     for (const identity of [leaderIdentity, follower1Identity, follower2Identity]) {
       const node = new HolepunchSwarmNode({
@@ -1065,7 +1066,8 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
         identity,
         authorizedNodes,
         encryptionKey,
-        bootstrap: testnet.bootstrap
+        bootstrap: testnet.bootstrap,
+        requestTimeoutMs
       })
       nodes.push(node)
     }
