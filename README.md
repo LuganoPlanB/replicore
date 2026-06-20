@@ -6,9 +6,9 @@ Replicore is an app running on remote servers to form a dynamically extensible n
 
 
 The nodes may have three roles:
-2. Notary: is the primary node by election, the only one who can write
-3. Witness: eligible as candidate for next elections, read-only and transparent proxy to the Notary on writes
-4. Archivist: needs authorization to become a Witness and provides read-only access.
+1. **Notary**: is the primary node by election, the only one who can write
+2. **Witness**: eligible as candidate for next elections, read-only and transparent proxy to the Notary on writes
+3. **Archivist**: needs authorization to become a Witness and provides read-only access.
 
 Replicore implements a small multi-node service with these properties:
 - The data is stored as append-only feed that that can reconcile after network splits.
@@ -48,29 +48,9 @@ Replicore is intended for non-Byzantine production use only within the boundarie
 - Shared-secret compromise rotation and automatic cluster-wide recovery
 - Byzantine fault tolerance
 
-## Requirements
-
-- Node.js 24.6 or newer
-- npm
-
-## Releases
-
-Releases are managed by GitHub Actions after the `Tests` workflow passes on
-`main`.
-
-Commits on `main` are interpreted with Conventional Commits:
-
-- `fix: ...` creates a patch release.
-- `feat: ...` creates a minor release.
-- `feat!: ...`, `fix!: ...`, or a `BREAKING CHANGE:` footer creates a major release.
-
-When releasable commits are present, the release workflow bumps `package.json`,
-updates `package-lock.json`, writes `CHANGELOG.md`, commits the release, creates
-the `vX.Y.Z` tag, and publishes a GitHub release.
-
 ## Install
 
-```powershell
+```
 npm install
 ```
 
@@ -78,13 +58,13 @@ npm install
 
 Start a local HyperDHT bootstrap node:
 
-```powershell
+```
 npm run start:bootstrap
 ```
 
 For a fresh cluster, bootstrap one explicit initializer:
 
-```powershell
+```
 npm run start:node -- examples/local/init-node.json
 npm run start:node -- examples/local/init-joiner.json
 ```
@@ -95,7 +75,7 @@ implicitly creating a second voter cluster.
 
 Start three swarm nodes in separate terminals:
 
-```powershell
+```
 npm run start:node -- examples/local/node-1.json
 npm run start:node -- examples/local/node-2.json
 npm run start:node -- examples/local/node-3.json
@@ -108,7 +88,7 @@ cluster. The explicit fresh-cluster bootstrap path is `examples/local/init-node.
 Start a fourth node and let it join as a learner without editing the existing
 voter configs:
 
-```powershell
+```
 npm run start:node -- examples/local/joiner.json
 ```
 
@@ -135,7 +115,7 @@ promotion.
 
 Start the local setup mode without joining a cluster:
 
-```powershell
+```
 npm run start:setup -- .\data\node-1.json
 ```
 
@@ -167,7 +147,7 @@ The setup server exposes a local web wizard and setup-only JSON routes such as:
 
 Write:
 
-```powershell
+```
 curl -X PUT "http://127.0.0.1:3001/kv/hash:abc?keyspace=default" `
   -H "authorization: Bearer writer" `
   -H "content-type: application/json" `
@@ -176,21 +156,21 @@ curl -X PUT "http://127.0.0.1:3001/kv/hash:abc?keyspace=default" `
 
 Read:
 
-```powershell
+```
 curl "http://127.0.0.1:3002/kv/hash:abc?keyspace=default" `
   -H "authorization: Bearer reader"
 ```
 
 Delete:
 
-```powershell
+```
 curl -X DELETE "http://127.0.0.1:3003/kv/hash:abc?keyspace=default" `
   -H "authorization: Bearer writer"
 ```
 
 History:
 
-```powershell
+```
 curl "http://127.0.0.1:3001/kv/hash:abc/history?keyspace=default" `
   -H "authorization: Bearer reader"
 ```
@@ -199,19 +179,19 @@ curl "http://127.0.0.1:3001/kv/hash:abc/history?keyspace=default" `
 
 Replication:
 
-```powershell
+```
 curl "http://127.0.0.1:3001/status/replication"
 ```
 
 Writers:
 
-```powershell
+```
 curl "http://127.0.0.1:3001/status/writers"
 ```
 
 Leader:
 
-```powershell
+```
 curl "http://127.0.0.1:3001/status/leader"
 ```
 
@@ -219,19 +199,19 @@ curl "http://127.0.0.1:3001/status/leader"
 
 Export a snapshot from a live node:
 
-```powershell
+```
 npm run snapshot -- export http://127.0.0.1:3001 admin .\tmp\snapshot.json
 ```
 
 Import a snapshot into a live node:
 
-```powershell
+```
 npm run snapshot -- import http://127.0.0.1:3001 admin .\tmp\snapshot.json
 ```
 
 Rotate the active encryption key on a live node:
 
-```powershell
+```
 curl -X POST "http://127.0.0.1:3001/admin/encryption/rotate" `
   -H "authorization: Bearer admin" `
   -H "content-type: application/json" `
@@ -324,19 +304,19 @@ If you already have static configs:
 
 ## Tests
 
-```powershell
+```
 npm test
 ```
 
 Longer local reliability pass:
 
-```powershell
+```
 npm run test:reliability
 ```
 
 Example bounded reliability profile:
 
-```powershell
+```
 $env:REPLICORE_TEST_ROUNDS=2
 $env:REPLICORE_TEST_TIMEOUT_MS=180000
 $env:REPLICORE_TEST_PATTERN="offline leader|isolated leader|isolated follower|concurrent writes|bootstrap outage|restarted follower stays disconnected|follower write forwarding|deterministic churn"
@@ -390,8 +370,3 @@ Operators must still treat these as hard limits:
 - clients that need freshest reads must use a leader-connected path or otherwise require a strong-read policy above the current API
 - do not initialize two independent clusters with the same `clusterSecret`; a fresh cluster must use one explicit `initCluster: true` voter and all other same-secret nodes must join as learners
 
-Not covered:
-
-- malevolent or Byzantine nodes
-- automatic shared-secret rotation and compromise recovery
-- production auth, backup lifecycle, or deployment packaging
