@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import semver from "semver"
 
 const config = JSON.parse(readFileSync(".github/release-config.json", "utf8"))
 const tagPrefix = config.tagPrefix ?? "v"
@@ -86,7 +87,9 @@ function latestSemverTag() {
   const tags = git("tag", "--list", `${tagPrefix}[0-9]*`, "--sort=-v:refname")
     .split("\n")
     .filter(Boolean)
-  return tags.find((tag) => semverPattern().test(tag)) ?? null
+    .filter((tag) => semver.valid(tag.slice(tagPrefix.length)))
+    .sort((left, right) => semver.rcompare(left.slice(tagPrefix.length), right.slice(tagPrefix.length)))
+  return tags[0] ?? null
 }
 
 function tagExists(tag) {
@@ -135,22 +138,17 @@ function planRelease(currentVersion, commits) {
       : "patch"
 
   return {
-    version: bumpVersion(currentVersion, bump),
+    version: nextVersion(currentVersion, bump),
     date: new Date().toISOString().slice(0, 10),
     bump,
     entries
   }
 }
 
-function bumpVersion(version, bump) {
-  const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/)
-  if (!match) throw new Error(`Unsupported semver version: ${version}`)
-  const major = Number(match[1])
-  const minor = Number(match[2])
-  const patch = Number(match[3])
-  if (bump === "major") return `${major + 1}.0.0`
-  if (bump === "minor") return `${major}.${minor + 1}.0`
-  return `${major}.${minor}.${patch + 1}`
+function nextVersion(version, bump) {
+  const next = semver.inc(version, bump)
+  if (!next) throw new Error(`Unsupported semver version: ${version}`)
+  return next
 }
 
 function renderChangelogEntry(release) {
@@ -191,14 +189,6 @@ function createGitHubRelease(tag, notes) {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
-}
-
-function semverPattern() {
-  return new RegExp(`^${escapeRegExp(tagPrefix)}\\d+\\.\\d+\\.\\d+$`)
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 function git(...args) {

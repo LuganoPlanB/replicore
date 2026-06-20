@@ -18,5 +18,8 @@
     "hypercore-crypto": "^3.4.2",
     "hyperdht": "^6.32.0",
     "hyperswarm": "^4.17.0"
+  },
+  "devDependencies": {
+    "semver": "^7.8.5"
   }
 }
