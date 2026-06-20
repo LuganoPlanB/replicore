@@ -104,7 +104,8 @@ const shards = [
       "HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD calls",
       "HTTP admin routes validate bodies before node admin calls",
       "HTTP error payload suppresses internal cluster state in refusal responses",
-      "HTTP rate limiting returns 429 after exceeding per-IP write budget"
+      "HTTP rate limiting returns 429 after exceeding per-IP write budget",
+      "HTTP rate limit logging omits authorization tokens"
     ]
   },
   {
