@@ -1,5 +1,12 @@
 import http from "node:http"
 import { readJsonBody } from "./http/body.js"
+import {
+  rejectUnknownKeys,
+  requirePlainObject,
+  validateJsonValue,
+  validateKvKey,
+  validateKeyspace
+} from "./http/validation.js"
 
 /**
  * Minimal authorized HTTP surface for the swarm node.
@@ -80,8 +87,8 @@ export class HolepunchHttpServer {
       const match = url.pathname.match(/^\/kv\/([^/]+)(\/history)?$/)
 
       if (match) {
-        const key = decodeURIComponent(match[1])
-        const keyspace = url.searchParams.get("keyspace") ?? "default"
+        const key = validateKvKey(decodeURIComponent(match[1]))
+        const keyspace = validateKeyspace(url.searchParams.get("keyspace") ?? "default")
 
         if (req.method === "GET" && match[2] === "/history") {
           this.#authorize(req, keyspace, "read")
@@ -104,9 +111,17 @@ export class HolepunchHttpServer {
         if (req.method === "PUT") {
           this.#authorize(req, keyspace, "write")
           this.#checkRateLimit(req, "writes")
+          const body = requirePlainObject(await this.#readJson(req), "Request body")
+          rejectUnknownKeys(body, ["value"])
+          if (!Object.hasOwn(body, "value")) {
+            const error = new Error("Request body must include value")
+            error.code = "INVALID_REQUEST"
+            error.statusCode = 400
+            throw error
+          }
+          const value = validateJsonValue(body.value)
           await this.options.node.qualifyClientWriteEntrypoint()
-          const body = await this.#readJson(req)
-          const operation = await this.options.node.put(key, body.value, { keyspace })
+          const operation = await this.options.node.put(key, value, { keyspace })
           return this.#json(res, 200, operation)
         }
 

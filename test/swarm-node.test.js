@@ -3709,7 +3709,7 @@ test("HTTP malformed JSON returns 400 without calling node handlers and later va
     const malformedWritePayload = await malformedWrite.json()
     assert.equal(malformedWritePayload.code, "INVALID_JSON")
     assert.equal(malformedWritePayload.error, "Invalid JSON body")
-    assert.equal(calls.qualifyClientWriteEntrypoint, 1)
+    assert.equal(calls.qualifyClientWriteEntrypoint, 0)
     assert.equal(calls.put, 0)
     assert.ok(!JSON.stringify(malformedWritePayload).includes("SyntaxError"))
 
@@ -3744,6 +3744,122 @@ test("HTTP malformed JSON returns 400 without calling node handlers and later va
     const validRotatePayload = await validRotate.json()
     assert.deepEqual(validRotatePayload, { ok: true, keyId: "rotated" })
     assert.equal(calls.rotateEncryptionKey, 1)
+  } finally {
+    await server.close()
+  }
+})
+
+test("HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD calls", { concurrency: false }, async () => {
+  const calls = {
+    get: 0,
+    getHistory: 0,
+    qualifyClientWriteEntrypoint: 0,
+    put: 0,
+    delete: 0
+  }
+  const node = {
+    async setHttpAddress() {},
+    async get(key, options) {
+      calls.get += 1
+      return { key, keyspace: options.keyspace, value: { ok: true } }
+    },
+    async getHistory() {
+      calls.getHistory += 1
+      return [{ type: "put" }]
+    },
+    async qualifyClientWriteEntrypoint() {
+      calls.qualifyClientWriteEntrypoint += 1
+    },
+    async put(key, value, options) {
+      calls.put += 1
+      return {
+        opId: "crud-put-op",
+        actor: "stub-node",
+        type: "put",
+        key,
+        keyspace: options.keyspace,
+        value
+      }
+    },
+    async delete(key, options) {
+      calls.delete += 1
+      return {
+        opId: "crud-delete-op",
+        actor: "stub-node",
+        type: "delete",
+        key,
+        keyspace: options.keyspace
+      }
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    auth: {
+      tokens: {
+        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
+        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+      }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const invalidGet = await requestJson(`${baseUrl}/kv/${encodeURIComponent("bad/key")}?keyspace=default`, {
+      token: "reader"
+    })
+    assert.equal(invalidGet.status, 400)
+    assert.equal(invalidGet.payload.code, "INVALID_REQUEST")
+    assert.equal(calls.get, 0)
+
+    const invalidHistory = await requestJson(`${baseUrl}/kv/good/history?keyspace=bad%20space`, {
+      token: "reader"
+    })
+    assert.equal(invalidHistory.status, 400)
+    assert.equal(invalidHistory.payload.code, "INVALID_REQUEST")
+    assert.equal(calls.getHistory, 0)
+
+    const missingValue = await requestJson(`${baseUrl}/kv/good?keyspace=default`, {
+      method: "PUT",
+      token: "writer",
+      body: {}
+    })
+    assert.equal(missingValue.status, 400)
+    assert.equal(missingValue.payload.code, "INVALID_REQUEST")
+    assert.equal(calls.qualifyClientWriteEntrypoint, 0)
+    assert.equal(calls.put, 0)
+
+    const unknownPutField = await requestJson(`${baseUrl}/kv/good?keyspace=default`, {
+      method: "PUT",
+      token: "writer",
+      body: { value: { ok: true }, extra: true }
+    })
+    assert.equal(unknownPutField.status, 400)
+    assert.equal(unknownPutField.payload.code, "INVALID_REQUEST")
+    assert.equal(calls.qualifyClientWriteEntrypoint, 0)
+    assert.equal(calls.put, 0)
+
+    const validGet = await requestJson(`${baseUrl}/kv/good?keyspace=default`, {
+      token: "reader"
+    })
+    expectCommittedValue(validGet, { ok: true })
+    assert.equal(calls.get, 1)
+
+    const validHistory = await requestJson(`${baseUrl}/kv/good/history?keyspace=default`, {
+      token: "reader"
+    })
+    assert.equal(validHistory.status, 200)
+    assert.equal(calls.getHistory, 1)
+
+    const validPut = await putValue(baseUrl, "good", { ok: true })
+    expectCommittedOperation(validPut, { type: "put", key: "good", keyspace: "default" })
+    assert.equal(calls.qualifyClientWriteEntrypoint, 1)
+    assert.equal(calls.put, 1)
+
+    const validDelete = await deleteValue(baseUrl, "good")
+    expectCommittedOperation(validDelete, { type: "delete", key: "good", keyspace: "default" })
+    assert.equal(calls.delete, 1)
   } finally {
     await server.close()
   }

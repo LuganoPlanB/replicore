@@ -96,6 +96,7 @@ const shards = [
       "closing a leader rejects a delayed durability wait without leaving a live timer behind",
       "HTTP body size limit enforces maximum request body size through Content-Length header",
       "HTTP malformed JSON returns 400 without calling node handlers and later valid requests still work",
+      "HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD calls",
       "HTTP error payload suppresses internal cluster state in refusal responses",
       "HTTP rate limiting returns 429 after exceeding per-token write budget"
     ]
