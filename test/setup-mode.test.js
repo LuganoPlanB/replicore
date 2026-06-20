@@ -244,6 +244,76 @@ test("setup http server rejects invalid machine-id derivation input", { concurre
   }
 })
 
+test("setup http server rejects malformed JSON without calling deriveMachineId", { concurrency: false }, async () => {
+  let deriveCalls = 0
+  const server = new SetupHttpServer({
+    deriveMachineId: async () => {
+      deriveCalls += 1
+      return Buffer.alloc(32)
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const clusterSecret = "ab".repeat(32)
+    const machineIdentity = "machine-a"
+    const response = await fetch(`${baseUrl}/setup/derive-machine-id`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: `{"clusterSecret":"${clusterSecret}","machineIdentity":"${machineIdentity}"`
+    })
+
+    assert.equal(response.status, 400)
+    const payload = await response.json()
+    assert.deepEqual(payload, { error: "Invalid JSON body" })
+    assert.equal(deriveCalls, 0)
+    assert.ok(!JSON.stringify(payload).includes(clusterSecret))
+    assert.ok(!JSON.stringify(payload).includes(machineIdentity))
+  } finally {
+    await server.close()
+  }
+})
+
+test("setup http server rejects oversized draft bodies before saveDraft", { concurrency: false }, async () => {
+  let saveCalls = 0
+  const server = new SetupHttpServer({
+    loadDraft: async () => null,
+    saveDraft: async () => {
+      saveCalls += 1
+      return {}
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const hugeBody = JSON.stringify({
+      clusterSecret: "aa".repeat(32),
+      machineIdentity: "machine-a",
+      draft: "x".repeat(70 * 1024)
+    })
+    const response = await fetch(`${baseUrl}/setup/draft`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: hugeBody
+    })
+
+    assert.equal(response.status, 413)
+    const payload = await response.json()
+    assert.equal(payload.error, "Request body too large")
+    assert.equal(saveCalls, 0)
+    assert.ok(!JSON.stringify(payload).includes("aa".repeat(32)))
+    assert.ok(!JSON.stringify(payload).includes("machine-a"))
+  } finally {
+    await server.close()
+  }
+})
+
 test("setup http server persists and reloads setup drafts without exposing file paths", { concurrency: false }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-http-"))
   const draftPath = path.join(dir, "node.setup-draft.json")
