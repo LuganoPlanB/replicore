@@ -2489,28 +2489,14 @@ test("HTTP witness CRUD keeps writes on the leader-connected side during a split
   try {
     await cluster.startAll()
 
-    await waitFor(
-      async () => cluster.nodes.every((node) => node.status.knownHeartbeats.length >= 3),
-      {
-        description: "cluster convergence before HTTP durability test",
-        onTimeout: () => collectClusterDiagnostics(cluster)
-      }
-    )
-
-    const leaderId = currentLeaderId(cluster)
+    const leaderId = await waitForClusterLeader(cluster, "leader convergence before HTTP durability test", {
+      timeoutMs: 30000
+    })
     const [minorityWitnessId, majorityWitnessId, ...majorityFollowerIds] = liveFollowerIds(cluster, leaderId)
     const minorityWitness = cluster.record(minorityWitnessId).node
     const majorityWitness = cluster.record(majorityWitnessId).node
     const majorityNodeIds = [leaderId, majorityWitnessId, ...majorityFollowerIds]
     const majorityNodes = majorityNodeIds.map((nodeId) => cluster.record(nodeId).node)
-
-    await waitFor(
-      async () => cluster.nodes.every((node) => node.currentLeader() === leaderId),
-      {
-        description: "leader convergence before HTTP durability test",
-        onTimeout: () => collectClusterDiagnostics(cluster)
-      }
-    )
 
     for (const node of [majorityWitness, minorityWitness]) {
       const server = new HolepunchHttpServer({
@@ -2954,7 +2940,7 @@ function currentLeaderId(cluster) {
   return cluster.identities.map((identity) => identity.publicKeyId).sort()[0]
 }
 
-async function waitForClusterLeader(cluster, description) {
+async function waitForClusterLeader(cluster, description, options = {}) {
   let leaderId = null
   await waitFor(
     async () => {
@@ -2962,6 +2948,7 @@ async function waitForClusterLeader(cluster, description) {
       return leaderId !== null && cluster.nodes.every((node) => node.currentLeader() === leaderId)
     },
     {
+      timeoutMs: options.timeoutMs,
       description,
       onTimeout: () => collectClusterDiagnostics(cluster)
     }
