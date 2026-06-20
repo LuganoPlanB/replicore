@@ -9,13 +9,13 @@ export class HolepunchHttpServer {
    *   node: import("./node.js").HolepunchSwarmNode,
    *   host?: string,
    *   port?: number,
-  *   auth?: {
-  *     tokens: Record<string, {
-  *       admin?: boolean,
-  *       readKeyspaces?: string[],
-  *       writeKeyspaces?: string[]
-  *     }>
-  *   }
+   *   auth?: {
+   *     tokens: Record<string, {
+   *       admin?: boolean,
+   *       readKeyspaces?: string[],
+   *       writeKeyspaces?: string[]
+   *     }>
+   *   }
    * }} options
    */
   constructor(options) {
@@ -24,10 +24,16 @@ export class HolepunchHttpServer {
       port: 0,
       auth: { tokens: {} },
       maxBodySize: 64 * 1024,
+      rateLimit: options?.rateLimit ?? {
+        writes: { max: 60, windowMs: 60_000 },
+        admin: { max: 10, windowMs: 60_000 },
+        reads: { max: 600, windowMs: 60_000 }
+      },
       ...options
     }
     this.server = null
     this.sockets = new Set()
+    this.rateLimitBuckets = new Map()
   }
 
   async start() {
@@ -78,6 +84,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "GET" && match[2] === "/history") {
           this.#authorize(req, keyspace, "read")
+          this.#checkRateLimit(req, "reads")
           return this.#json(res, 200, {
             key,
             keyspace,
@@ -87,6 +94,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "GET") {
           this.#authorize(req, keyspace, "read")
+          this.#checkRateLimit(req, "reads")
           const value = await this.options.node.get(key, { keyspace })
           if (!value) return this.#json(res, 404, { error: "Not found" })
           return this.#json(res, 200, value)
@@ -94,6 +102,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "PUT") {
           this.#authorize(req, keyspace, "write")
+          this.#checkRateLimit(req, "writes")
           await this.options.node.qualifyClientWriteEntrypoint()
           const body = await this.#readJson(req)
           const operation = await this.options.node.put(key, body.value, { keyspace })
@@ -102,6 +111,7 @@ export class HolepunchHttpServer {
 
         if (req.method === "DELETE") {
           this.#authorize(req, keyspace, "write")
+          this.#checkRateLimit(req, "writes")
           await this.options.node.qualifyClientWriteEntrypoint()
           const operation = await this.options.node.delete(key, { keyspace })
           return this.#json(res, 200, operation)
@@ -109,24 +119,29 @@ export class HolepunchHttpServer {
       }
 
       if (req.method === "GET" && url.pathname === "/status/replication") {
+        this.#checkRateLimit(req, "reads")
         return this.#json(res, 200, await this.options.node.getReplicationStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/status/writers") {
+        this.#checkRateLimit(req, "reads")
         return this.#json(res, 200, this.options.node.getWritersStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/status/leader") {
+        this.#checkRateLimit(req, "reads")
         return this.#json(res, 200, await this.options.node.getLeaderStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/admin/snapshot") {
         this.#authorizeAdmin(req)
+        this.#checkRateLimit(req, "admin")
         return this.#json(res, 200, await this.options.node.createSnapshot())
       }
 
       if (req.method === "POST" && url.pathname === "/admin/snapshot/import") {
         this.#authorizeAdmin(req)
+        this.#checkRateLimit(req, "admin")
         const body = await this.#readJson(req, 1024 * 1024)
         await this.options.node.restoreSnapshot(body)
         return this.#json(res, 200, { ok: true })
@@ -134,6 +149,7 @@ export class HolepunchHttpServer {
 
       if (req.method === "POST" && url.pathname === "/admin/encryption/rotate") {
         this.#authorizeAdmin(req)
+        this.#checkRateLimit(req, "admin")
         const body = await this.#readJson(req)
         return this.#json(res, 200, {
           ok: true,
@@ -144,7 +160,8 @@ export class HolepunchHttpServer {
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
-      return this.#json(res, status, this.#errorPayload(error))
+      const extraHeaders = error?.retryAfter ? { "retry-after": String(error.retryAfter) } : undefined
+      return this.#json(res, status, this.#errorPayload(error), extraHeaders)
     }
   }
 
@@ -187,6 +204,46 @@ export class HolepunchHttpServer {
     const header = req.headers.authorization ?? ""
     const token = header.startsWith("Bearer ") ? header.slice(7) : null
     return token ? this.options.auth.tokens[token] ?? null : null
+  }
+
+  #checkRateLimit(req, category) {
+    if (Object.keys(this.options.auth.tokens).length === 0) return
+
+    const token = this.#extractToken(req)
+    if (!token) return
+
+    const limits = this.options.rateLimit ?? { reads: { max: 600, windowMs: 60_000 } }
+    const defaults = { max: 600, windowMs: 60_000 }
+    const limit = limits[category] ?? limits.reads ?? defaults
+    const { max, windowMs } = limit
+
+    let buckets = this.rateLimitBuckets.get(token)
+    if (!buckets) {
+      buckets = { writes: [], admin: [], reads: [] }
+      this.rateLimitBuckets.set(token, buckets)
+    }
+
+    const timestamps = buckets[category]
+    const now = Date.now()
+    while (timestamps.length > 0 && timestamps[0] < now - windowMs) {
+      timestamps.shift()
+    }
+
+    if (timestamps.length >= max) {
+      const retryAfter = Math.ceil((timestamps[0] + windowMs - now) / 1000)
+      const error = new Error("Too Many Requests")
+      error.code = "TOO_MANY_REQUESTS"
+      error.statusCode = 429
+      error.retryAfter = retryAfter
+      throw error
+    }
+
+    timestamps.push(now)
+  }
+
+  #extractToken(req) {
+    const header = req.headers.authorization ?? ""
+    return header.startsWith("Bearer ") ? header.slice(7) : null
   }
 
   async #readJson(req, maxSize = this.options.maxBodySize) {
@@ -251,12 +308,13 @@ export class HolepunchHttpServer {
     return payload
   }
 
-  #json(res, statusCode, payload) {
+  #json(res, statusCode, payload, extraHeaders) {
     const body = JSON.stringify(payload)
     res.writeHead(statusCode, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(body),
-      "connection": "close"
+      "connection": "close",
+      ...(extraHeaders ?? {})
     })
     res.end(body)
   }

@@ -44,7 +44,7 @@ const steps = [
       "--test",
       "--test-concurrency=1",
       "--test-name-pattern",
-      "snapshot restore rejects tampered|operation validation rejects mismatched|operation validation rejects inconsistent|operation validation rejects revoked|logical log link validation|sync rejects a feed entry with a bad|sync rejects a feed entry with a corrupted|encryption rotation preserves|fresh node can restore current state|restored node can serve snapshot reads|replication status exposes staged|concurrent leader appends|follower keeps a replicated write staged|committed feed progress survives|staged delete stays out|closing a leader rejects|HTTP body size limit|HTTP error payload suppresses",
+      "snapshot restore rejects tampered|operation validation rejects mismatched|operation validation rejects inconsistent|operation validation rejects revoked|logical log link validation|sync rejects a feed entry with a bad|sync rejects a feed entry with a corrupted|encryption rotation preserves|fresh node can restore current state|restored node can serve snapshot reads|replication status exposes staged|concurrent leader appends|follower keeps a replicated write staged|committed feed progress survives|staged delete stays out|closing a leader rejects|HTTP body size limit|HTTP error payload suppresses|HTTP rate limiting",
       "test/swarm-node.test.js"
     ]
   },
