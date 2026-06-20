@@ -1734,7 +1734,7 @@ test(
   }
 )
 
-test("timed-out local append stays uncommitted across leader restart and later healthy writes", { concurrency: false }, async () => {
+test("failed local write stays uncommitted across leader restart and later healthy writes", { concurrency: false }, async () => {
   const identities = createIdentities(3, ["timeout-leader", "timeout-follower-a", "timeout-follower-b"])
   const leaderId = identities.map((identity) => identity.publicKeyId).sort()[0]
   const ackDelayMsByNodeId = Object.fromEntries(
@@ -1767,13 +1767,28 @@ test("timed-out local append stays uncommitted across leader restart and later h
       }
     )
 
+    let refusal = null
     await assert.rejects(
-      originalLeader.put("hash:timed-out-local", { blocked: true }),
-      /Timed out waiting for follower acknowledgement/
+      (async () => {
+        try {
+          await originalLeader.put("hash:timed-out-local", { blocked: true })
+        } catch (error) {
+          refusal = error
+          throw error
+        }
+      })(),
+      /Durability requirement not met: no reachable quorum available/
     )
+    assert.equal(refusal?.code, "DURABILITY_UNAVAILABLE")
 
     await waitFor(
-      async () => (await originalLeader.getReplicationStatus()).authoritativeLog.stagedTail.count === 0,
+      async () => {
+        const status = await originalLeader.getReplicationStatus()
+        return (
+          status.authoritativeLog.stagedTail.count === 0 &&
+          status.authoritativeLog.uncommittedTailLength === 0
+        )
+      },
       {
         description: "timed-out local append is removed from the uncommitted authoritative tail",
         onTimeout: () => originalLeader.getReplicationStatus()
@@ -1782,7 +1797,9 @@ test("timed-out local append stays uncommitted across leader restart and later h
 
     assert.equal(await originalLeader.get("hash:timed-out-local"), null)
     assert.deepEqual(await originalLeader.getHistory("hash:timed-out-local"), [])
-    assert.ok((await originalLeader.createSnapshot()).entries.every((entry) => !String(entry.key).includes("/staged/")))
+    const snapshot = await originalLeader.createSnapshot()
+    const snapshotEntries = snapshot.content?.entries ?? snapshot.entries ?? []
+    assert.ok(snapshotEntries.every((entry) => !String(entry.key).includes("/staged/")))
 
     const restartedLeader = await cluster.restartNode(leaderId)
     await waitFor(
