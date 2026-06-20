@@ -1,6 +1,7 @@
 import http from "node:http"
 
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
+import { listNetworkInterfaces } from "./setup/network-interfaces.js"
 import { normalizeSetupMachineIdInput } from "./setup-validation.js"
 
 /**
@@ -13,6 +14,7 @@ export class SetupHttpServer {
    *   port?: number,
    *   state?: () => Promise<unknown> | unknown,
    *   deriveMachineId?: typeof deriveMachineId,
+   *   listNetworkInterfaces?: typeof listNetworkInterfaces,
    *   loadDraft?: () => Promise<unknown>,
    *   saveDraft?: (draft: unknown) => Promise<unknown>
    * }} [options]
@@ -23,6 +25,7 @@ export class SetupHttpServer {
       port: 0,
       state: () => ({ mode: "setup" }),
       deriveMachineId,
+      listNetworkInterfaces,
       loadDraft: null,
       saveDraft: null,
       ...options
@@ -81,6 +84,12 @@ export class SetupHttpServer {
           machineId: machineId.toString("hex"),
           kdf: "argon2d",
           purpose: MACHINE_ID_PURPOSE
+        })
+      }
+
+      if (req.method === "GET" && url.pathname === "/setup/interfaces") {
+        return this.#json(res, 200, {
+          interfaces: await this.options.listNetworkInterfaces()
         })
       }
 

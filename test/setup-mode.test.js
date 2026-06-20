@@ -123,6 +123,47 @@ test("setup http server derives machine identifiers through the backend", { conc
   }
 })
 
+test("setup http server exposes normalized network interfaces", { concurrency: false }, async () => {
+  const server = new SetupHttpServer({
+    listNetworkInterfaces: () => [
+      {
+        name: "eth0",
+        family: "IPv4",
+        address: "192.168.1.10",
+        netmask: "255.255.255.0",
+        mac: "aa:bb:cc:dd:ee:ff",
+        internal: false,
+        cidr: "192.168.1.10/24",
+        eligibleForBind: true
+      }
+    ]
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const response = await requestJson(`${baseUrl}/setup/interfaces`)
+
+    assert.equal(response.status, 200)
+    assert.deepEqual(response.payload, {
+      interfaces: [
+        {
+          name: "eth0",
+          family: "IPv4",
+          address: "192.168.1.10",
+          netmask: "255.255.255.0",
+          mac: "aa:bb:cc:dd:ee:ff",
+          internal: false,
+          cidr: "192.168.1.10/24",
+          eligibleForBind: true
+        }
+      ]
+    })
+  } finally {
+    await server.close()
+  }
+})
+
 test("setup http server rejects invalid machine-id derivation input", { concurrency: false }, async () => {
   const server = new SetupHttpServer()
 
