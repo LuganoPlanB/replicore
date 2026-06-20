@@ -1076,6 +1076,7 @@ export class HolepunchSwarmNode {
           peerPublicKey: this.network?.peerPublicKeyForNodeId(nodeId) ?? null,
           role: this.#membershipRole(nodeId)
         })
+        this.#recordHeartbeatDurability(nodeId, operation)
         const watermark = this.#usesSharedAuthoritativeLog()
           ? operation.heartbeat?.leaderCommitIndex
           : operation.heartbeat?.appliedFeeds?.[node.feedKey]
@@ -1689,6 +1690,28 @@ export class HolepunchSwarmNode {
   #recordAck(nodeId, seq) {
     if (nodeId === this.options.identity.publicKeyId) return
     this.durabilityWaiter.record(nodeId, seq)
+  }
+
+  /**
+   * Followers advertise their raw authoritative tail boundary in heartbeats.
+   * When that heartbeat still trusts this leader, treat it as equivalent to an
+   * ack for every in-flight leader entry up to that boundary.
+   *
+   * @param {string} nodeId
+   * @param {Record<string, unknown>} operation
+   */
+  #recordHeartbeatDurability(nodeId, operation) {
+    if (!this.#usesSharedAuthoritativeLog()) return
+    if (this.currentLeader() !== this.options.identity.publicKeyId) return
+    if (nodeId === this.options.identity.publicKeyId) return
+    if (operation?.kind !== "heartbeat") return
+    if (operation.heartbeat?.leaderId !== this.options.identity.publicKeyId) return
+    if (operation.heartbeat?.observedLeader !== this.options.identity.publicKeyId) return
+    if (operation.heartbeat?.reachableLeader !== true) return
+
+    const replicatedIndex = operation.heartbeat?.prevLogIndex
+    if (!Number.isInteger(replicatedIndex) || replicatedIndex < 0) return
+    this.durabilityWaiter.recordUpTo(nodeId, replicatedIndex)
   }
 
   async #notifyCurrentAuthoritativeTail(nodeId) {

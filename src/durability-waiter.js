@@ -32,6 +32,7 @@ export class DurabilityWaiter {
   async waitForGroups(seq, groups, initialNodeIds = []) {
     const key = this.#waiterKey(seq)
     const existing = this.waiters.get(key) ?? {
+      seq,
       nodes: new Set(),
       groups: groups.map((group) => ({
         eligibleNodeIds: group.eligibleNodeIds ? new Set(group.eligibleNodeIds) : null,
@@ -87,6 +88,29 @@ export class DurabilityWaiter {
       this.waiters.delete(this.#waiterKey(seq))
       this.lastDurableSequence = Math.max(this.lastDurableSequence, seq)
       waiter.resolve()
+    }
+  }
+
+  /**
+   * Count one node as having acknowledged every pending wait up to the reported
+   * raw sequence. This lets leaders trust follower heartbeats when the explicit
+   * ack RPC was missed but the follower already advertised the replicated tail.
+   *
+   * @param {string} nodeId
+   * @param {number} seq
+   */
+  recordUpTo(nodeId, seq) {
+    if (!Number.isInteger(seq) || seq < 0) return
+
+    for (const waiter of this.waiters.values()) {
+      if (waiter.seq > seq) continue
+      waiter.nodes.add(nodeId)
+      if (this.#groupsSatisfied(waiter)) {
+        clearTimeout(waiter.timer)
+        this.waiters.delete(this.#waiterKey(waiter.seq))
+        this.lastDurableSequence = Math.max(this.lastDurableSequence, waiter.seq)
+        waiter.resolve()
+      }
     }
   }
 
