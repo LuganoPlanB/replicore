@@ -12,7 +12,9 @@ export class SetupHttpServer {
    *   host?: string,
    *   port?: number,
    *   state?: () => Promise<unknown> | unknown,
-   *   deriveMachineId?: typeof deriveMachineId
+   *   deriveMachineId?: typeof deriveMachineId,
+   *   loadDraft?: () => Promise<unknown>,
+   *   saveDraft?: (draft: unknown) => Promise<unknown>
    * }} [options]
    */
   constructor(options = {}) {
@@ -21,6 +23,8 @@ export class SetupHttpServer {
       port: 0,
       state: () => ({ mode: "setup" }),
       deriveMachineId,
+      loadDraft: null,
+      saveDraft: null,
       ...options
     }
     this.server = null
@@ -80,11 +84,41 @@ export class SetupHttpServer {
         })
       }
 
+      if (url.pathname === "/setup/draft") {
+        this.#requireDraftPersistence()
+
+        if (req.method === "GET") {
+          try {
+            return this.#json(res, 200, { draft: await this.options.loadDraft() })
+          } catch (error) {
+            if (error?.code === "ENOENT") {
+              error.statusCode = 404
+              error.message = "Setup draft not found"
+            }
+            throw error
+          }
+        }
+
+        if (req.method === "POST") {
+          return this.#json(res, 200, {
+            draft: await this.options.saveDraft(await this.#readJson(req))
+          })
+        }
+      }
+
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       return this.#json(res, error?.statusCode ?? 500, {
         error: error instanceof Error ? error.message : String(error)
       })
+    }
+  }
+
+  #requireDraftPersistence() {
+    if (!this.options.loadDraft || !this.options.saveDraft) {
+      const error = new Error("Setup draft storage is unavailable")
+      error.statusCode = 409
+      throw error
     }
   }
 

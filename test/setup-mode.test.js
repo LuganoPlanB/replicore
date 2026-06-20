@@ -1,9 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 
 import { SetupHttpServer } from "../src/index.js"
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "../src/cluster-secret.js"
+import { readSetupDraft, writeSetupDraft } from "../src/setup-draft-store.js"
 import { requestJson } from "./helpers/http-crud.js"
 
 test("setup http server exposes setup state and no CRUD routes", { concurrency: false }, async () => {
@@ -136,6 +140,123 @@ test("setup http server rejects invalid machine-id derivation input", { concurre
 
     assert.equal(response.status, 400)
     assert.equal(response.payload.error, "clusterSecret must decode to 32 bytes")
+  } finally {
+    await server.close()
+  }
+})
+
+test("setup http server persists and reloads setup drafts without exposing file paths", { concurrency: false }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-http-"))
+  const draftPath = path.join(dir, "node.setup-draft.json")
+  const server = new SetupHttpServer({
+    loadDraft: () => readSetupDraft(draftPath),
+    saveDraft: (draft) => writeSetupDraft(draftPath, draft).then((result) => result.draft)
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const missing = await requestJson(`${baseUrl}/setup/draft`)
+    assert.equal(missing.status, 404)
+    assert.deepEqual(missing.payload, { error: "Setup draft not found" })
+
+    const create = await requestJson(`${baseUrl}/setup/draft`, {
+      method: "POST",
+      body: {
+        selectedInterface: "eth0",
+        bindHost: "127.0.0.1",
+        clusterSecret: "aa".repeat(32),
+        machineIdentity: "machine-a",
+        machineId: "bb".repeat(32)
+      }
+    })
+
+    assert.equal(create.status, 200)
+    assert.deepEqual(create.payload, {
+      draft: {
+        schemaVersion: 1,
+        updatedAt: create.payload.draft.updatedAt,
+        selectedInterface: "eth0",
+        bindHost: "127.0.0.1",
+        clusterSecret: "aa".repeat(32),
+        machineIdentity: "machine-a",
+        machineId: "bb".repeat(32)
+      }
+    })
+    assert.equal("path" in create.payload.draft, false)
+
+    const reload = await requestJson(`${baseUrl}/setup/draft`)
+    assert.equal(reload.status, 200)
+    assert.deepEqual(reload.payload, create.payload)
+
+    const overwrite = await requestJson(`${baseUrl}/setup/draft`, {
+      method: "POST",
+      body: {
+        selectedInterface: "wlan0",
+        bindHost: "192.168.1.5",
+        clusterSecret: "cc".repeat(32),
+        machineIdentity: "machine-b",
+        machineId: "dd".repeat(32)
+      }
+    })
+
+    assert.equal(overwrite.status, 200)
+    assert.equal(overwrite.payload.draft.selectedInterface, "wlan0")
+    assert.equal(overwrite.payload.draft.bindHost, "192.168.1.5")
+    assert.equal(overwrite.payload.draft.clusterSecret, "cc".repeat(32))
+    assert.equal(overwrite.payload.draft.machineIdentity, "machine-b")
+    assert.equal(overwrite.payload.draft.machineId, "dd".repeat(32))
+  } finally {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("setup http server rejects invalid setup drafts", { concurrency: false }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-http-"))
+  const draftPath = path.join(dir, "node.setup-draft.json")
+  const server = new SetupHttpServer({
+    loadDraft: () => readSetupDraft(draftPath),
+    saveDraft: (draft) => writeSetupDraft(draftPath, draft).then((result) => result.draft)
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const response = await requestJson(`${baseUrl}/setup/draft`, {
+      method: "POST",
+      body: {
+        selectedInterface: "",
+        bindHost: "127.0.0.1",
+        clusterSecret: "aa".repeat(32),
+        machineIdentity: "machine-a",
+        machineId: "bb".repeat(32)
+      }
+    })
+
+    assert.equal(response.status, 400)
+    assert.deepEqual(response.payload, {
+      error: "selectedInterface must be a non-empty string"
+    })
+  } finally {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("setup http server reports when setup draft storage is unavailable", { concurrency: false }, async () => {
+  const server = new SetupHttpServer()
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const response = await requestJson(`${baseUrl}/setup/draft`)
+
+    assert.equal(response.status, 409)
+    assert.deepEqual(response.payload, {
+      error: "Setup draft storage is unavailable"
+    })
   } finally {
     await server.close()
   }

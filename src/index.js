@@ -22,6 +22,7 @@ export {
 export { MaterializedView } from "./materialized-view.js"
 export { HolepunchHttpServer } from "./http-server.js"
 export { SetupHttpServer } from "./setup-http-server.js"
+export { readSetupDraft, SETUP_DRAFT_SCHEMA_VERSION, writeSetupDraft } from "./setup-draft-store.js"
 export {
   createSignedOperation,
   decryptOperationValue,

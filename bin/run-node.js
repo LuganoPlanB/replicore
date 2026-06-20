@@ -1,16 +1,27 @@
 #!/usr/bin/env node
 import path from "node:path"
 
-import { HolepunchHttpServer, HolepunchSwarmNode, loadRuntimeConfig, SetupHttpServer } from "../src/index.js"
+import {
+  HolepunchHttpServer,
+  HolepunchSwarmNode,
+  loadRuntimeConfig,
+  readSetupDraft,
+  SetupHttpServer,
+  writeSetupDraft
+} from "../src/index.js"
 
 const cli = parseCli(process.argv.slice(2))
 
 if (cli.setup) {
+  const setupConfigPath = cli.configPath ? path.resolve(cli.configPath) : null
+  const setupDraftPath = setupConfigPath ? deriveSetupDraftPath(setupConfigPath) : null
   const setupServer = new SetupHttpServer({
     state: () => ({
       mode: "setup",
-      configPath: cli.configPath ? path.resolve(cli.configPath) : null
-    })
+      configPath: setupConfigPath
+    }),
+    loadDraft: setupDraftPath ? () => readSetupDraft(setupDraftPath) : null,
+    saveDraft: setupDraftPath ? (draft) => writeSetupDraft(setupDraftPath, draft).then((result) => result.draft) : null
   })
 
   await setupServer.start()
@@ -19,7 +30,7 @@ if (cli.setup) {
     JSON.stringify(
       {
         type: "setup-ready",
-        configPath: cli.configPath ? path.resolve(cli.configPath) : null,
+        configPath: setupConfigPath,
         http: setupServer.address
       },
       null,
@@ -109,4 +120,9 @@ function parseCli(argv) {
     setup: false,
     configPath: argv[0] ?? null
   }
+}
+
+function deriveSetupDraftPath(configPath) {
+  const parsed = path.parse(configPath)
+  return path.join(parsed.dir, `${parsed.name}.setup-draft.json`)
 }
