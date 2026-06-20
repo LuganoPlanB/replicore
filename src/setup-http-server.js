@@ -105,8 +105,7 @@ export class SetupHttpServer {
             return this.#json(res, 200, { draft: await this.options.loadDraft() })
           } catch (error) {
             if (error?.code === "ENOENT") {
-              error.statusCode = 404
-              error.message = "Setup draft not found"
+              return this.#json(res, 200, { draft: null })
             }
             throw error
           }
@@ -245,6 +244,7 @@ function fallbackSetupHtml() {
     "<meta charset=\"utf-8\" />",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />",
     "<title>Replicore Setup</title>",
+    "<link rel=\"icon\" href=\"data:,\" />",
     "</head>",
     "<body>",
     "<main><h1>Replicore Setup</h1><p>Setup UI assets are not built yet.</p></main>",

@@ -174,7 +174,7 @@
     try {
       return await readJson("/setup/draft")
     } catch (error) {
-      if (error.status === 404 || error.status === 409) {
+      if (error.status === 409) {
         return null
       }
 

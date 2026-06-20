@@ -257,8 +257,8 @@ test("setup http server persists and reloads setup drafts without exposing file 
     const baseUrl = `http://${server.address.address}:${server.address.port}`
 
     const missing = await requestJson(`${baseUrl}/setup/draft`)
-    assert.equal(missing.status, 404)
-    assert.deepEqual(missing.payload, { error: "Setup draft not found" })
+    assert.equal(missing.status, 200)
+    assert.deepEqual(missing.payload, { draft: null })
 
     const create = await requestJson(`${baseUrl}/setup/draft`, {
       method: "POST",
