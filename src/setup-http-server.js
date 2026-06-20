@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
+import { readJsonBody } from "./http/body.js"
 import { listNetworkInterfaces } from "./setup/network-interfaces.js"
 import { normalizeSetupMachineIdInput } from "./setup-validation.js"
 
@@ -82,7 +83,7 @@ export class SetupHttpServer {
       }
 
       if (req.method === "POST" && url.pathname === "/setup/derive-machine-id") {
-        const input = normalizeSetupMachineIdInput(await this.#readJson(req))
+        const input = normalizeSetupMachineIdInput(await this.#readJson(req, 16 * 1024))
         const machineId = await this.options.deriveMachineId(input)
         return this.#json(res, 200, {
           machineId: machineId.toString("hex"),
@@ -113,7 +114,7 @@ export class SetupHttpServer {
 
         if (req.method === "POST") {
           return this.#json(res, 200, {
-            draft: await this.options.saveDraft(await this.#readJson(req))
+            draft: await this.options.saveDraft(await this.#readJson(req, 64 * 1024))
           })
         }
       }
@@ -184,24 +185,12 @@ export class SetupHttpServer {
     return null
   }
 
-  async #readJson(req) {
-    const chunks = []
-
-    for await (const chunk of req) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-    }
-
-    if (chunks.length === 0) {
-      return {}
-    }
-
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString("utf8"))
-    } catch {
-      const error = new Error("Request body must be valid JSON")
-      error.statusCode = 400
-      throw error
-    }
+  async #readJson(req, maxBytes) {
+    return readJsonBody(req, {
+      maxBytes,
+      contentType: req.headers["content-type"] ?? "",
+      allowEmpty: true
+    })
   }
 
   #json(res, statusCode, payload) {
