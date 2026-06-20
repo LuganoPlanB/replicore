@@ -112,7 +112,9 @@ const shards = [
       "HTTP internal errors are sanitized for clients and logged with the injected logger",
       "HTTP error payload suppresses internal cluster state in refusal responses",
       "HTTP rate limiting returns 429 after exceeding per-IP write budget",
-      "HTTP rate limit logging omits authorization tokens"
+      "HTTP rate limit logging omits authorization tokens",
+      "GET /openapi.yaml returns the OpenAPI spec with correct content-type",
+      "GET /docs returns the Scalar API Reference page"
     ]
   },
   {

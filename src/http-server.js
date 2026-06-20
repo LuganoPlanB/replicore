@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs"
 import http from "node:http"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { readJsonBody } from "./http/body.js"
 import { createFixedWindowRateLimiter } from "./http/rate-limit.js"
 import { sendError, sendJson } from "./http/response.js"
@@ -9,6 +12,8 @@ import {
   validateKvKey,
   validateKeyspace
 } from "./http/validation.js"
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
 /**
  * Minimal authorized HTTP surface for the swarm node.
@@ -193,6 +198,14 @@ export class HolepunchHttpServer {
         })
       }
 
+      if (req.method === "GET" && url.pathname === "/docs") {
+        return this.#serveStatic(res, "docs/scalar.html", "text/html; charset=utf-8")
+      }
+
+      if (req.method === "GET" && url.pathname === "/openapi.yaml") {
+        return this.#serveStatic(res, "docs/openapi.yaml", "application/yaml; charset=utf-8")
+      }
+
       return this.#sendJson(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
@@ -327,6 +340,28 @@ export class HolepunchHttpServer {
 
   #sendJson(res, statusCode, payload) {
     sendJson(res, statusCode, payload)
+  }
+
+  #serveStatic(res, relativePath, contentType) {
+    try {
+      const filePath = path.resolve(ROOT, relativePath)
+      const content = readFileSync(filePath)
+      res.writeHead(200, {
+        "content-type": contentType,
+        "content-length": String(content.length),
+        "x-content-type-options": "nosniff"
+      })
+      res.end(content)
+      return true
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        this.#sendJson(res, 404, { error: "Not found" })
+        return true
+      }
+      this.options.logger?.error?.("serve static failed", { relativePath, err })
+      sendError(res, 500, { error: "Internal server error", code: "INTERNAL_ERROR" })
+      return true
+    }
   }
 
   #sendError(res, statusCode, payload, extraHeaders) {

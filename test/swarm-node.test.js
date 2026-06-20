@@ -4403,6 +4403,43 @@ test("HTTP rate limit logging omits authorization tokens", { concurrency: false 
   }
 })
 
+test("GET /openapi.yaml returns the OpenAPI spec with correct content-type", async () => {
+  const server = new HolepunchHttpServer({
+    node: { async setHttpAddress() {} }
+  })
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const res = await fetch(`${baseUrl}/openapi.yaml`)
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get("content-type").includes("application/yaml"))
+    const body = await res.text()
+    assert.ok(body.includes("openapi:"))
+    assert.ok(body.includes("title: Replicore"))
+    assert.ok(body.includes("/kv/{key}"))
+  } finally {
+    await server.close()
+  }
+})
+
+test("GET /docs returns the Scalar API Reference page", async () => {
+  const server = new HolepunchHttpServer({
+    node: { async setHttpAddress() {} }
+  })
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+    const res = await fetch(`${baseUrl}/docs`)
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get("content-type").includes("text/html"))
+    const body = await res.text()
+    assert.ok(body.includes("scalar-api-reference") || body.includes("@scalar/api-reference"))
+    assert.ok(body.includes("<html"))
+  } finally {
+    await server.close()
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],

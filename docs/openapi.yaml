@@ -1,0 +1,530 @@
+openapi: "3.1.1"
+info:
+  title: Replicore
+  version: "0.1.0"
+  description: |
+    Holepunch/Hypercore K/V swarm with signed append-only operations,
+    leader-based writes, and multi-node replication.
+
+servers:
+  - url: "http://127.0.0.1:{port}"
+    variables:
+      port:
+        default: "3000"
+        description: Node listen port (configured via config.json)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: CRUD
+    description: Key-value read, write, delete, and history
+  - name: Status
+    description: Cluster health and leadership
+  - name: Admin
+    description: Snapshot export/import and encryption rotation
+
+paths:
+
+  /kv/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 512
+        description: |
+          K/V key. Must not contain `/` or control characters (U+0000–U+001F, U+007F).
+      - name: keyspace
+        in: query
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._:-]+$"
+          default: "default"
+        description: Logical keyspace namespace
+
+    get:
+      tags: [CRUD]
+      summary: Read a value by key
+      responses:
+        "200":
+          description: The stored value (any valid JSON)
+          content:
+            application/json:
+              schema: {}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+    put:
+      tags: [CRUD]
+      summary: Create or update a value by key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              additionalProperties: false
+              properties:
+                value:
+                  description: |
+                    Any valid JSON value. Strings capped at 4096 chars.
+                    Nested objects capped at depth 8.
+            examples:
+              string:
+                value: { value: "hello" }
+              object:
+                value: { value: { phase: "ready", count: 3 } }
+      responses:
+        "200":
+          description: Write operation descriptor (includes opId, seq, signature)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/RefusalError"
+
+    delete:
+      tags: [CRUD]
+      summary: Delete a key (tombstone)
+      responses:
+        "200":
+          description: Delete operation descriptor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/RefusalError"
+
+  /kv/{key}/history:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 512
+      - name: keyspace
+        in: query
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._:-]+$"
+          default: "default"
+
+    get:
+      tags: [CRUD]
+      summary: List all operation history for a key
+      responses:
+        "200":
+          description: Key history with operation list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, keyspace, history]
+                properties:
+                  key:
+                    type: string
+                  keyspace:
+                    type: string
+                  history:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /status/replication:
+    get:
+      tags: [Status]
+      summary: Replication health across peers
+      security: []
+      responses:
+        "200":
+          description: Replication status object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: integer
+                    description: Number of connected peers
+                  readStatus:
+                    type: object
+                    description: Read freshness info
+                  heartbeatByNode:
+                    type: object
+                    description: Latest heartbeat per node
+                  peerReplication:
+                    type: object
+                    description: Per-peer replication state
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /status/writers:
+    get:
+      tags: [Status]
+      summary: Current voters and their status
+      security: []
+      responses:
+        "200":
+          description: Writers status object
+          content:
+            application/json:
+              schema:
+                type: object
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /status/leader:
+    get:
+      tags: [Status]
+      summary: Current leader info
+      security: []
+      responses:
+        "200":
+          description: Leader status object
+          content:
+            application/json:
+              schema:
+                type: object
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /admin/snapshot:
+    get:
+      tags: [Admin]
+      summary: Export full current-state snapshot
+      responses:
+        "200":
+          description: Snapshot with all current K/V entries and integrity metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /admin/snapshot/import:
+    post:
+      tags: [Admin]
+      summary: Import a snapshot for state restore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [entries]
+                  properties:
+                    entries:
+                      type: array
+                - type: object
+                  required: [content]
+                  properties:
+                    content:
+                      type: object
+                      not:
+                        type: array
+      responses:
+        "200":
+          description: Snapshot imported
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    const: true
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /admin/encryption/rotate:
+    post:
+      tags: [Admin]
+      summary: Rotate the active encryption key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keyId]
+              additionalProperties: false
+              properties:
+                keyId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  pattern: "^[A-Za-z0-9._:-]+$"
+      responses:
+        "200":
+          description: Key rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    const: true
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Token from the node's auth configuration.
+        Each token carries `admin`, `readKeyspaces`, and `writeKeyspaces` scopes.
+
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+        code:
+          type: string
+          description: Machine-readable error code (e.g. "INVALID_REQUEST")
+
+    Operation:
+      type: object
+      description: Signed append-only operation
+      properties:
+        opId:
+          type: string
+          description: Content hash serving as operation ID
+        seq:
+          type: integer
+          description: Feed sequence number
+        kind:
+          type: string
+          enum: [kv, heartbeat, membership]
+        type:
+          type: string
+          enum: [put, delete]
+          description: Present for kv-kind operations
+        key:
+          type: string
+        keyspace:
+          type: string
+        value:
+          description: Present for put operations
+        signature:
+          type: string
+          description: Ed25519 signature over canonicalized operation
+
+    RefusalError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            retryable:
+              type: boolean
+              description: Whether the client should retry
+            reconnectHints:
+              type: object
+              description: Hints for reconnection (visible in DEBUG mode)
+
+    Snapshot:
+      type: object
+      description: Full current-state export with integrity metadata
+      properties:
+        contentHash:
+          type: string
+          description: SHA-256 over canonicalized envelope
+        entries:
+          type: array
+          description: All current K/V data
+
+  responses:
+
+    NotFound:
+      description: Key not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Not found"
+
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Unauthorized"
+            code: "UNAUTHORIZED"
+
+    Forbidden:
+      description: Token lacks required scope for this endpoint or keyspace
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Forbidden"
+            code: "FORBIDDEN"
+
+    InvalidRequest:
+      description: Bad request (validation failure)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Request body must include value"
+            code: "INVALID_REQUEST"
+
+    PayloadTooLarge:
+      description: Request body exceeds size limit
+      headers:
+        Retry-After:
+          schema:
+            type: string
+          description: |
+            Only present when rate limit exceeded.
+            Integer seconds until the window resets.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Request body too large"
+            code: "PAYLOAD_TOO_LARGE"
+
+    UnsupportedMediaType:
+      description: Content-Type must be application/json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Unsupported Media Type"
+            code: "UNSUPPORTED_MEDIA_TYPE"
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Ratelimit-Limit:
+          schema:
+            type: integer
+          description: Max requests per window
+        Ratelimit-Remaining:
+          schema:
+            type: integer
+          description: Remaining requests in this window
+        Ratelimit-Reset:
+          schema:
+            type: integer
+          description: Unix timestamp when window resets
+        Retry-After:
+          schema:
+            type: string
+          description: Seconds until window resets
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Too Many Requests"
+            code: "TOO_MANY_REQUESTS"
+
+    RefusalError:
+      description: |
+        Operation refused by the cluster (e.g. not connected to quorum,
+        not the current leader). Retryable unless `retryable` is false.
+      headers:
+        Retry-After:
+          schema:
+            type: string
+          description: Suggested retry delay in seconds
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RefusalError"
+          example:
+            error: "Write not accepted: this node is not the current leader"
+            code: "NOT_LEADER"
+            message: "Write not accepted: this node is not the current leader"
+            retryable: true
+            reconnectHints: {}
+
