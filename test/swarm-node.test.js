@@ -3639,6 +3639,87 @@ test("HTTP body size limit enforces maximum request body size through Content-Le
   }
 })
 
+test("HTTP error payload suppresses internal cluster state in refusal responses", { concurrency: false }, async () => {
+  const testnet = await createTestnet(2)
+  const dirs = []
+  const nodes = []
+  let server = null
+
+  try {
+    const encryptionKey = randomBytes(32)
+    const leaderIdentity = generateIdentity(seed("http-error-payload-leader"))
+    const followerIdentity = generateIdentity(seed("http-error-payload-follower"))
+    const authorizedNodes = [leaderIdentity, followerIdentity].map((identity) => ({
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }))
+
+    const leader = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-error-payload",
+      topicSalt: "test-error-payload",
+      identity: leaderIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+    const follower = new HolepunchSwarmNode({
+      dataDir: await tempDir(dirs),
+      clusterId: "test-error-payload",
+      topicSalt: "test-error-payload",
+      identity: followerIdentity,
+      authorizedNodes,
+      encryptionKey,
+      bootstrap: testnet.bootstrap
+    })
+
+    nodes.push(leader, follower)
+    await leader.start()
+    await follower.start()
+
+    const leaderId = [leaderIdentity, followerIdentity].sort((a, b) =>
+      a.publicKeyId.localeCompare(b.publicKeyId)
+    )[0].publicKeyId
+    await waitFor(
+      async () => nodes.every((node) => node.currentLeader() === leaderId),
+      { description: "leader convergence for error payload test" }
+    )
+
+    const leaderNode = nodes.find((node) => node.options.identity.publicKeyId === leaderId)
+    server = new HolepunchHttpServer({
+      node: leaderNode,
+      auth: {
+        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+      }
+    })
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const refusal = expectWriteRefusal(
+      await putValue(baseUrl, "hash:http-refusal-test", { test: true }),
+      { status: 503, code: "not-witness-entrypoint" }
+    )
+    assert.equal(refusal.retryable, true)
+    assert.equal(typeof refusal.code, "string")
+    assert.equal(typeof refusal.message, "string")
+    assert.equal(Object.hasOwn(refusal, "reconnectHints"), true)
+
+    const forbiddenFields = [
+      "currentTerm", "knownLeaderId", "leaderReachable",
+      "splitStatus", "commitIndex", "membershipVersion", "role"
+    ]
+    for (const field of forbiddenFields) {
+      assert.ok(!Object.hasOwn(refusal, field), `Refusal payload must not expose ${field}`)
+    }
+  } finally {
+    await server?.close()
+    await Promise.allSettled(nodes.map((node) => node.close()))
+    await testnet.destroy()
+    await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+  }
+})
+
 /**
  * @param {{
  *   dirs: string[],

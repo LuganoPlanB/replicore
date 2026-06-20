@@ -221,18 +221,21 @@ export class HolepunchHttpServer {
     }
     if (error?.code) payload.code = error.code
     if (error?.refusal) {
-      payload.refusal = error.refusal
       payload.code = error.refusal.code
       payload.message = error.refusal.message
       payload.retryable = error.refusal.retryable
-      payload.currentTerm = error.refusal.currentTerm
-      payload.knownLeaderId = error.refusal.knownLeaderId
-      payload.leaderReachable = error.refusal.leaderReachable
-      payload.splitStatus = error.refusal.splitStatus
-      payload.commitIndex = error.refusal.commitIndex
-      payload.membershipVersion = error.refusal.membershipVersion
-      payload.role = error.refusal.role
       payload.reconnectHints = error.refusal.reconnectHints
+      if (process.env.DEBUG) {
+        console.debug("refusal detail", {
+          currentTerm: error.refusal.currentTerm,
+          knownLeaderId: error.refusal.knownLeaderId,
+          leaderReachable: error.refusal.leaderReachable,
+          splitStatus: error.refusal.splitStatus,
+          commitIndex: error.refusal.commitIndex,
+          membershipVersion: error.refusal.membershipVersion,
+          role: error.refusal.role
+        })
+      }
     }
     return payload
   }
