@@ -12,7 +12,12 @@ import { requestJson } from "./helpers/http-crud.js"
 
 test("setup http server exposes setup state and no CRUD routes", { concurrency: false }, async () => {
   const server = new SetupHttpServer({
-    state: () => ({ mode: "setup", configPath: "/tmp/node-config.json" })
+    state: () => ({
+      mode: "setup",
+      view: "wizard",
+      nodeRunning: false,
+      configPath: "/tmp/node-config.json"
+    })
   })
 
   try {
@@ -23,6 +28,8 @@ test("setup http server exposes setup state and no CRUD routes", { concurrency: 
     assert.equal(state.status, 200)
     assert.deepEqual(state.payload, {
       mode: "setup",
+      view: "wizard",
+      nodeRunning: false,
       configPath: "/tmp/node-config.json"
     })
 
@@ -123,6 +130,8 @@ test("run-node setup mode starts without loading a node config", { concurrency: 
     assert.equal(state.status, 200)
     assert.deepEqual(state.payload, {
       mode: "setup",
+      view: "wizard",
+      nodeRunning: false,
       configPath,
       configExists: false
     })

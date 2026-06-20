@@ -22,6 +22,8 @@ if (cli.setup) {
     uiRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/setup-ui"),
     state: () => ({
       mode: "setup",
+      view: "wizard",
+      nodeRunning: false,
       configPath: setupConfigPath,
       configExists
     }),
