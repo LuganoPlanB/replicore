@@ -1,5 +1,6 @@
 import http from "node:http"
 import { readJsonBody } from "./http/body.js"
+import { createFixedWindowRateLimiter } from "./http/rate-limit.js"
 import {
   rejectUnknownKeys,
   requirePlainObject,
@@ -33,6 +34,7 @@ export class HolepunchHttpServer {
       auth: { tokens: {} },
       maxBodySize: 64 * 1024,
       rateLimit: options?.rateLimit ?? {
+        all: { max: 300, windowMs: 60_000 },
         writes: { max: 60, windowMs: 60_000 },
         admin: { max: 10, windowMs: 60_000 },
         reads: { max: 600, windowMs: 60_000 }
@@ -41,7 +43,12 @@ export class HolepunchHttpServer {
     }
     this.server = null
     this.sockets = new Set()
-    this.rateLimitBuckets = new Map()
+    this.rateLimiters = {
+      all: createFixedWindowRateLimiter(this.options.rateLimit.all ?? { max: 300, windowMs: 60_000 }),
+      writes: createFixedWindowRateLimiter(this.options.rateLimit.writes ?? { max: 60, windowMs: 60_000 }),
+      admin: createFixedWindowRateLimiter(this.options.rateLimit.admin ?? { max: 10, windowMs: 60_000 }),
+      reads: createFixedWindowRateLimiter(this.options.rateLimit.reads ?? { max: 600, windowMs: 60_000 })
+    }
   }
 
   async start() {
@@ -187,7 +194,8 @@ export class HolepunchHttpServer {
       return this.#json(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
-      const extraHeaders = error?.retryAfter ? { "retry-after": String(error.retryAfter) } : undefined
+      const extraHeaders = error?.rateLimitHeaders
+        ?? (error?.retryAfter ? { "retry-after": String(error.retryAfter) } : undefined)
       const isInternalError = status >= 500 && !error?.refusal
       const payload = isInternalError
         ? { error: "Internal server error", code: "INTERNAL_ERROR" }
@@ -241,43 +249,33 @@ export class HolepunchHttpServer {
   }
 
   #checkRateLimit(req, category) {
-    if (Object.keys(this.options.auth.tokens).length === 0) return
-
-    const token = this.#extractToken(req)
-    if (!token) return
-
-    const limits = this.options.rateLimit ?? { reads: { max: 600, windowMs: 60_000 } }
-    const defaults = { max: 600, windowMs: 60_000 }
-    const limit = limits[category] ?? limits.reads ?? defaults
-    const { max, windowMs } = limit
-
-    let buckets = this.rateLimitBuckets.get(token)
-    if (!buckets) {
-      buckets = { writes: [], admin: [], reads: [] }
-      this.rateLimitBuckets.set(token, buckets)
+    const remoteAddress = req.socket?.remoteAddress ?? "unknown"
+    const globalResult = this.rateLimiters.all(remoteAddress)
+    if (!globalResult.allowed) {
+      throw this.#createRateLimitError(globalResult, this.options.rateLimit.all ?? { max: 300, windowMs: 60_000 })
     }
 
-    const timestamps = buckets[category]
-    const now = Date.now()
-    while (timestamps.length > 0 && timestamps[0] < now - windowMs) {
-      timestamps.shift()
-    }
+    const limiter = this.rateLimiters[category]
+    if (!limiter) return
 
-    if (timestamps.length >= max) {
-      const retryAfter = Math.ceil((timestamps[0] + windowMs - now) / 1000)
-      const error = new Error("Too Many Requests")
-      error.code = "TOO_MANY_REQUESTS"
-      error.statusCode = 429
-      error.retryAfter = retryAfter
-      throw error
+    const result = limiter(remoteAddress)
+    if (!result.allowed) {
+      throw this.#createRateLimitError(result, this.options.rateLimit[category] ?? { max: 0, windowMs: 0 })
     }
-
-    timestamps.push(now)
   }
 
-  #extractToken(req) {
-    const header = req.headers.authorization ?? ""
-    return header.startsWith("Bearer ") ? header.slice(7) : null
+  #createRateLimitError(result, config) {
+    const error = new Error("Too Many Requests")
+    error.code = "TOO_MANY_REQUESTS"
+    error.statusCode = 429
+    error.retryAfter = result.retryAfterSeconds
+    error.rateLimitHeaders = {
+      "retry-after": String(result.retryAfterSeconds),
+      "ratelimit-limit": String(config.max ?? 0),
+      "ratelimit-remaining": String(result.remaining),
+      "ratelimit-reset": String(Math.ceil(result.resetAt / 1000))
+    }
+    return error
   }
 
   async #readJson(req, maxSize = this.options.maxBodySize) {
