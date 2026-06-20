@@ -229,9 +229,16 @@
   <main class="shell">
     <section class="panel" aria-labelledby="setup-title">
       <header class="header">
-        <div>
+        <div class="title-block">
           <p class="eyebrow">Replicore</p>
           <h1 id="setup-title">Node setup</h1>
+          <div class="chips" aria-label="Setup mode status">
+            <span class="chip">Loopback only</span>
+            <span class:chip={true} class:chip-active={Boolean(setupState?.configPath)}>
+              {setupState?.configPath ? "Draft persistence enabled" : "Draft persistence unavailable"}
+            </span>
+            <span class="chip">{interfaces.length} addresses discovered</span>
+          </div>
         </div>
         <dl class="meta">
           <div>
@@ -249,21 +256,36 @@
         <section class="group" aria-labelledby="network-title">
           <div class="group-header">
             <h2 id="network-title">Network</h2>
+            <p class="section-summary">Choose the address this node should advertise first.</p>
           </div>
 
-          <label class="field">
-            <span>Interface</span>
-            <select bind:value={draft.selectedInterface} on:change={handleInterfaceChange}>
-              {#each Array.from(new Set(interfaces.map((record) => record.name))) as name}
-                <option value={name}>{name}</option>
-              {/each}
-            </select>
-          </label>
+          <div class="split-grid">
+            <div class="stack">
+              <label class="field">
+                <span>Interface</span>
+                <select bind:value={draft.selectedInterface} on:change={handleInterfaceChange}>
+                  {#each Array.from(new Set(interfaces.map((record) => record.name))) as name}
+                    <option value={name}>{name}</option>
+                  {/each}
+                </select>
+              </label>
 
-          <label class="field">
-            <span>Bind host</span>
-            <input type="text" bind:value={draft.bindHost} readonly />
-          </label>
+              <label class="field">
+                <span>Bind host</span>
+                <input type="text" bind:value={draft.bindHost} readonly />
+              </label>
+            </div>
+
+            <div class="facts">
+              {#each selectedInterfaceRecords().slice(0, 3) as record}
+                <div class="fact-card">
+                  <div class="fact-label">{record.family}</div>
+                  <div class="fact-value">{record.address}</div>
+                  <div class="fact-meta">{record.eligibleForBind ? "Eligible for bind" : "Read-only address"}</div>
+                </div>
+              {/each}
+            </div>
+          </div>
 
           <div class="interface-list" role="table" aria-label="Discovered addresses">
             <div class="interface-head" role="row">
@@ -284,6 +306,7 @@
         <section class="group" aria-labelledby="identity-title">
           <div class="group-header">
             <h2 id="identity-title">Cluster identity</h2>
+            <p class="section-summary">The machine identifier is derived locally from the shared secret and raw machine identity.</p>
           </div>
 
           <label class="field">
@@ -312,11 +335,15 @@
             <textarea rows="3" bind:value={draft.machineId} readonly></textarea>
           </label>
 
-          {#if deriveError}
-            <p class="error" role="alert">{deriveError}</p>
-          {:else if isDeriving}
-            <p class="status">Deriving machine identifier…</p>
-          {/if}
+          <div class="inline-status">
+            <span class="chip">argon2d</span>
+            <span class="chip">purpose: machine-id</span>
+            {#if deriveError}
+              <p class="error" role="alert">{deriveError}</p>
+            {:else if isDeriving}
+              <p class="status">Deriving machine identifier…</p>
+            {/if}
+          </div>
         </section>
 
         <footer class="actions">
