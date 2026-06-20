@@ -3979,6 +3979,114 @@ test("HTTP admin routes validate bodies before node admin calls", { concurrency:
   }
 })
 
+test("HTTP JSON responses carry consistent security headers across success and error paths", { concurrency: false }, async () => {
+  const node = {
+    async setHttpAddress() {},
+    async getReplicationStatus() {
+      return { ok: true }
+    },
+    async get(key) {
+      if (key === "explode") {
+        throw new Error("sensitive-marker")
+      }
+      return { key, keyspace: "default", value: { ok: true } }
+    },
+    getWritersStatus() {
+      return { ok: true }
+    },
+    async getLeaderStatus() {
+      return { ok: true }
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    maxBodySize: 32,
+    auth: {
+      tokens: {
+        reader: { readKeyspaces: ["default"], writeKeyspaces: [] },
+        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+      }
+    }
+  })
+  const rateLimitedServer = new HolepunchHttpServer({
+    node,
+    auth: {
+      tokens: {
+        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+      }
+    },
+    rateLimit: {
+      all: { max: 300, windowMs: 60_000 },
+      writes: { max: 60, windowMs: 60_000 },
+      reads: { max: 1, windowMs: 60_000 },
+      admin: { max: 10, windowMs: 60_000 }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const success = await fetch(`${baseUrl}/status/replication`)
+    assertJsonSecurityHeaders(success)
+    assert.equal(success.status, 200)
+
+    const invalidRequest = await fetch(`${baseUrl}/kv/good?keyspace=bad%20space`, {
+      headers: {
+        authorization: "Bearer reader"
+      }
+    })
+    assertJsonSecurityHeaders(invalidRequest)
+    assert.equal(invalidRequest.status, 400)
+
+    const badRequest = await fetch(`${baseUrl}/kv/good?keyspace=default`, {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ value: { tooLarge: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } })
+    })
+    assertJsonSecurityHeaders(badRequest)
+    assert.equal(badRequest.status, 413)
+
+    const unauthorized = await fetch(`${baseUrl}/kv/good?keyspace=default`)
+    assertJsonSecurityHeaders(unauthorized)
+    assert.equal(unauthorized.status, 401)
+
+    const notFound = await fetch(`${baseUrl}/nope`)
+    assertJsonSecurityHeaders(notFound)
+    assert.equal(notFound.status, 404)
+
+    const internal = await fetch(`${baseUrl}/kv/${encodeURIComponent("explode")}?keyspace=default`, {
+      headers: {
+        authorization: "Bearer reader"
+      }
+    })
+    assertJsonSecurityHeaders(internal)
+    assert.equal(internal.status, 500)
+    const internalPayload = await internal.json()
+    assert.equal(internalPayload.error, "Internal server error")
+    assert.ok(!JSON.stringify(internalPayload).includes("sensitive-marker"))
+  } finally {
+    await server.close()
+  }
+
+  try {
+    await rateLimitedServer.start()
+    const baseUrl = `http://${rateLimitedServer.address.address}:${rateLimitedServer.address.port}`
+
+    const allowed = await fetch(`${baseUrl}/status/replication`)
+    assert.equal(allowed.status, 200)
+
+    const limited = await fetch(`${baseUrl}/status/replication`)
+    assertJsonSecurityHeaders(limited)
+    assert.equal(limited.status, 429)
+  } finally {
+    await rateLimitedServer.close()
+  }
+})
+
 test("HTTP error payload suppresses internal cluster state in refusal responses", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []
@@ -4059,6 +4167,20 @@ test("HTTP error payload suppresses internal cluster state in refusal responses"
     await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
   }
 })
+
+function assertJsonSecurityHeaders(response) {
+  assert.match(response.headers.get("content-type") ?? "", /^application\/json; charset=utf-8$/)
+  assert.match(response.headers.get("content-length") ?? "", /^\d+$/)
+  assert.equal(response.headers.get("connection"), "close")
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff")
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer")
+  assert.equal(response.headers.get("x-frame-options"), "DENY")
+  assert.equal(
+    response.headers.get("content-security-policy"),
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+  )
+  assert.equal(response.headers.get("strict-transport-security"), null)
+}
 
 test("HTTP rate limiting returns 429 after exceeding per-IP write budget", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)

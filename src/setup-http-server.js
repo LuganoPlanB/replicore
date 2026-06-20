@@ -4,6 +4,7 @@ import path from "node:path"
 
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
 import { readJsonBody } from "./http/body.js"
+import { sendError, sendJson } from "./http/response.js"
 import { listNetworkInterfaces } from "./setup/network-interfaces.js"
 import { normalizeSetupMachineIdInput } from "./setup-validation.js"
 
@@ -79,13 +80,13 @@ export class SetupHttpServer {
       const url = new URL(req.url, "http://127.0.0.1")
 
       if (req.method === "GET" && url.pathname === "/setup/state") {
-        return this.#json(res, 200, await this.options.state())
+        return this.#sendJson(res, 200, await this.options.state())
       }
 
       if (req.method === "POST" && url.pathname === "/setup/derive-machine-id") {
         const input = normalizeSetupMachineIdInput(await this.#readJson(req, 16 * 1024))
         const machineId = await this.options.deriveMachineId(input)
-        return this.#json(res, 200, {
+        return this.#sendJson(res, 200, {
           machineId: machineId.toString("hex"),
           kdf: "argon2d",
           purpose: MACHINE_ID_PURPOSE
@@ -93,7 +94,7 @@ export class SetupHttpServer {
       }
 
       if (req.method === "GET" && url.pathname === "/setup/interfaces") {
-        return this.#json(res, 200, {
+        return this.#sendJson(res, 200, {
           interfaces: await this.options.listNetworkInterfaces()
         })
       }
@@ -103,17 +104,17 @@ export class SetupHttpServer {
 
         if (req.method === "GET") {
           try {
-            return this.#json(res, 200, { draft: await this.options.loadDraft() })
+            return this.#sendJson(res, 200, { draft: await this.options.loadDraft() })
           } catch (error) {
             if (error?.code === "ENOENT") {
-              return this.#json(res, 200, { draft: null })
+              return this.#sendJson(res, 200, { draft: null })
             }
             throw error
           }
         }
 
         if (req.method === "POST") {
-          return this.#json(res, 200, {
+          return this.#sendJson(res, 200, {
             draft: await this.options.saveDraft(await this.#readJson(req, 64 * 1024))
           })
         }
@@ -126,9 +127,9 @@ export class SetupHttpServer {
         }
       }
 
-      return this.#json(res, 404, { error: "Not found" })
+      return this.#sendJson(res, 404, { error: "Not found" })
     } catch (error) {
-      return this.#json(res, error?.statusCode ?? 500, {
+      return this.#sendError(res, error?.statusCode ?? 500, {
         error: error instanceof Error ? error.message : String(error)
       })
     }
@@ -193,9 +194,12 @@ export class SetupHttpServer {
     })
   }
 
-  #json(res, statusCode, payload) {
-    const body = JSON.stringify(payload)
-    this.#send(res, statusCode, "application/json; charset=utf-8", body)
+  #sendJson(res, statusCode, payload) {
+    sendJson(res, statusCode, payload)
+  }
+
+  #sendError(res, statusCode, payload) {
+    sendError(res, statusCode, payload)
   }
 
   #send(res, statusCode, contentType, body) {
