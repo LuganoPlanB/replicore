@@ -155,6 +155,43 @@ h1 {
   font-size: 0.9375rem;
 }
 
+.inline-fields {
+  display: flex;
+  gap: 16px;
+}
+
+.inline-fields .field {
+  flex: 1;
+  min-width: 0;
+}
+
+.input-with-button {
+  display: flex;
+  gap: 8px;
+}
+
+.input-with-button input {
+  flex: 0 1 75%;
+  min-width: 0;
+}
+
+.input-with-button button {
+  white-space: nowrap;
+  flex-shrink: 0;
+  padding: 12px 18px;
+  background: rgba(14, 165, 233, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  color: #38bdf8;
+}
+
+.input-with-button button:hover {
+  background: rgba(14, 165, 233, 0.28);
+}
+
+.group-identity input {
+  font-size: 1.35rem;
+}
+
 input,
 select,
 textarea,
@@ -270,9 +307,18 @@ button:disabled {
 }
 
 .summary,
-.status {
+.status,
+.hint {
   margin: 0;
   color: #94a3b8;
+}
+
+.hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: rgba(148, 163, 184, 0.12);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.85em;
 }
 
 .error {

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 
 import { deriveMachineId, MACHINE_ID_PURPOSE } from "./cluster-secret.js"
+import { base58Encode } from "./base58.js"
 import { readJsonBody } from "./http/body.js"
 import { sendError, sendJson } from "./http/response.js"
 import { listNetworkInterfaces } from "./setup/network-interfaces.js"
@@ -89,10 +90,14 @@ export class SetupHttpServer {
         const input = normalizeSetupMachineIdInput(await this.#readJson(req, 16 * 1024))
         const machineId = await this.options.deriveMachineId(input)
         return this.#sendJson(res, 200, {
-          machineId: machineId.toString("hex"),
+          machineId: base58Encode(machineId),
           kdf: "argon2d",
           purpose: MACHINE_ID_PURPOSE
         })
+      }
+
+      if (req.method === "GET" && url.pathname === "/setup/machine-id") {
+        return this.#sendJson(res, 200, { machineId: await this.#readMachineId() })
       }
 
       if (req.method === "GET" && url.pathname === "/setup/interfaces") {
@@ -107,11 +112,8 @@ export class SetupHttpServer {
         if (req.method === "GET") {
           try {
             return this.#sendJson(res, 200, { draft: await this.options.loadDraft() })
-          } catch (error) {
-            if (error?.code === "ENOENT") {
-              return this.#sendJson(res, 200, { draft: null })
-            }
-            throw error
+          } catch {
+            return this.#sendJson(res, 200, { draft: null })
           }
         }
 
@@ -202,6 +204,14 @@ export class SetupHttpServer {
       contentType: req.headers["content-type"] ?? "",
       allowEmpty: true
     })
+  }
+
+  async #readMachineId() {
+    try {
+      return (await readFile("/etc/machine-id", "utf8")).trim()
+    } catch {
+      return ""
+    }
   }
 
   #sendJson(res, statusCode, payload) {

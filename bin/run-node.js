@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access } from "node:fs/promises"
+import { access, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -15,10 +15,16 @@ import {
 const cli = parseCli(process.argv.slice(2))
 
 if (cli.setup) {
+  const machineIdentity = await readMachineIdentity()
   const setupConfigPath = cli.configPath ? path.resolve(cli.configPath) : null
-  const setupDraftPath = setupConfigPath ? deriveSetupDraftPath(setupConfigPath) : null
+  const setupDraftPath = setupConfigPath
+    ? deriveSetupDraftPath(setupConfigPath)
+    : machineIdentity
+      ? path.resolve(`./replicore-node-${machineIdentity}.json`)
+      : null
   const configExists = setupConfigPath ? await pathExists(setupConfigPath) : false
   const setupServer = new SetupHttpServer({
+    port: asSetupPort(process.env.REPLICORE_SETUP_PORT),
     uiRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/setup-ui"),
     state: () => ({
       mode: "setup",
@@ -27,8 +33,15 @@ if (cli.setup) {
       configPath: setupConfigPath,
       configExists
     }),
-    loadDraft: setupDraftPath ? () => readSetupDraft(setupDraftPath) : null,
-    saveDraft: setupDraftPath ? (draft) => writeSetupDraft(setupDraftPath, draft).then((result) => result.draft) : null
+    loadDraft: setupDraftPath
+      ? () => readSetupDraft(setupDraftPath)
+      : () => Promise.resolve(null),
+    saveDraft: async (draft) => {
+      const savePath = setupDraftPath
+        ?? path.resolve(`./replicore-node-${draft.machineIdentity}.json`)
+      const result = await writeSetupDraft(savePath, draft)
+      return { ...result.draft, _savedPath: path.basename(result.path) }
+    }
   })
 
   await setupServer.start()
@@ -144,4 +157,18 @@ async function pathExists(filePath) {
   } catch {
     return false
   }
+}
+
+async function readMachineIdentity() {
+  try {
+    return (await readFile("/etc/machine-id", "utf8")).trim()
+  } catch {
+    return ""
+  }
+}
+
+function asSetupPort(value) {
+  if (value === undefined || value === "") return 0
+  const port = Number.parseInt(value, 10)
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0
 }

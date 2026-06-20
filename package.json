@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build:setup-ui": "vite build --config setup-ui/vite.config.js",
-    "dev:setup-ui": "vite --config setup-ui/vite.config.js",
+    "dev:setup-ui": "REPLICORE_SETUP_PORT=37210 vite --config setup-ui/vite.config.js",
+    "dev:setup": "REPLICORE_SETUP_PORT=37210 node bin/run-node.js --setup & sleep 1 && REPLICORE_SETUP_PORT=37210 vite --config setup-ui/vite.config.js",
     "start:setup": "node bin/run-node.js --setup",
     "test": "node test/run-suite.mjs",
     "test:reliability": "node test/reliability-churn.mjs",
@@ -14,6 +15,7 @@
     "snapshot": "node bin/snapshot.js"
   },
   "dependencies": {
+    "base58-js": "^3.0.3",
     "corestore": "^7.10.1",
     "hash-wasm": "^4.12.0",
     "hyperbee": "^2.27.3",
