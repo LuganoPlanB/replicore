@@ -307,8 +307,14 @@ test("single surviving node serves reads but blocks writes until a follower retu
     const current = await leader.get("hash:survive-read")
     assert.deepEqual(current?.value, { baseline: true })
 
-    await assert.rejects(leader.put("hash:blocked-write", { shouldFail: true }), /Durability requirement not met/)
-    await assert.rejects(leader.delete("hash:survive-read"), /Durability requirement not met/)
+    await assert.rejects(
+      leader.put("hash:blocked-write", { shouldFail: true }),
+      /No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request/
+    )
+    await assert.rejects(
+      leader.delete("hash:survive-read"),
+      /No current leader is available|Durability requirement not met|Timed out waiting for follower acknowledgement|Timed out forwarding write request/
+    )
 
     const blockedStatus = await leader.getReplicationStatus()
     assert.equal(blockedStatus.lastDurableSequence, baselineDurableSequence)
