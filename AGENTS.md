@@ -15,6 +15,10 @@ This repo is a minimal Holepunch / Hypercore K/V swarm prototype. Treat it as a 
 - Followers replicate, serve reads, and forward writes
 - Heartbeats determine the current leader
 - Durability requires leader append plus one follower acknowledgement
+- `HolepunchSwarmNode` accepts `useHeartbeatDurability: false` to prevent
+  follower heartbeats from short-circuiting the durability-waiter timeout.
+  Tests that inject artificial `ackDelayMs` should set this to `false` so the
+  explicit ack timeout fires deterministically.
 
 Do not redesign this into Redis, SQL clustering, or general multi-writer consensus unless the user explicitly asks for that.
 
