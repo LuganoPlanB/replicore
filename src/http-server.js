@@ -1,6 +1,7 @@
 import http from "node:http"
 import { readJsonBody } from "./http/body.js"
 import { createFixedWindowRateLimiter } from "./http/rate-limit.js"
+import { sendError, sendJson } from "./http/response.js"
 import {
   rejectUnknownKeys,
   requirePlainObject,
@@ -101,7 +102,7 @@ export class HolepunchHttpServer {
         if (req.method === "GET" && match[2] === "/history") {
           this.#authorize(req, keyspace, "read")
           this.#checkRateLimit(req, "reads")
-          return this.#json(res, 200, {
+          return this.#sendJson(res, 200, {
             key,
             keyspace,
             history: await this.options.node.getHistory(key, { keyspace })
@@ -112,8 +113,8 @@ export class HolepunchHttpServer {
           this.#authorize(req, keyspace, "read")
           this.#checkRateLimit(req, "reads")
           const value = await this.options.node.get(key, { keyspace })
-          if (!value) return this.#json(res, 404, { error: "Not found" })
-          return this.#json(res, 200, value)
+          if (!value) return this.#sendJson(res, 404, { error: "Not found" })
+          return this.#sendJson(res, 200, value)
         }
 
         if (req.method === "PUT") {
@@ -130,7 +131,7 @@ export class HolepunchHttpServer {
           const value = validateJsonValue(body.value)
           await this.options.node.qualifyClientWriteEntrypoint()
           const operation = await this.options.node.put(key, value, { keyspace })
-          return this.#json(res, 200, operation)
+          return this.#sendJson(res, 200, operation)
         }
 
         if (req.method === "DELETE") {
@@ -138,29 +139,29 @@ export class HolepunchHttpServer {
           this.#checkRateLimit(req, "writes")
           await this.options.node.qualifyClientWriteEntrypoint()
           const operation = await this.options.node.delete(key, { keyspace })
-          return this.#json(res, 200, operation)
+          return this.#sendJson(res, 200, operation)
         }
       }
 
       if (req.method === "GET" && url.pathname === "/status/replication") {
         this.#checkRateLimit(req, "reads")
-        return this.#json(res, 200, await this.options.node.getReplicationStatus())
+        return this.#sendJson(res, 200, await this.options.node.getReplicationStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/status/writers") {
         this.#checkRateLimit(req, "reads")
-        return this.#json(res, 200, this.options.node.getWritersStatus())
+        return this.#sendJson(res, 200, this.options.node.getWritersStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/status/leader") {
         this.#checkRateLimit(req, "reads")
-        return this.#json(res, 200, await this.options.node.getLeaderStatus())
+        return this.#sendJson(res, 200, await this.options.node.getLeaderStatus())
       }
 
       if (req.method === "GET" && url.pathname === "/admin/snapshot") {
         this.#authorizeAdmin(req)
         this.#checkRateLimit(req, "admin")
-        return this.#json(res, 200, await this.options.node.createSnapshot())
+        return this.#sendJson(res, 200, await this.options.node.createSnapshot())
       }
 
       if (req.method === "POST" && url.pathname === "/admin/snapshot/import") {
@@ -177,7 +178,7 @@ export class HolepunchHttpServer {
           throw error
         }
         await this.options.node.restoreSnapshot(body)
-        return this.#json(res, 200, { ok: true })
+        return this.#sendJson(res, 200, { ok: true })
       }
 
       if (req.method === "POST" && url.pathname === "/admin/encryption/rotate") {
@@ -186,13 +187,13 @@ export class HolepunchHttpServer {
         const body = requirePlainObject(await this.#readJson(req), "Request body")
         rejectUnknownKeys(body, ["keyId"])
         const keyId = validateKeyspace(body.keyId)
-        return this.#json(res, 200, {
+        return this.#sendJson(res, 200, {
           ok: true,
           ...this.options.node.rotateEncryptionKey(keyId)
         })
       }
 
-      return this.#json(res, 404, { error: "Not found" })
+      return this.#sendJson(res, 404, { error: "Not found" })
     } catch (error) {
       const status = error?.statusCode ?? 500
       const extraHeaders = error?.rateLimitHeaders
@@ -204,7 +205,7 @@ export class HolepunchHttpServer {
       if (isInternalError) {
         this.options.logger?.error?.("http internal error", { status, code: error?.code, message: error?.message?.slice(0, 200) })
       }
-      return this.#json(res, status, payload, extraHeaders)
+      return this.#sendError(res, status, payload, extraHeaders)
     }
   }
 
@@ -324,15 +325,11 @@ export class HolepunchHttpServer {
     return payload
   }
 
-  #json(res, statusCode, payload, extraHeaders) {
-    const body = JSON.stringify(payload)
-    res.writeHead(statusCode, {
-      "content-type": "application/json; charset=utf-8",
-      "content-length": Buffer.byteLength(body),
-      "connection": "close",
-      "x-content-type-options": "nosniff",
-      ...(extraHeaders ?? {})
-    })
-    res.end(body)
+  #sendJson(res, statusCode, payload) {
+    sendJson(res, statusCode, payload)
+  }
+
+  #sendError(res, statusCode, payload, extraHeaders) {
+    sendError(res, statusCode, payload, { headers: extraHeaders })
   }
 }

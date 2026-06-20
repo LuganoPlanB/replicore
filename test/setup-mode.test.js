@@ -314,6 +314,44 @@ test("setup http server rejects oversized draft bodies before saveDraft", { conc
   }
 })
 
+test("setup JSON responses carry the shared security headers", { concurrency: false }, async () => {
+  const server = new SetupHttpServer({
+    loadDraft: async () => null,
+    saveDraft: async (draft) => draft
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const success = await fetch(`${baseUrl}/setup/state`)
+    assertJsonSecurityHeaders(success)
+    assert.equal(success.status, 200)
+
+    const malformed = await fetch(`${baseUrl}/setup/derive-machine-id`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: "{\"clusterSecret\":"
+    })
+    assertJsonSecurityHeaders(malformed)
+    assert.equal(malformed.status, 400)
+
+    const tooLarge = await fetch(`${baseUrl}/setup/draft`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ draft: "x".repeat(70 * 1024) })
+    })
+    assertJsonSecurityHeaders(tooLarge)
+    assert.equal(tooLarge.status, 413)
+  } finally {
+    await server.close()
+  }
+})
+
 test("setup http server persists and reloads setup drafts without exposing file paths", { concurrency: false }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "replicore-setup-http-"))
   const draftPath = path.join(dir, "node.setup-draft.json")
@@ -465,3 +503,17 @@ test("node http server does not expose setup routes", { concurrency: false }, as
     await server.close()
   }
 })
+
+function assertJsonSecurityHeaders(response) {
+  assert.match(response.headers.get("content-type") ?? "", /^application\/json; charset=utf-8$/)
+  assert.match(response.headers.get("content-length") ?? "", /^\d+$/)
+  assert.equal(response.headers.get("connection"), "close")
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff")
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer")
+  assert.equal(response.headers.get("x-frame-options"), "DENY")
+  assert.equal(
+    response.headers.get("content-security-policy"),
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+  )
+  assert.equal(response.headers.get("strict-transport-security"), null)
+}
