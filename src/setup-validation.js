@@ -1,3 +1,5 @@
+import { base58Decode } from "./base58.js"
+
 /**
  * Normalize one machine-ID derivation request from the setup UI.
  *
@@ -11,7 +13,7 @@ export function normalizeSetupMachineIdInput(input) {
     throw badRequest("Request body must be an object")
   }
 
-  const clusterSecret = requireHex(input.clusterSecret, "clusterSecret", 32)
+  const clusterSecret = requireBase58Bytes(input.clusterSecret, "clusterSecret", 32)
   const machineIdentity = requireTrimmedString(input.machineIdentity, "machineIdentity")
 
   return {
@@ -53,9 +55,8 @@ export function normalizeSetupDraft(input) {
     updatedAt,
     selectedInterface: requireTrimmedString(input.selectedInterface, "selectedInterface"),
     bindHost: requireTrimmedString(input.bindHost, "bindHost"),
-    clusterSecret: requireHexString(input.clusterSecret, "clusterSecret", 32),
-    machineIdentity: requireTrimmedString(input.machineIdentity, "machineIdentity"),
-    machineId: requireHexString(input.machineId, "machineId", 32)
+    clusterSecret: requireBase58String(input.clusterSecret, "clusterSecret", 32),
+    machineId: requireBase58String(input.machineId, "machineId", 32)
   }
 }
 
@@ -72,22 +73,20 @@ function requireTrimmedString(value, field) {
   return normalized
 }
 
-function requireHex(value, field, exactLength) {
-  if (typeof value !== "string" || !/^[0-9a-fA-F]+$/.test(value)) {
-    throw badRequest(`${field} must be a hex string`)
-  }
-
-  const buffer = Buffer.from(value, "hex")
-  if (buffer.length !== exactLength) {
+function requireBase58String(value, field, exactLength) {
+  const decoded = base58Decode(value)
+  if (decoded.length !== exactLength) {
     throw badRequest(`${field} must decode to ${exactLength} bytes`)
   }
-
-  return buffer
+  return value
 }
 
-function requireHexString(value, field, exactLength) {
-  requireHex(value, field, exactLength)
-  return value.toLowerCase()
+function requireBase58Bytes(value, field, exactLength) {
+  const decoded = base58Decode(value)
+  if (decoded.length !== exactLength) {
+    throw badRequest(`${field} must decode to ${exactLength} bytes`)
+  }
+  return decoded
 }
 
 function badRequest(message) {

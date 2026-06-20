@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 
+import { base58Encode } from "./base58.js"
 import { normalizeSetupDraft } from "./setup-validation.js"
 
 export const SETUP_DRAFT_SCHEMA_VERSION = 1
@@ -42,5 +43,24 @@ export async function writeSetupDraft(filePath, draft) {
  */
 export async function readSetupDraft(filePath) {
   const absolutePath = path.resolve(filePath)
-  return normalizeSetupDraft(JSON.parse(await readFile(absolutePath, "utf8")))
+  let raw
+  try {
+    raw = JSON.parse(await readFile(absolutePath, "utf8"))
+  } catch (error) {
+    if (error?.code === "ENOENT") throw error
+    return null
+  }
+
+  if (/^[0-9a-f]{64}$/.test(raw.clusterSecret ?? "")) {
+    raw.clusterSecret = base58Encode(Buffer.from(raw.clusterSecret, "hex"))
+  }
+  if (/^[0-9a-f]{64}$/.test(raw.machineId ?? "")) {
+    raw.machineId = base58Encode(Buffer.from(raw.machineId, "hex"))
+  }
+
+  try {
+    return normalizeSetupDraft(raw)
+  } catch {
+    return null
+  }
 }

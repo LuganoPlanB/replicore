@@ -1,5 +1,6 @@
 <script>
   import { onMount } from "svelte"
+  import { binary_to_base58 } from "base58-js"
 
   const emptyDraft = {
     selectedInterface: "",
@@ -19,6 +20,9 @@
   let saveMessage = ""
   let isSaving = false
   let isDeriving = false
+  let showSecret = false
+
+  const BASE58_RE = /[^123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]/g
 
   onMount(() => {
     void loadWizard()
@@ -29,22 +33,26 @@
     loadingError = ""
 
     try {
-      const [stateResponse, interfacesResponse, draftResponse] = await Promise.all([
+      const [stateResponse, interfacesResponse, machineIdResponse, draftResponse] = await Promise.all([
         readJson("/setup/state"),
         readJson("/setup/interfaces"),
+        readJson("/setup/machine-id").catch(() => ({ machineId: "" })),
         readOptionalDraft()
       ])
 
       setupState = stateResponse
       interfaces = interfacesResponse.interfaces ?? []
 
+      const rawMachineId = machineIdResponse?.machineId ?? ""
+
       if (draftResponse?.draft) {
-        draft = { ...emptyDraft, ...draftResponse.draft }
+        draft = { ...emptyDraft, ...draftResponse.draft, machineIdentity: rawMachineId || draftResponse.draft.machineIdentity }
       } else {
         draft = {
           ...emptyDraft,
           selectedInterface: interfaces[0]?.name ?? "",
-          bindHost: firstEligibleAddress(interfaces) ?? ""
+          bindHost: firstEligibleAddress(interfaces) ?? "",
+          machineIdentity: rawMachineId
         }
       }
 
@@ -93,21 +101,25 @@
   }
 
   async function handleSecretInput(event) {
+    const filtered = event.currentTarget.value.replace(BASE58_RE, "")
     draft = {
       ...draft,
-      clusterSecret: event.currentTarget.value
+      clusterSecret: filtered
     }
 
-    await refreshMachineId()
+    if (filtered.length >= 40) {
+      await refreshMachineId()
+    } else {
+      deriveError = ""
+      draft = { ...draft, machineId: "" }
+    }
   }
 
-  async function handleMachineIdentityInput(event) {
-    draft = {
-      ...draft,
-      machineIdentity: event.currentTarget.value
-    }
-
-    await refreshMachineId()
+  function generateClusterSecret() {
+    const bytes = new Uint8Array(32)
+    crypto.getRandomValues(bytes)
+    draft = { ...draft, clusterSecret: binary_to_base58(bytes) }
+    void refreshMachineId()
   }
 
   async function refreshMachineId() {
@@ -135,7 +147,7 @@
 
       draft = {
         ...draft,
-        clusterSecret: draft.clusterSecret.trim().toLowerCase(),
+        clusterSecret: draft.clusterSecret.trim(),
         machineIdentity: draft.machineIdentity.trim(),
         machineId: response.machineId
       }
@@ -162,7 +174,9 @@
       })
 
       draft = { ...draft, ...response.draft }
-      saveMessage = "Draft saved locally."
+      saveMessage = response.draft._savedPath
+        ? `Configuration saved to ${response.draft._savedPath}`
+        : "Configuration saved."
     } catch (error) {
       saveError = error.message
     } finally {
@@ -232,13 +246,6 @@
         <div class="title-block">
           <p class="eyebrow">Replicore</p>
           <h1 id="setup-title">Node setup</h1>
-          <div class="chips" aria-label="Setup mode status">
-            <span class="chip">Loopback only</span>
-            <span class:chip={true} class:chip-active={Boolean(setupState?.configPath)}>
-              {setupState?.configPath ? "Draft persistence enabled" : "Draft persistence unavailable"}
-            </span>
-            <span class="chip">{interfaces.length} addresses discovered</span>
-          </div>
         </div>
         <dl class="meta">
           <div>
@@ -256,35 +263,23 @@
         <section class="group" aria-labelledby="network-title">
           <div class="group-header">
             <h2 id="network-title">Network</h2>
-            <p class="section-summary">Choose the address this node should advertise first.</p>
+            <p class="section-summary">Listen address for DATA CRUD API</p>
           </div>
 
-          <div class="split-grid">
-            <div class="stack">
-              <label class="field">
-                <span>Interface</span>
-                <select bind:value={draft.selectedInterface} on:change={handleInterfaceChange}>
-                  {#each Array.from(new Set(interfaces.map((record) => record.name))) as name}
-                    <option value={name}>{name}</option>
-                  {/each}
-                </select>
-              </label>
+          <div class="inline-fields">
+            <label class="field">
+              <span>Interface</span>
+              <select bind:value={draft.selectedInterface} on:change={handleInterfaceChange}>
+                {#each Array.from(new Set(interfaces.map((record) => record.name))) as name}
+                  <option value={name}>{name}</option>
+                {/each}
+              </select>
+            </label>
 
-              <label class="field">
-                <span>Bind host</span>
-                <input type="text" bind:value={draft.bindHost} readonly />
-              </label>
-            </div>
-
-            <div class="facts">
-              {#each selectedInterfaceRecords().slice(0, 3) as record}
-                <div class="fact-card">
-                  <div class="fact-label">{record.family}</div>
-                  <div class="fact-value">{record.address}</div>
-                  <div class="fact-meta">{record.eligibleForBind ? "Eligible for bind" : "Read-only address"}</div>
-                </div>
-              {/each}
-            </div>
+            <label class="field">
+              <span>Bind host</span>
+              <input type="text" bind:value={draft.bindHost} readonly />
+            </label>
           </div>
 
           <div class="interface-list" role="table" aria-label="Discovered addresses">
@@ -303,7 +298,7 @@
           </div>
         </section>
 
-        <section class="group" aria-labelledby="identity-title">
+        <section class="group group-identity" aria-labelledby="identity-title">
           <div class="group-header">
             <h2 id="identity-title">Cluster identity</h2>
             <p class="section-summary">The machine identifier is derived locally from the shared secret and raw machine identity.</p>
@@ -311,28 +306,34 @@
 
           <label class="field">
             <span>Cluster secret</span>
+            <div class="input-with-button">
+              <input
+                type={showSecret ? "text" : "password"}
+                value={draft.clusterSecret}
+                on:input={handleSecretInput}
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button type="button" on:click={generateClusterSecret}>Generate</button>
+              <button type="button" on:click={() => showSecret = !showSecret}>
+                {showSecret ? "Hide" : "Show"}
+              </button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Machine identity</span>
             <input
-              type="password"
-              value={draft.clusterSecret}
-              on:input={handleSecretInput}
-              autocomplete="off"
+              type="text"
+              value={draft.machineIdentity}
+              readonly
               spellcheck="false"
             />
           </label>
 
           <label class="field">
-            <span>Machine identity</span>
-            <textarea
-              rows="4"
-              value={draft.machineIdentity}
-              on:input={handleMachineIdentityInput}
-              spellcheck="false"
-            ></textarea>
-          </label>
-
-          <label class="field">
             <span>Derived machine identifier</span>
-            <textarea rows="3" bind:value={draft.machineId} readonly></textarea>
+            <input type="text" bind:value={draft.machineId} readonly />
           </label>
 
           <div class="inline-status">
@@ -347,7 +348,7 @@
         </section>
 
         <footer class="actions">
-          <button type="submit" disabled={isSaving || !draft.machineId}>Save draft</button>
+          <button type="submit" disabled={isSaving || !draft.machineId}>Save configuration</button>
           {#if saveError}
             <p class="error" role="alert">{saveError}</p>
           {:else if saveMessage}
