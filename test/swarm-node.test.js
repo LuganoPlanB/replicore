@@ -3865,6 +3865,120 @@ test("HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD cal
   }
 })
 
+test("HTTP admin routes validate bodies before node admin calls", { concurrency: false }, async () => {
+  const calls = {
+    rotateEncryptionKey: 0,
+    restoreSnapshot: 0
+  }
+  const node = {
+    async setHttpAddress() {},
+    rotateEncryptionKey(keyId) {
+      calls.rotateEncryptionKey += 1
+      return { keyId }
+    },
+    async restoreSnapshot(snapshot) {
+      calls.restoreSnapshot += 1
+      return snapshot
+    }
+  }
+  const server = new HolepunchHttpServer({
+    node,
+    auth: {
+      tokens: {
+        admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
+        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+      }
+    }
+  })
+
+  try {
+    await server.start()
+    const baseUrl = `http://${server.address.address}:${server.address.port}`
+
+    const unauthorizedRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keyId: "next" })
+    })
+    assert.equal(unauthorizedRotate.status, 401)
+    assert.equal(calls.rotateEncryptionKey, 0)
+
+    const forbiddenRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer writer",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "next" })
+    })
+    assert.equal(forbiddenRotate.status, 403)
+    assert.equal(calls.rotateEncryptionKey, 0)
+
+    const invalidRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "bad key" })
+    })
+    assert.equal(invalidRotate.status, 400)
+    const invalidRotatePayload = await invalidRotate.json()
+    assert.equal(invalidRotatePayload.code, "INVALID_REQUEST")
+    assert.equal(calls.rotateEncryptionKey, 0)
+
+    const unknownRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "next", extra: true })
+    })
+    assert.equal(unknownRotate.status, 400)
+    assert.equal(calls.rotateEncryptionKey, 0)
+
+    const malformedSnapshot = await fetch(`${baseUrl}/admin/snapshot/import`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ notSnapshot: true })
+    })
+    assert.equal(malformedSnapshot.status, 400)
+    const malformedSnapshotPayload = await malformedSnapshot.json()
+    assert.equal(malformedSnapshotPayload.code, "INVALID_REQUEST")
+    assert.equal(calls.restoreSnapshot, 0)
+
+    const validRotate = await fetch(`${baseUrl}/admin/encryption/rotate`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ keyId: "next-key" })
+    })
+    assert.equal(validRotate.status, 200)
+    assert.deepEqual(await validRotate.json(), { ok: true, keyId: "next-key" })
+    assert.equal(calls.rotateEncryptionKey, 1)
+
+    const validSnapshot = await fetch(`${baseUrl}/admin/snapshot/import`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ entries: [] })
+    })
+    assert.equal(validSnapshot.status, 200)
+    assert.deepEqual(await validSnapshot.json(), { ok: true })
+    assert.equal(calls.restoreSnapshot, 1)
+  } finally {
+    await server.close()
+  }
+})
+
 test("HTTP error payload suppresses internal cluster state in refusal responses", { concurrency: false }, async () => {
   const testnet = await createTestnet(2)
   const dirs = []

@@ -158,7 +158,16 @@ export class HolepunchHttpServer {
       if (req.method === "POST" && url.pathname === "/admin/snapshot/import") {
         this.#authorizeAdmin(req)
         this.#checkRateLimit(req, "admin")
-        const body = await this.#readJson(req, 1024 * 1024)
+        const body = requirePlainObject(await this.#readJson(req, 1024 * 1024), "Request body")
+        if (
+          !Array.isArray(body.entries)
+          && (!body.content || typeof body.content !== "object" || Array.isArray(body.content))
+        ) {
+          const error = new Error("Request body must look like a snapshot")
+          error.code = "INVALID_REQUEST"
+          error.statusCode = 400
+          throw error
+        }
         await this.options.node.restoreSnapshot(body)
         return this.#json(res, 200, { ok: true })
       }
@@ -166,10 +175,12 @@ export class HolepunchHttpServer {
       if (req.method === "POST" && url.pathname === "/admin/encryption/rotate") {
         this.#authorizeAdmin(req)
         this.#checkRateLimit(req, "admin")
-        const body = await this.#readJson(req)
+        const body = requirePlainObject(await this.#readJson(req), "Request body")
+        rejectUnknownKeys(body, ["keyId"])
+        const keyId = validateKeyspace(body.keyId)
         return this.#json(res, 200, {
           ok: true,
-          ...this.options.node.rotateEncryptionKey(body.keyId)
+          ...this.options.node.rotateEncryptionKey(keyId)
         })
       }
 
