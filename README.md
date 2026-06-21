@@ -54,6 +54,34 @@ Replicore is intended for non-Byzantine production use only within the boundarie
 npm install
 ```
 
+## Docker Deployment
+
+Copy the environment template and fill in your values:
+
+```
+cp .env.example .env
+```
+
+Required variables: `CLUSTER_ID`, `CLUSTER_SECRET` (64-char hex), `IDENTITY_SEED`
+(64-char hex), `ENCRYPTION_KEY` (64-char hex). Generate with `openssl rand -hex 32`.
+
+Start with Caddy reverse proxy (auto-TLS for a real domain):
+
+```
+docker compose up -d
+```
+
+The node exposes its HTTP API internally on port 3000. Caddy proxies
+`${DOMAIN}:443` → `replicore:3000`. A fixed UDP port (default 49737) is
+published for DHT inbound traffic. `/etc/machine-id` is mounted read-only from
+the host to derive the cluster-scoped machine identity.
+
+The entrypoint prints the derived DHT topic (base58) so you can verify it
+matches between nodes.
+
+All runtime fields can be set via environment variables. See `.env.example` for
+the full list.
+
 ## Local Run
 
 Start a local HyperDHT bootstrap node:
