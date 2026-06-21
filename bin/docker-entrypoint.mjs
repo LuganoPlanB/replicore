@@ -114,10 +114,10 @@ async function main() {
   const dataDir = process.env.DATA_DIR || "/data"
   const configPath = path.join(dataDir, "runtime-config.json")
 
-  let machineIdentity = process.env.SERVICE_BASE64_MACHINE_IDENTITY
+  let machineIdentity = await readPersistedMachineIdentity(configPath)
+    || process.env.SERVICE_BASE64_MACHINEID
     || process.env.MACHINE_IDENTITY
     || await readMachineIdentity()
-    || await readPersistedMachineIdentity(configPath)
     || generateMachineIdentity()
 
   const identitySeed = await deriveClusterScopedBytes({
