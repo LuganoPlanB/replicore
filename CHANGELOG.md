@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.0 - 2026-06-21
+
+### Features
+
+- add Caddy reverse proxy and docker-compose.yml (12c42aa)
+- add Dockerfile (multi-stage, node:lts-alpine) and docker-entrypoint (c0cf892)
+
 ## v0.3.0 - 2026-06-21
 
 ### Features
