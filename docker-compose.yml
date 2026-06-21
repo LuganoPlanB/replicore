@@ -43,11 +43,18 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
     environment:
       DOMAIN: ${DOMAIN:-localhost}
       REPLICORE_HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
+    command: >
+      sh -c '
+        if [ -n "$$DOMAIN" ] && [ "$$DOMAIN" != "localhost" ]; then
+          exec caddy reverse-proxy --from "$$DOMAIN" --to "replicore:$$REPLICORE_HTTP_PORT"
+        else
+          exec caddy reverse-proxy --from :80 --to "replicore:$$REPLICORE_HTTP_PORT"
+        fi
+      '
 
 volumes:
   replicore_data:
