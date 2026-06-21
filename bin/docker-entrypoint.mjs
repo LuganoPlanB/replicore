@@ -156,7 +156,7 @@ async function main() {
     electionTimeoutMaxMs: parseIntEnv("ELECTION_TIMEOUT_MAX_MS", 1500),
     requestTimeoutMs: parseIntEnv("REQUEST_TIMEOUT_MS", 5000),
     maxInflightReplication: parseIntEnv("MAX_INFLIGHT_REPLICATION", 16),
-    forwarding: parseBooleanEnv("FORWARDING", true),
+    forwarding: true,
     durability: {
       requiredFollowerAcks: parseIntEnv("DURABILITY_ACKS", 1),
       timeoutMs: parseIntEnv("DURABILITY_TIMEOUT_MS", 5000)
