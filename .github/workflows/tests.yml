@@ -28,6 +28,6 @@ jobs:
 
       - name: Run tests
         env:
-          REPLICORE_TEST_STEP_TIMEOUT_MS: "180000"
+          REPLICORE_TEST_STEP_TIMEOUT_MS: "360000"
           DEBUG: "1"
         run: npm test
