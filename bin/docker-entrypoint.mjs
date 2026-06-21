@@ -3,17 +3,18 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { base58Encode } from "../src/base58.js"
-import { deriveDiscoveryTopic } from "../src/cluster-secret.js"
+import {
+  deriveClusterScopedBytes,
+  deriveDiscoveryTopic
+} from "../src/cluster-secret.js"
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DRY_RUN = process.argv.includes("--dry-run")
 
-const REQUIRED_VARS = [
-  "CLUSTER_ID",
-  "CLUSTER_SECRET",
-  "IDENTITY_SEED",
-  "ENCRYPTION_KEY"
-]
+const NODE_IDENTITY_PURPOSE = "replicore:node-identity:v1"
+const ENCRYPTION_KEY_PURPOSE = "replicore:encryption-key:v1"
+
+const REQUIRED_VARS = ["CLUSTER_ID", "CLUSTER_SECRET"]
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -78,6 +79,10 @@ function validateHex(value, name, byteLength) {
   }
 }
 
+function bufferToHex(buf) {
+  return buf.toString("hex")
+}
+
 async function main() {
   for (const name of REQUIRED_VARS) {
     requireEnv(name)
@@ -85,21 +90,50 @@ async function main() {
 
   const clusterId = process.env.CLUSTER_ID
   const clusterSecretHex = process.env.CLUSTER_SECRET
-  const identitySeedHex = process.env.IDENTITY_SEED
-  const encryptionKeyHex = process.env.ENCRYPTION_KEY
 
   validateHex(clusterSecretHex, "CLUSTER_SECRET", 32)
-  validateHex(identitySeedHex, "IDENTITY_SEED", 32)
-  validateHex(encryptionKeyHex, "ENCRYPTION_KEY", 32)
 
   const clusterSecret = Buffer.from(clusterSecretHex, "hex")
+
+  const machineIdentity = await readMachineIdentity()
+  if (!machineIdentity) {
+    console.error("Cannot read /etc/machine-id; mount it from the host with /etc/machine-id:/etc/machine-id:ro")
+    process.exit(1)
+  }
+
+  const identitySeed = await deriveClusterScopedBytes({
+    clusterSecret,
+    purpose: NODE_IDENTITY_PURPOSE,
+    context: machineIdentity,
+    length: 32
+  })
+
+  const encryptionKey = await deriveClusterScopedBytes({
+    clusterSecret,
+    purpose: ENCRYPTION_KEY_PURPOSE,
+    context: clusterId,
+    length: 32
+  })
+
+  const topic = await deriveDiscoveryTopic({ clusterSecret, clusterId })
+
+  console.log(
+    JSON.stringify({
+      type: "derived-keys",
+      topicBase58: base58Encode(topic),
+      identitySeed: bufferToHex(identitySeed),
+      encryptionKey: bufferToHex(encryptionKey),
+      machineIdentity
+    })
+  )
 
   const config = {
     dataDir: process.env.DATA_DIR || "/data",
     clusterId,
     clusterSecret: clusterSecretHex,
-    identitySeed: identitySeedHex,
-    encryptionKey: encryptionKeyHex,
+    identitySeed: bufferToHex(identitySeed),
+    encryptionKey: bufferToHex(encryptionKey),
+    machineIdentity,
     role: process.env.ROLE || "voter",
     initCluster: parseBooleanEnv("INIT_CLUSTER", false),
     compatibilityMode: process.env.COMPATIBILITY_MODE || undefined,
@@ -126,24 +160,6 @@ async function main() {
 
   if (process.env.ELECTION_TIMEOUT_SEED) {
     config.electionTimeoutSeed = process.env.ELECTION_TIMEOUT_SEED
-  }
-
-  const machineIdentity = await readMachineIdentity()
-  if (machineIdentity) {
-    config.machineIdentity = machineIdentity
-  }
-
-  try {
-    const topic = await deriveDiscoveryTopic({ clusterSecret, clusterId })
-    console.log(
-      JSON.stringify({
-        type: "dht-topic",
-        topicBase58: base58Encode(topic)
-      })
-    )
-  } catch (err) {
-    console.error("Failed to derive DHT topic:", err.message)
-    process.exit(1)
   }
 
   if (DRY_RUN) {
