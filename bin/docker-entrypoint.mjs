@@ -11,6 +11,7 @@ import {
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DRY_RUN = process.argv.includes("--dry-run")
 
+const CLUSTER_ID_PURPOSE = "replicore:cluster-id:v1"
 const NODE_IDENTITY_PURPOSE = "replicore:node-identity:v1"
 const ENCRYPTION_KEY_PURPOSE = "replicore:encryption-key:v1"
 
@@ -88,12 +89,20 @@ async function main() {
     requireEnv(name)
   }
 
-  const clusterId = process.env.CLUSTER_ID || "default"
   const clusterSecretHex = process.env.CLUSTER_SECRET
 
   validateHex(clusterSecretHex, "CLUSTER_SECRET", 32)
 
   const clusterSecret = Buffer.from(clusterSecretHex, "hex")
+
+  const clusterId = base58Encode(
+    await deriveClusterScopedBytes({
+      clusterSecret,
+      purpose: CLUSTER_ID_PURPOSE,
+      context: "cluster-id",
+      length: 8
+    })
+  )
 
   const machineIdentity = await readMachineIdentity()
   if (!machineIdentity) {
@@ -120,6 +129,7 @@ async function main() {
   console.log(
     JSON.stringify({
       type: "derived-keys",
+      clusterId,
       topicBase58: base58Encode(topic),
       identitySeed: bufferToHex(identitySeed),
       encryptionKey: bufferToHex(encryptionKey),

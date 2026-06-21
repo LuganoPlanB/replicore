@@ -63,9 +63,10 @@ cp .env.example .env
 ```
 
 Only `CLUSTER_SECRET` (64-char hex) is required. Generate with `openssl rand -hex 32`.
-The entrypoint derives `identitySeed`, `encryptionKey`, and the DHT topic from it.
-`CLUSTER_ID` defaults to `"default"` — set it explicitly if you run multiple clusters
-(it participates in KDF salt derivation, so all nodes in one cluster must share it).
+The entrypoint derives everything else — `clusterId`, `identitySeed`, `encryptionKey`,
+and the DHT topic — using the same purpose-scoped argon2id KDF as the core library.
+All nodes with the same `CLUSTER_SECRET` derive identical keys (except `identitySeed`,
+which is unique per machine via `/etc/machine-id`).
 
 Start with Caddy reverse proxy (auto-TLS for a real domain):
 
