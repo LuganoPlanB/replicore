@@ -11,6 +11,7 @@ import {
   SetupHttpServer,
   writeSetupDraft
 } from "../src/index.js"
+import { base58Encode } from "../src/base58.js"
 
 const cli = parseCli(process.argv.slice(2))
 
@@ -110,8 +111,8 @@ if (cli.setup) {
     JSON.stringify(
       {
         type: "node-ready",
-        nodeId: config.identity.publicKeyId,
-        feedKey: config.identity.feedKey,
+        nodeId: base58Encode(Buffer.from(config.identity.publicKeyId, "hex")),
+        feedKey: base58Encode(Buffer.from(config.identity.feedKey, "hex")),
         dataDir: config.dataDir,
         http: http.address,
         leader: node.currentLeader()
