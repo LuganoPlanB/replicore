@@ -5,17 +5,13 @@ services:
     container_name: replicore
     restart: unless-stopped
     volumes:
-      - replicore_data:/data
+      - ./volumes/replicore:/data
       - /etc/machine-id:/etc/machine-id:ro
     environment:
       # --- Required ---
       CLUSTER_SECRET: ${CLUSTER_SECRET:?}
-      # CLUSTER_ID, IDENTITY_SEED, and ENCRYPTION_KEY are derived by the entrypoint
-      # from CLUSTER_SECRET + /etc/machine-id + purpose.
       # --- Optional (defaults shown) ---
-      ROLE: ${ROLE:-voter}
       INIT_CLUSTER: ${INIT_CLUSTER:-false}
-      COMPATIBILITY_MODE: ${COMPATIBILITY_MODE:-}
       HTTP_HOST: ${HTTP_HOST:-0.0.0.0}
       HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
       AUTH_TOKENS: ${AUTH_TOKENS:-}
@@ -33,7 +29,7 @@ services:
     expose:
       - "${REPLICORE_HTTP_PORT:-3000}"
     ports:
-      - "${REPLICORE_DHT_PORT:-49737}:${REPLICORE_DHT_PORT:-49737}/udp"
+      - "${REPLICORE_DHT_PORT:-59737}:${REPLICORE_DHT_PORT:-49737}/udp"
 
   caddy:
     image: caddy:2-alpine
@@ -43,7 +39,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - caddy_data:/data
+      - ./volumes/caddy:/data
     environment:
       DOMAIN: ${DOMAIN:-localhost}
       REPLICORE_HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
@@ -55,7 +51,3 @@ services:
           exec caddy reverse-proxy --from :80 --to "replicore:$$REPLICORE_HTTP_PORT"
         fi
       '
-
-volumes:
-  replicore_data:
-  caddy_data:
