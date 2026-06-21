@@ -1,0 +1,55 @@
+services:
+  replicore:
+    build: .
+    image: replicore:latest
+    container_name: replicore
+    restart: unless-stopped
+    volumes:
+      - replicore_data:/data
+      - /etc/machine-id:/etc/machine-id:ro
+    environment:
+      # --- Required ---
+      CLUSTER_ID: ${CLUSTER_ID:?}
+      CLUSTER_SECRET: ${CLUSTER_SECRET:?}
+      IDENTITY_SEED: ${IDENTITY_SEED:?}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?}
+      # --- Optional (defaults shown) ---
+      ROLE: ${ROLE:-voter}
+      INIT_CLUSTER: ${INIT_CLUSTER:-false}
+      COMPATIBILITY_MODE: ${COMPATIBILITY_MODE:-}
+      HTTP_HOST: ${HTTP_HOST:-0.0.0.0}
+      HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
+      AUTH_TOKENS: ${AUTH_TOKENS:-}
+      BOOTSTRAP: ${BOOTSTRAP:-}
+      HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-500}
+      HEARTBEAT_TTL_MS: ${HEARTBEAT_TTL_MS:-3000}
+      ELECTION_TIMEOUT_MIN_MS: ${ELECTION_TIMEOUT_MIN_MS:-900}
+      ELECTION_TIMEOUT_MAX_MS: ${ELECTION_TIMEOUT_MAX_MS:-1500}
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-5000}
+      MAX_INFLIGHT_REPLICATION: ${MAX_INFLIGHT_REPLICATION:-16}
+      FORWARDING: ${FORWARDING:-true}
+      DURABILITY_ACKS: ${DURABILITY_ACKS:-1}
+      DURABILITY_TIMEOUT_MS: ${DURABILITY_TIMEOUT_MS:-5000}
+      ELECTION_TIMEOUT_SEED: ${ELECTION_TIMEOUT_SEED:-}
+    expose:
+      - "${REPLICORE_HTTP_PORT:-3000}"
+    ports:
+      - "${REPLICORE_DHT_PORT:-49737}:${REPLICORE_DHT_PORT:-49737}/udp"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: replicore-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      REPLICORE_HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
+
+volumes:
+  replicore_data:
+  caddy_data:
