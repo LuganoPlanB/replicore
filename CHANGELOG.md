@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.0 - 2026-06-21
+
+### Features
+
+- log values as base58, remove sensitive fields, use consistent naming (01364cb)
+- add cluster role radio to setup UI (e6acb9d)
+- accept base58 alongside hex for CLUSTER_SECRET and all secret fields (c9d2840)
+
+### Bug Fixes
+
+- switch Docker to Debian-slim and add volume permission fix (17ebdfa)
+- use Caddy reverse-proxy CLI instead of Caddyfile mount (b46deea)
+
 ## v0.4.0 - 2026-06-21
 
 ### Features
