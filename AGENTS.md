@@ -31,6 +31,15 @@ Do not redesign this into Redis, SQL clustering, or general multi-writer consens
 - Do not commit `.gestalt/`.
 - Do not touch `holepunch-stack/`. It is vendored reference material, not project code.
 
+## Docker
+
+- [Dockerfile](C:/Users/denis/devel/planb-cleard/Dockerfile:1): multi-stage (build setup-ui, run production-only on `node:lts-alpine`)
+- [docker-compose.yml](C:/Users/denis/devel/planb-cleard/docker-compose.yml:1): replicore + Caddy reverse proxy
+- [bin/docker-entrypoint.mjs](C:/Users/denis/devel/planb-cleard/bin/docker-entrypoint.mjs:1): reads env vars, writes runtime-config.json to `/data`, derives & prints DHT topic as base58, execs `run-node.js`
+- [.env.example](C:/Users/denis/devel/planb-cleard/.env.example:1): all configurable env vars (Coolify-compatible)
+- `/etc/machine-id` is mounted read-only from the host into the container to derive `machineIdentity`
+- Fixed UDP port (default 49737) is published for DHT inbound traffic
+
 ## Key Files
 
 - [src/node.js](C:/Users/denis/devel/planb-cleard/src/node.js:1): main swarm node logic
@@ -88,6 +97,6 @@ These are expected missing pieces, not accidental omissions:
 - key rotation
 - log pruning / archival
 - production backup lifecycle
-- deployment packaging
+- deployment packaging (Docker + Caddy provided, but no Kubernetes/Helm)
 
 If you add any of these, keep the implementation incremental and do not silently broaden the system model.
