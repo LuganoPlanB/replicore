@@ -117,11 +117,14 @@ test("loadRuntimeConfig requires a 32-byte clusterSecret", async () => {
 
     delete raw.clusterSecret
     await writeFile(configPath, JSON.stringify(raw, null, 2))
-    await assert.rejects(loadRuntimeConfig(configPath), /clusterSecret must be a hex string/)
+    await assert.rejects(loadRuntimeConfig(configPath), /clusterSecret must be a non-empty hex or base58 string/)
 
     raw.clusterSecret = "xyz"
     await writeFile(configPath, JSON.stringify(raw, null, 2))
-    await assert.rejects(loadRuntimeConfig(configPath), /clusterSecret must be a hex string/)
+    await assert.rejects(
+      loadRuntimeConfig(configPath),
+      /clusterSecret must decode to 32 bytes/
+    )
 
     raw.clusterSecret = "aa"
     await writeFile(configPath, JSON.stringify(raw, null, 2))

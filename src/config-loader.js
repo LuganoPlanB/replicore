@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 
+import { decodeHexOrBase58 } from "./base58.js"
 import { generateIdentity } from "./crypto.js"
 import { verifyOrPersistRuntimeGuardrails } from "./runtime-guardrails.js"
 
@@ -322,11 +323,17 @@ function requireBoundedInteger(value, field, { min, max }) {
 }
 
 function requireHex(value, field, exactLength) {
-  if (typeof value !== "string" || !/^[0-9a-fA-F]+$/.test(value)) {
-    throw new Error(`${field} must be a hex string`)
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${field} must be a non-empty hex or base58 string`)
   }
 
-  const buffer = Buffer.from(value, "hex")
+  let buffer
+  try {
+    buffer = decodeHexOrBase58(value)
+  } catch {
+    throw new Error(`${field} must be a hex or base58 string`)
+  }
+
   if (exactLength && buffer.length !== exactLength) {
     throw new Error(`${field} must decode to ${exactLength} bytes`)
   }

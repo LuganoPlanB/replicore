@@ -2,10 +2,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { base58Encode } from "../src/base58.js"
+import { base58Encode, decodeHexOrBase58 } from "../src/base58.js"
 import {
   deriveClusterScopedBytes,
-  deriveDiscoveryTopic
+  deriveDiscoveryTopic,
+  deriveMachineId
 } from "../src/cluster-secret.js"
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
@@ -69,31 +70,23 @@ async function readMachineIdentity() {
   }
 }
 
-function validateHex(value, name, byteLength) {
-  if (typeof value !== "string" || !/^[0-9a-fA-F]+$/.test(value)) {
-    console.error(`${name} must be a hex string, got: ${value}`)
-    process.exit(1)
-  }
-  if (byteLength !== undefined && Buffer.from(value, "hex").length !== byteLength) {
-    console.error(`${name} must decode to ${byteLength} bytes, got ${Buffer.from(value, "hex").length} bytes`)
-    process.exit(1)
-  }
-}
-
-function bufferToHex(buf) {
-  return buf.toString("hex")
-}
-
 async function main() {
   for (const name of REQUIRED_VARS) {
     requireEnv(name)
   }
 
-  const clusterSecretHex = process.env.CLUSTER_SECRET
-
-  validateHex(clusterSecretHex, "CLUSTER_SECRET", 32)
-
-  const clusterSecret = Buffer.from(clusterSecretHex, "hex")
+  const clusterSecretRaw = process.env.CLUSTER_SECRET
+  let clusterSecret
+  try {
+    clusterSecret = decodeHexOrBase58(clusterSecretRaw)
+  } catch {
+    console.error(`CLUSTER_SECRET must be a hex or base58 string, got: ${clusterSecretRaw}`)
+    process.exit(1)
+  }
+  if (clusterSecret.length !== 32) {
+    console.error(`CLUSTER_SECRET must decode to 32 bytes, got ${clusterSecret.length} bytes`)
+    process.exit(1)
+  }
 
   const clusterId = base58Encode(
     await deriveClusterScopedBytes({
@@ -126,27 +119,29 @@ async function main() {
 
   const topic = await deriveDiscoveryTopic({ clusterSecret, clusterId })
 
+  const machineId = await deriveMachineId({ clusterSecret, machineIdentity })
+
   console.log(
     JSON.stringify({
       type: "derived-keys",
       clusterId,
-      topicBase58: base58Encode(topic),
-      identitySeed: bufferToHex(identitySeed),
-      encryptionKey: bufferToHex(encryptionKey),
-      machineIdentity
+      topic: base58Encode(topic),
+      machineId: base58Encode(machineId)
     })
   )
+
+  const initCluster = parseBooleanEnv("INIT_CLUSTER", false)
+  const role = initCluster ? "voter" : "learner"
 
   const config = {
     dataDir: process.env.DATA_DIR || "/data",
     clusterId,
-    clusterSecret: clusterSecretHex,
-    identitySeed: bufferToHex(identitySeed),
-    encryptionKey: bufferToHex(encryptionKey),
+    clusterSecret: base58Encode(clusterSecret),
+    identitySeed: base58Encode(identitySeed),
+    encryptionKey: base58Encode(encryptionKey),
     machineIdentity,
-    role: process.env.ROLE || "voter",
-    initCluster: parseBooleanEnv("INIT_CLUSTER", false),
-    compatibilityMode: process.env.COMPATIBILITY_MODE || undefined,
+    role,
+    initCluster,
     http: {
       host: process.env.HTTP_HOST || "0.0.0.0",
       port: parseIntEnv("HTTP_PORT", 3000)
@@ -172,6 +167,14 @@ async function main() {
     config.electionTimeoutSeed = process.env.ELECTION_TIMEOUT_SEED
   }
 
+  if (!initCluster && role === "voter") {
+    console.error(
+      "Voter role requires INIT_CLUSTER=true.\n" +
+        "Set INIT_CLUSTER=true, or remove ROLE=voter to join as a learner."
+    )
+    process.exit(1)
+  }
+
   if (DRY_RUN) {
     console.log(
       JSON.stringify({ type: "config-dry-run", config }, null, 2)
@@ -191,7 +194,6 @@ async function main() {
       configPath,
       dataDir,
       clusterId,
-      role: config.role,
       httpPort: config.http.port
     })
   )
