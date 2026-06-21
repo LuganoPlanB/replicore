@@ -1,9 +1,14 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 
-import { decodeHexOrBase58 } from "./base58.js"
+import { base58Encode, decodeHexOrBase58 } from "./base58.js"
+import { deriveClusterScopedBytes } from "./cluster-secret.js"
 import { generateIdentity } from "./crypto.js"
 import { verifyOrPersistRuntimeGuardrails } from "./runtime-guardrails.js"
+
+const CLUSTER_ID_PURPOSE = "replicore:cluster-id:v1"
+const NODE_IDENTITY_PURPOSE = "replicore:node-identity:v1"
+const ENCRYPTION_KEY_PURPOSE = "replicore:encryption-key:v1"
 
 /**
  * Load and normalize a node runtime config from JSON.
@@ -14,84 +19,86 @@ export async function loadRuntimeConfig(configPath) {
   const absolutePath = path.resolve(configPath)
   const raw = JSON.parse(await readFile(absolutePath, "utf8"))
 
-  const identitySeed = requireHex(raw.identitySeed ?? raw.nodeIdentitySeed, "identitySeed")
-  const identity = generateIdentity(identitySeed)
-  const role = normalizeRole(raw.role)
-  const initCluster = normalizeInitCluster(raw.initCluster)
-  const compatibilityMode = normalizeCompatibilityMode(raw.compatibilityMode)
+  const clusterSecret = requireHex(raw.clusterSecret, "clusterSecret", 32)
   const machineId = normalizeMachineIdentity(raw)
-
-  let authorizedNodes = normalizeAuthorizedNodes(raw, {
-    required: compatibilityMode === "legacy-static-membership"
-  })
-  const localIncluded = authorizedNodes.some((node) => node.nodeId === identity.publicKeyId)
-  let normalizedCompatibilityMode = compatibilityMode
-  let revokedNodeIds = []
-
-  if (compatibilityMode === "legacy-static-membership") {
-    if (initCluster) {
-      throw new Error('initCluster cannot be combined with compatibilityMode "legacy-static-membership"')
-    }
-    if (role === "voter" && !localIncluded) {
-      throw new Error("Authorized nodes do not include the local identity")
-    }
-    if (role === "learner" && localIncluded) {
-      throw new Error("Learner config must not include the local identity in authorizedNodes")
-    }
-    if (role === "learner") {
-      throw new Error('compatibilityMode "legacy-static-membership" is incompatible with role "learner"')
-    }
-    revokedNodeIds = normalizeRevokedNodeIds(raw, authorizedNodes)
-  } else {
-    normalizedCompatibilityMode = "secret-first"
-    if (authorizedNodes.length > 0) {
-      throw new Error(
-        'Static membership config requires compatibilityMode "legacy-static-membership"'
-      )
-    }
-    if (raw.revokedNodeIds !== undefined) {
-      throw new Error(
-        'Secret-first config must omit revokedNodeIds until membership is committed in-cluster'
-      )
-    }
-    if (role === "learner") {
-      if (initCluster) {
-        throw new Error("initCluster may only be used with voter role")
-      }
-    } else if (initCluster) {
-      authorizedNodes = [{
-        nodeId: identity.publicKeyId,
-        publicKey: identity.publicKey,
-        feedKey: identity.feedKey
-      }]
-    } else {
-      throw new Error(
-        'Secret-first voter config requires initCluster: true; joining nodes must use role "learner"'
-      )
-    }
+  const initCluster = normalizeInitCluster(raw.initCluster)
+  const role = raw.role ?? (initCluster ? "voter" : "learner")
+  if (role !== "voter" && role !== "learner") {
+    throw new Error("role must be either voter or learner")
   }
-  if (revokedNodeIds.includes(identity.publicKeyId)) {
-    throw new Error("Local identity is revoked in config")
+  if (initCluster && role !== "voter") {
+    throw new Error("initCluster may only be used with voter role")
   }
-  const encryption = normalizeEncryption(raw)
+
+  const clusterId = raw.clusterId ?? base58Encode(
+    await deriveClusterScopedBytes({
+      clusterSecret,
+      purpose: CLUSTER_ID_PURPOSE,
+      context: "cluster-id",
+      length: 8
+    })
+  )
+
+  const identitySeed = raw.identitySeed
+    ? requireHex(raw.identitySeed, "identitySeed")
+    : await deriveClusterScopedBytes({
+        clusterSecret,
+        purpose: NODE_IDENTITY_PURPOSE,
+        context: machineId,
+        length: 32
+      })
+
+  const identity = generateIdentity(identitySeed)
+
+  const encryption = raw.encryption
+    ? normalizeEncryption(raw)
+    : raw.encryptionKey
+      ? normalizeEncryption(raw)
+      : {
+          currentKeyId: "default",
+          keys: {
+            default: await deriveClusterScopedBytes({
+              clusterSecret,
+              purpose: ENCRYPTION_KEY_PURPOSE,
+              context: clusterId,
+              length: 32
+            })
+          }
+        }
+
+  let authorizedNodes = []
+  const revokedNodeIds = []
+
+  if (initCluster) {
+    authorizedNodes = [{
+      nodeId: identity.publicKeyId,
+      publicKey: identity.publicKey,
+      feedKey: identity.feedKey
+    }]
+  } else if (role === "voter") {
+    throw new Error(
+      'Secret-first voter config requires initCluster: true; joining nodes must use role "learner"'
+    )
+  }
+
   const raft = normalizeRaftTimings(raw)
   const dataDir = path.resolve(path.dirname(absolutePath), raw.dataDir)
 
   await verifyOrPersistRuntimeGuardrails({
     dataDir,
-    clusterId: requireString(raw.clusterId, "clusterId"),
-    clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
+    clusterId,
+    clusterSecret,
     identity,
-    compatibilityMode: normalizedCompatibilityMode,
+    compatibilityMode: "secret-first",
     initCluster
   })
 
   return {
     configPath: absolutePath,
     dataDir,
-    clusterId: requireString(raw.clusterId, "clusterId"),
-    clusterSecret: requireHex(raw.clusterSecret, "clusterSecret", 32),
-    compatibilityMode: normalizedCompatibilityMode,
+    clusterId,
+    clusterSecret,
+    compatibilityMode: "secret-first",
     role,
     initCluster,
     machineId,
@@ -122,26 +129,12 @@ export async function loadRuntimeConfig(configPath) {
   }
 }
 
-function normalizeRole(value) {
-  if (value === undefined) return "voter"
-  if (value === "voter" || value === "learner") return value
-  throw new Error("role must be either voter or learner")
-}
-
 function normalizeInitCluster(value) {
   if (value === undefined) return false
   if (typeof value !== "boolean") {
     throw new Error("initCluster must be a boolean when provided")
   }
   return value
-}
-
-function normalizeCompatibilityMode(value) {
-  if (value === undefined) return null
-  if (value === "legacy-static-membership") return value
-  throw new Error(
-    'compatibilityMode must be "legacy-static-membership" when provided'
-  )
 }
 
 function normalizeMachineIdentity(raw) {
@@ -154,48 +147,6 @@ function normalizeMachineIdentity(raw) {
   }
 
   return configMachineIdentity ?? legacyMachineId
-}
-
-function normalizeAuthorizedNodes(raw, options = {}) {
-  const required = options.required ?? true
-
-  if (Array.isArray(raw.authorizedNodeSeeds) && raw.authorizedNodeSeeds.length > 0) {
-    return raw.authorizedNodeSeeds.map((seed, index) => {
-      const identity = generateIdentity(requireHex(seed, `authorizedNodeSeeds[${index}]`))
-      return {
-        nodeId: identity.publicKeyId,
-        publicKey: identity.publicKey,
-        feedKey: identity.feedKey
-      }
-    })
-  }
-
-  if (Array.isArray(raw.authorizedNodes) && raw.authorizedNodes.length > 0) {
-    return raw.authorizedNodes.map((node, index) => ({
-      nodeId: requireString(node.nodeId, `authorizedNodes[${index}].nodeId`),
-      publicKey: requireHex(node.publicKey, `authorizedNodes[${index}].publicKey`),
-      feedKey: requireString(node.feedKey, `authorizedNodes[${index}].feedKey`)
-    }))
-  }
-
-  if (!required) return []
-  throw new Error("Config must include authorizedNodeSeeds or authorizedNodes")
-}
-
-function normalizeRevokedNodeIds(raw, authorizedNodes) {
-  if (raw.revokedNodeIds === undefined) return []
-  if (!Array.isArray(raw.revokedNodeIds)) {
-    throw new Error("revokedNodeIds must be an array")
-  }
-
-  const knownNodeIds = new Set(authorizedNodes.map((node) => node.nodeId))
-  return raw.revokedNodeIds.map((nodeId, index) => {
-    const normalized = requireString(nodeId, `revokedNodeIds[${index}]`)
-    if (!knownNodeIds.has(normalized)) {
-      throw new Error(`revokedNodeIds[${index}] must reference an authorized node`)
-    }
-    return normalized
-  })
 }
 
 function normalizeEncryption(raw) {

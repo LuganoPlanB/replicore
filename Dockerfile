@@ -22,9 +22,9 @@ COPY --from=build /build/dist/ ./dist/
 
 COPY bin/docker-entrypoint.mjs ./bin/docker-entrypoint.mjs
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl libatomic1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl libatomic1 gosu && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -r replicore && useradd -r -g replicore -s /bin/sh replicore
+RUN groupadd -r replicore && useradd -r -g replicore replicore
 RUN mkdir -p /data && chown replicore:replicore /data
 
 COPY bin/docker-startup.sh /usr/local/bin/docker-startup.sh

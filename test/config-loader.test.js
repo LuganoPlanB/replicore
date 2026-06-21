@@ -23,19 +23,19 @@ test("loadRuntimeConfig derives identities and resolves paths", async () => {
   try {
     const configPath = path.join(dir, "node.json")
     const raw = JSON.parse(
-      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
     )
     raw.dataDir = "./data"
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
     const config = await loadRuntimeConfig(configPath)
-    assert.equal(config.clusterId, "local-demo")
+    assert.equal(config.clusterId, "local-demo-fresh")
     assert.equal(config.clusterSecret.length, 32)
-    assert.equal(config.compatibilityMode, "legacy-static-membership")
-    assert.equal(config.machineId, "local-demo-node-1")
-    assert.equal(config.http.port, 3001)
-    assert.equal(config.authorizedNodes.length, 3)
+    assert.equal(config.compatibilityMode, "secret-first")
+    assert.equal(config.machineId, "local-demo-init-node")
+    assert.equal(config.http.port, 3010)
+    assert.equal(config.authorizedNodes.length, 1)
     assert.equal(config.dataDir, path.join(dir, "data"))
     assert.equal(config.electionTimeoutMinMs, 900)
     assert.equal(config.electionTimeoutMaxMs, 1500)
@@ -137,34 +137,6 @@ test("loadRuntimeConfig requires a 32-byte clusterSecret", async () => {
   }
 })
 
-test("loadRuntimeConfig requires an explicit legacy compatibility mode for static membership files", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-compat-"))
-
-  try {
-    const configPath = path.join(dir, "node.json")
-    const raw = JSON.parse(
-      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
-    )
-    raw.dataDir = "./data"
-
-    delete raw.compatibilityMode
-    await writeFile(configPath, JSON.stringify(raw, null, 2))
-    await assert.rejects(
-      loadRuntimeConfig(configPath),
-      /Static membership config requires compatibilityMode "legacy-static-membership"/
-    )
-
-    raw.compatibilityMode = "wrong-mode"
-    await writeFile(configPath, JSON.stringify(raw, null, 2))
-    await assert.rejects(
-      loadRuntimeConfig(configPath),
-      /compatibilityMode must be "legacy-static-membership" when provided/
-    )
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
 test("loadRuntimeConfig rejects a secret-first voter without initCluster", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-missing-init-"))
 
@@ -175,6 +147,7 @@ test("loadRuntimeConfig rejects a secret-first voter without initCluster", async
     )
     raw.dataDir = "./data"
     delete raw.initCluster
+    raw.role = "voter"
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
@@ -285,13 +258,13 @@ test("loadRuntimeConfig rejects missing persisted identity metadata", async () =
   }
 })
 
-test("loadRuntimeConfig supports encryption keyrings and revoked writers", async () => {
+test("loadRuntimeConfig supports encryption keyrings", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-rotation-"))
 
   try {
     const configPath = path.join(dir, "node.json")
     const raw = JSON.parse(
-      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+      await readFile(path.resolve("examples/local/init-node.json"), "utf8")
     )
     raw.dataDir = "./data"
     raw.encryption = {
@@ -302,15 +275,12 @@ test("loadRuntimeConfig supports encryption keyrings and revoked writers", async
       }
     }
     delete raw.encryptionKey
-    const revokedIdentity = generateIdentity(Buffer.from(raw.authorizedNodeSeeds[2], "hex"))
-    raw.revokedNodeIds = [revokedIdentity.publicKeyId]
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
     const config = await loadRuntimeConfig(configPath)
     assert.equal(config.encryption.currentKeyId, "primary")
     assert.equal(Buffer.isBuffer(config.encryption.keys.primary), true)
-    assert.deepEqual(config.revokedNodeIds, [revokedIdentity.publicKeyId])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -393,24 +363,23 @@ test("loadRuntimeConfig validates raft timing bounds", async () => {
   }
 })
 
-test("loadRuntimeConfig rejects learner role in legacy static membership mode", async () => {
+test("loadRuntimeConfig rejects initCluster with learner role", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "holepunch-config-learner-"))
 
   try {
     const configPath = path.join(dir, "node.json")
     const raw = JSON.parse(
-      await readFile(path.resolve("examples/local/node-1.json"), "utf8")
+      await readFile(path.resolve("examples/local/joiner.json"), "utf8")
     )
     raw.dataDir = "./data"
+    raw.initCluster = true
     raw.role = "learner"
-    raw.identitySeed = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
-    raw.authorizedNodeSeeds = raw.authorizedNodeSeeds.slice(1)
 
     await writeFile(configPath, JSON.stringify(raw, null, 2))
 
     await assert.rejects(
       loadRuntimeConfig(configPath),
-      /legacy-static-membership" is incompatible with role "learner"/
+      /initCluster may only be used with voter role/
     )
   } finally {
     await rm(dir, { recursive: true, force: true })

@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { randomBytes } from "node:crypto"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -70,6 +71,19 @@ async function readMachineIdentity() {
   }
 }
 
+async function readPersistedMachineIdentity(configPath) {
+  try {
+    const config = JSON.parse(await readFile(configPath, "utf8"))
+    return config.machineIdentity || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function generateMachineIdentity() {
+  return base58Encode(randomBytes(32))
+}
+
 async function main() {
   for (const name of REQUIRED_VARS) {
     requireEnv(name)
@@ -97,11 +111,14 @@ async function main() {
     })
   )
 
-  const machineIdentity = await readMachineIdentity()
-  if (!machineIdentity) {
-    console.error("Cannot read /etc/machine-id; mount it from the host with /etc/machine-id:/etc/machine-id:ro")
-    process.exit(1)
-  }
+  const dataDir = process.env.DATA_DIR || "/data"
+  const configPath = path.join(dataDir, "runtime-config.json")
+
+  let machineIdentity = process.env.SERVICE_BASE64_MACHINE_IDENTITY
+    || process.env.MACHINE_IDENTITY
+    || await readMachineIdentity()
+    || await readPersistedMachineIdentity(configPath)
+    || generateMachineIdentity()
 
   const identitySeed = await deriveClusterScopedBytes({
     clusterSecret,
@@ -134,13 +151,9 @@ async function main() {
   const role = initCluster ? "voter" : "learner"
 
   const config = {
-    dataDir: process.env.DATA_DIR || "/data",
-    clusterId,
+    dataDir,
     clusterSecret: base58Encode(clusterSecret),
-    identitySeed: base58Encode(identitySeed),
-    encryptionKey: base58Encode(encryptionKey),
     machineIdentity,
-    role,
     initCluster,
     http: {
       host: process.env.HTTP_HOST || "0.0.0.0",
@@ -182,10 +195,8 @@ async function main() {
     process.exit(0)
   }
 
-  const dataDir = config.dataDir
   await mkdir(dataDir, { recursive: true })
 
-  const configPath = path.join(dataDir, "runtime-config.json")
   await writeFile(configPath, JSON.stringify(config, null, 2), "utf8")
 
   console.log(
