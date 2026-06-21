@@ -62,10 +62,10 @@ Copy the environment template and fill in your values:
 cp .env.example .env
 ```
 
-Only two variables are required: `CLUSTER_ID` and `CLUSTER_SECRET` (64-char hex).
-Generate `CLUSTER_SECRET` with `openssl rand -hex 32`. The entrypoint derives
-`identitySeed` (per-machine signing key) and `encryptionKey` (shared at-rest key)
-from the cluster secret using the same Argon2id KDF as the rest of the codebase.
+Only `CLUSTER_SECRET` (64-char hex) is required. Generate with `openssl rand -hex 32`.
+The entrypoint derives `identitySeed`, `encryptionKey`, and the DHT topic from it.
+`CLUSTER_ID` defaults to `"default"` — set it explicitly if you run multiple clusters
+(it participates in KDF salt derivation, so all nodes in one cluster must share it).
 
 Start with Caddy reverse proxy (auto-TLS for a real domain):
 

@@ -9,8 +9,8 @@ services:
       - /etc/machine-id:/etc/machine-id:ro
     environment:
       # --- Required ---
-      CLUSTER_ID: ${CLUSTER_ID:?}
       CLUSTER_SECRET: ${CLUSTER_SECRET:?}
+      CLUSTER_ID: ${CLUSTER_ID:-default}
       # IDENTITY_SEED and ENCRYPTION_KEY are derived by the entrypoint
       # from CLUSTER_SECRET + /etc/machine-id + purpose.
       # --- Optional (defaults shown) ---
