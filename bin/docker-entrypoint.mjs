@@ -14,7 +14,7 @@ const DRY_RUN = process.argv.includes("--dry-run")
 const NODE_IDENTITY_PURPOSE = "replicore:node-identity:v1"
 const ENCRYPTION_KEY_PURPOSE = "replicore:encryption-key:v1"
 
-const REQUIRED_VARS = ["CLUSTER_ID", "CLUSTER_SECRET"]
+const REQUIRED_VARS = ["CLUSTER_SECRET"]
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -88,7 +88,7 @@ async function main() {
     requireEnv(name)
   }
 
-  const clusterId = process.env.CLUSTER_ID
+  const clusterId = process.env.CLUSTER_ID || "default"
   const clusterSecretHex = process.env.CLUSTER_SECRET
 
   validateHex(clusterSecretHex, "CLUSTER_SECRET", 32)
