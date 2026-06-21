@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.0 - 2026-06-21
+
+### Features
+
+- **docs:** add OpenAPI 3.1 spec and Scalar API Reference UI (fbe6139)
+- **setup:** full setup UI hardening (83cd69e)
+- log rate limited HTTP requests safely (c99fb7f)
+- add IP-based HTTP rate limiting (a3ab07c)
+- validate HTTP admin input (4d3a5b1)
+- validate HTTP CRUD input (ad1cca6)
+- add HTTP validation helpers (7c48356)
+
+### Bug Fixes
+
+- **test:** increase durability timeout to 60s for degraded topology test (f7dbb7c)
+- **test:** use quorum.reachableVoters instead of heartbeat aliveness for degraded topology test (676944e)
+- disable heartbeat-based durability in ack-delay timeout test (414ec6e)
+- **test:** wait for quorum before first write in degraded topology test (a0edaa2)
+- fail fast when RPC extension is missing (70c9e7b)
+- sanitize unexpected HTTP server errors (7061118)
+- return 400 for malformed public JSON (d4955b9)
+- stabilize excluded perturbation durability paths (d4fd7ea)
+
 ## v0.2.0 - 2026-06-20
 
 ### Features
