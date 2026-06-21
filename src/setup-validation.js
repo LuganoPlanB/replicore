@@ -50,12 +50,25 @@ export function normalizeSetupDraft(input) {
     throw badRequest("schemaVersion must be a positive integer")
   }
 
+  const initCluster = input.initCluster === true
+
+  const role = input.role || (initCluster ? "voter" : "learner")
+  if (role !== "voter" && role !== "learner") {
+    throw badRequest("role must be either voter or learner")
+  }
+  if (initCluster && role !== "voter") {
+    throw badRequest("initCluster may only be used with voter role")
+  }
+
   return {
     schemaVersion,
     updatedAt,
+    initCluster,
+    role,
     selectedInterface: requireTrimmedString(input.selectedInterface, "selectedInterface"),
     bindHost: requireTrimmedString(input.bindHost, "bindHost"),
     clusterSecret: requireBase58String(input.clusterSecret, "clusterSecret", 32),
+    machineIdentity: requireTrimmedString(input.machineIdentity, "machineIdentity"),
     machineId: requireBase58String(input.machineId, "machineId", 32)
   }
 }

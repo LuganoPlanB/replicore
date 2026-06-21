@@ -155,9 +155,58 @@ h1 {
   font-size: 0.9375rem;
 }
 
+.radio-field {
+  display: flex !important;
+  flex-direction: row;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.6);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.radio-field:has(input:checked) {
+  border-color: rgba(56, 189, 248, 0.48);
+  background: rgba(14, 165, 233, 0.08);
+}
+
+.radio-field input[type="radio"] {
+  width: auto;
+  margin-top: 2px;
+  accent-color: #0ea5e9;
+}
+
+.radio-field span {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.radio-field strong {
+  color: #e2e8f0;
+}
+
+.radio-field small {
+  color: #94a3b8;
+  font-size: 0.8125rem;
+}
+
 .inline-fields {
   display: flex;
   gap: 16px;
+}
+
+fieldset.inline-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+fieldset.inline-fields {
+  border: none;
+  padding: 0;
 }
 
 .inline-fields .field {
@@ -348,5 +397,9 @@ button:disabled {
   .interface-head,
   .interface-row {
     grid-template-columns: 72px minmax(0, 1fr) 48px;
+  }
+
+  fieldset.inline-fields {
+    grid-template-columns: 1fr;
   }
 }
