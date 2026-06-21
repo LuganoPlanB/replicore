@@ -3,3 +3,4 @@ holepunch-stack
 node_modules
 data
 tmp
+volumes/
