@@ -7,7 +7,9 @@
     bindHost: "",
     clusterSecret: "",
     machineIdentity: "",
-    machineId: ""
+    machineId: "",
+    initCluster: false,
+    role: "learner"
   }
 
   let setupState = null
@@ -260,6 +262,46 @@
       </header>
 
       <form class="wizard" on:submit|preventDefault={saveDraft}>
+        <section class="group group-bootstrap" aria-labelledby="bootstrap-title">
+          <div class="group-header">
+            <h2 id="bootstrap-title">Cluster role</h2>
+            <p class="section-summary">
+              Exactly one node per cluster must initialize membership.
+              Every additional node joins as a learner.
+            </p>
+          </div>
+
+          <fieldset class="inline-fields">
+            <label class="field radio-field">
+              <input
+                type="radio"
+                name="bootstrap-mode"
+                value="init"
+                checked={draft.initCluster}
+                on:change={() => { draft = { ...draft, initCluster: true, role: "voter" } }}
+              />
+              <span>
+                <strong>Initialize new cluster</strong>
+                <small>First node — creates membership, becomes the initial voter.</small>
+              </span>
+            </label>
+
+            <label class="field radio-field">
+              <input
+                type="radio"
+                name="bootstrap-mode"
+                value="join"
+                checked={!draft.initCluster}
+                on:change={() => { draft = { ...draft, initCluster: false, role: "learner" } }}
+              />
+              <span>
+                <strong>Join existing cluster</strong>
+                <small>Additional node — joins as a learner, catches up from the cluster.</small>
+              </span>
+            </label>
+          </fieldset>
+        </section>
+
         <section class="group" aria-labelledby="network-title">
           <div class="group-header">
             <h2 id="network-title">Network</h2>
