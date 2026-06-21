@@ -11,8 +11,8 @@ services:
       # --- Required ---
       CLUSTER_ID: ${CLUSTER_ID:?}
       CLUSTER_SECRET: ${CLUSTER_SECRET:?}
-      IDENTITY_SEED: ${IDENTITY_SEED:?}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?}
+      # IDENTITY_SEED and ENCRYPTION_KEY are derived by the entrypoint
+      # from CLUSTER_SECRET + /etc/machine-id + purpose.
       # --- Optional (defaults shown) ---
       ROLE: ${ROLE:-voter}
       INIT_CLUSTER: ${INIT_CLUSTER:-false}
