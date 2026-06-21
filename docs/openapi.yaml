@@ -343,7 +343,7 @@ components:
       scheme: bearer
       description: |
         Token from the node's auth configuration.
-        Each token carries `admin`, `readKeyspaces`, and `writeKeyspaces` scopes.
+        Each token carries `admin`, `read`, and `write` scopes.
 
   schemas:
 

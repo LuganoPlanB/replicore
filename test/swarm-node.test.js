@@ -1101,9 +1101,9 @@ test("authorized HTTP API forwards writes and exposes status routes", { concurre
         node,
         auth: {
           tokens: {
-            admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
-            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+            admin: { admin: true, read: ["*"], write: ["*"] },
+            writer: { read: ["default"], write: ["default"] },
+            reader: { read: ["default"], write: [] }
           }
         }
       })
@@ -1263,8 +1263,8 @@ test("HTTP CRUD failure before commit stays absent after leader restart", { conc
       node: witness,
       auth: {
         tokens: {
-          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          writer: { read: ["default"], write: ["default"] },
+          reader: { read: ["default"], write: [] }
         }
       }
     })
@@ -1324,8 +1324,8 @@ test("acknowledged HTTP CRUD survives leader restart with one committed history 
       node: witness,
       auth: {
         tokens: {
-          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          writer: { read: ["default"], write: ["default"] },
+          reader: { read: ["default"], write: [] }
         }
       }
     })
@@ -1423,8 +1423,8 @@ test("learner HTTP CRUD stays read-only while serving caught-up reads", { concur
       node: learnerNode,
       auth: {
         tokens: {
-          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-          reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+          writer: { read: ["default"], write: ["default"] },
+          reader: { read: ["default"], write: [] }
         }
       }
     })
@@ -1540,8 +1540,8 @@ test("wrong-secret nodes do not discover or mirror cluster CRUD state", { concur
         node,
         auth: {
           tokens: {
-            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+            writer: { read: ["default"], write: ["default"] },
+            reader: { read: ["default"], write: [] }
           }
         }
       })
@@ -2836,8 +2836,8 @@ test(
       node: currentLeaderNode,
       auth: {
         tokens: {
-          admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
-          writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+          admin: { admin: true, read: ["*"], write: ["*"] },
+          writer: { read: ["default"], write: ["default"] }
         }
       }
     })
@@ -3638,7 +3638,7 @@ test("HTTP body size limit enforces maximum request body size through Content-Le
     server = new HolepunchHttpServer({
       node: witness,
       auth: {
-        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+        tokens: { writer: { read: ["default"], write: ["default"] } }
       }
     })
     await server.start()
@@ -3710,8 +3710,8 @@ test("HTTP malformed JSON returns 400 without calling node handlers and later va
     node,
     auth: {
       tokens: {
-        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-        admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] }
+        writer: { read: ["default"], write: ["default"] },
+        admin: { admin: true, read: ["*"], write: ["*"] }
       }
     }
   })
@@ -3819,8 +3819,8 @@ test("HTTP CRUD routes validate key, keyspace, and PUT body before node CRUD cal
     node,
     auth: {
       tokens: {
-        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        writer: { read: ["default"], write: ["default"] },
+        reader: { read: ["default"], write: [] }
       }
     }
   })
@@ -3908,8 +3908,8 @@ test("HTTP admin routes validate bodies before node admin calls", { concurrency:
     node,
     auth: {
       tokens: {
-        admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
-        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+        admin: { admin: true, read: ["*"], write: ["*"] },
+        writer: { read: ["default"], write: ["default"] }
       }
     }
   })
@@ -4027,8 +4027,8 @@ test("HTTP JSON responses carry consistent security headers across success and e
     logger: { error() {}, warn() {} },
     auth: {
       tokens: {
-        reader: { readKeyspaces: ["default"], writeKeyspaces: [] },
-        writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] }
+        reader: { read: ["default"], write: [] },
+        writer: { read: ["default"], write: ["default"] }
       }
     }
   })
@@ -4037,7 +4037,7 @@ test("HTTP JSON responses carry consistent security headers across success and e
     logger: { error() {}, warn() {} },
     auth: {
       tokens: {
-        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        reader: { read: ["default"], write: [] }
       }
     },
     rateLimit: {
@@ -4129,7 +4129,7 @@ test("HTTP internal errors are sanitized for clients and logged with the injecte
     },
     auth: {
       tokens: {
-        reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+        reader: { read: ["default"], write: [] }
       }
     }
   })
@@ -4209,7 +4209,7 @@ test("HTTP error payload suppresses internal cluster state in refusal responses"
     server = new HolepunchHttpServer({
       node: leaderNode,
       auth: {
-        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+        tokens: { writer: { read: ["default"], write: ["default"] } }
       }
     })
     await server.start()
@@ -4304,7 +4304,7 @@ test("HTTP rate limiting returns 429 after exceeding per-IP write budget", { con
     server = new HolepunchHttpServer({
       node: witness,
       auth: {
-        tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+        tokens: { writer: { read: ["default"], write: ["default"] } }
       },
       rateLimit: {
         all: { max: 300, windowMs: 60_000 },
@@ -4366,7 +4366,7 @@ test("HTTP rate limit logging omits authorization tokens", { concurrency: false 
       error() {}
     },
     auth: {
-      tokens: { writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] } }
+      tokens: { writer: { read: ["default"], write: ["default"] } }
     },
     rateLimit: {
       all: { max: 300, windowMs: 60_000 },

@@ -2520,9 +2520,9 @@ test("HTTP witness CRUD keeps writes on the leader-connected side during a split
         node,
         auth: {
           tokens: {
-            admin: { admin: true, readKeyspaces: ["*"], writeKeyspaces: ["*"] },
-            writer: { readKeyspaces: ["default"], writeKeyspaces: ["default"] },
-            reader: { readKeyspaces: ["default"], writeKeyspaces: [] }
+            admin: { admin: true, read: ["*"], write: ["*"] },
+            writer: { read: ["default"], write: ["default"] },
+            reader: { read: ["default"], write: [] }
           }
         }
       })

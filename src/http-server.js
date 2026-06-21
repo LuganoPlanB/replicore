@@ -27,8 +27,8 @@ export class HolepunchHttpServer {
    *   auth?: {
    *     tokens: Record<string, {
    *       admin?: boolean,
-   *       readKeyspaces?: string[],
-   *       writeKeyspaces?: string[]
+   *       read?: string[],
+   *       write?: string[]
    *     }>
    *   }
    * }} options
@@ -231,7 +231,7 @@ export class HolepunchHttpServer {
       throw error
     }
 
-    const allowed = mode === "read" ? grants.readKeyspaces ?? [] : grants.writeKeyspaces ?? []
+    const allowed = mode === "read" ? grants.read ?? [] : grants.write ?? []
     if (!(allowed.includes("*") || allowed.includes(keyspace))) {
       const error = new Error("Forbidden")
       error.code = "FORBIDDEN"

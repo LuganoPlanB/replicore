@@ -6,15 +6,15 @@ services:
     restart: unless-stopped
     volumes:
       - ./volumes/replicore:/data
-      - /etc/machine-id:/etc/machine-id:ro
     environment:
       # --- Required ---
       CLUSTER_SECRET: ${CLUSTER_SECRET:?}
-      # --- Optional (defaults shown) ---
       INIT_CLUSTER: ${INIT_CLUSTER:-false}
+      AUTH_TOKENS: ${AUTH_TOKENS:-}
+      # --- Optional (defaults shown) ---
+      MACHINE_IDENTITY: ${SERVICE_BASE64_MACHINEID}
       HTTP_HOST: ${HTTP_HOST:-0.0.0.0}
       HTTP_PORT: ${REPLICORE_HTTP_PORT:-3000}
-      AUTH_TOKENS: ${AUTH_TOKENS:-}
       HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-500}
       HEARTBEAT_TTL_MS: ${HEARTBEAT_TTL_MS:-3000}
       ELECTION_TIMEOUT_MIN_MS: ${ELECTION_TIMEOUT_MIN_MS:-900}

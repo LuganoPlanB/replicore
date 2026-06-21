@@ -25,16 +25,16 @@
     "tokens": {
       "admin": {
         "admin": true,
-        "readKeyspaces": ["*"],
-        "writeKeyspaces": ["*"]
+        "read": ["*"],
+        "write": ["*"]
       },
       "writer": {
-        "readKeyspaces": ["default"],
-        "writeKeyspaces": ["default"]
+        "read": ["default"],
+        "write": ["default"]
       },
       "reader": {
-        "readKeyspaces": ["default"],
-        "writeKeyspaces": []
+        "read": ["default"],
+        "write": []
       }
     }
   }
