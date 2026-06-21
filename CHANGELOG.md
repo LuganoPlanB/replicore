@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.1 - 2026-06-21
+
+### Bug Fixes
+
+- machine identity setting resilience (1a9e256)
+- docker entrypoint and confs (29ce3d3)
+- simplify auth token and docker compose (b7a34cf)
+- really remove caddy from docker compose (8d6f8eb)
+- simplify env and remove caddy from docker (8602d1d)
+
 ## v0.5.0 - 2026-06-21
 
 ### Features
