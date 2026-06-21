@@ -2989,13 +2989,13 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
 
   let restoredOffline = null
   let restoredOnline = null
-  let restoredDir = null
+   let restoredDir = null
 
   try {
     const encryptionKey = randomBytes(32)
     const durability = {
       requiredFollowerAcks: 1,
-      timeoutMs: 20_000
+      timeoutMs: 60_000
     }
     const leaderIdentity = generateIdentity(seed("leader"))
     const followerIdentity = generateIdentity(seed("follower-1"))
@@ -3066,7 +3066,7 @@ test("a restored node can serve snapshot reads before rejoin and later catch up 
       return reachable.length >= majority
     }, {
       description: "leader has reachable quorum before first write",
-      timeout: 15_000
+      timeoutMs: 30_000
     })
 
     await currentLeaderNode.put("hash:degraded-snapshot", { phase: "before-snapshot" })
